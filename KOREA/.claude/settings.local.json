@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(brew install:*)",
+      "Bash(~/.zshrc)",
+      "Bash(export PATH=\"/opt/homebrew/opt/postgresql@15/bin:$PATH\")",
+      "Bash(brew tap:*)",
+      "Bash(sudo rm:*)",
+      "Bash(timescaledb_move.sh:*)",
+      "Bash(timescaledb-tune:*)",
+      "Bash(brew services:*)",
+      "Bash(psql:*)",
+      "Bash(pg_config:*)",
+      "Bash(/opt/homebrew/opt/postgresql@17/bin/psql:*)",
+      "Bash(python3:*)",
+      "Bash(source:*)",
+      "Bash(pip install:*)",
+      "Bash(pip freeze:*)",
+      "Bash(python:*)",
+      "Bash(PYTHONPATH=. python:*)",
+      "Bash(git init:*)",
+      "Bash(git remote add:*)",
+      "Bash(git add:*)"
+    ]
+  }
+}
