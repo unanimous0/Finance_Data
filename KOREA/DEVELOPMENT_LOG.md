@@ -324,6 +324,158 @@
 
 ---
 
+## 2026-02-18 (화) - Phase 2 부분 진행 (ORM/Pydantic/테스트 완료)
+
+### ✅ 완료 작업
+
+1. **SQLAlchemy ORM 모델 작성 완료** (`database/models.py`)
+   - 10개 모델 정의:
+     - 메타데이터: Stock, Sector, IndexComponent, FloatingShares, ETFPortfolios
+     - 시계열: MarketCapDaily, OHLCVDaily, InvestorTrading (Hypertable)
+     - 모니터링: DataCollectionLogs, DataQualityChecks
+   - 주요 구현 내용:
+     - Foreign Key 관계 정의 (Stock ↔ Sector)
+     - Self-referential Foreign Key (Sector 계층 구조)
+     - 같은 테이블 2번 참조 (ETFPortfolios)
+     - 복합 Primary Key (Hypertable용)
+     - Relationship 및 backref 설정
+   - 모든 모델 동작 테스트 완료 ✅
+
+2. **Pydantic 검증 스키마 작성 완료** (`validators/schemas.py`)
+   - 10개 스키마 정의:
+     - StockSchema, SectorSchema, IndexComponentSchema, FloatingSharesSchema, ETFPortfoliosSchema
+     - MarketCapDailySchema, OHLCVDailySchema, InvestorTradingSchema
+     - DataCollectionLogsSchema, DataQualityChecksSchema
+   - 주요 검증 로직:
+     - 자동 대문자 변환 (market, investor_type)
+     - 범위 체크 (가격 ≥ 0, 유동비율 ≤ 100%)
+     - 관계 검증 (고가 ≥ 시가/저가, 유동주식 ≤ 총주식)
+     - 비즈니스 로직 (순매수 = 매수 - 매도, 자기 참조 방지)
+     - 날짜 검증 (미래 날짜 불가, 상장폐지일 > 상장일)
+   - 모든 스키마 동작 테스트 완료 ✅
+
+3. **테스트 코드 작성 완료** (`tests/`)
+   - `conftest.py`: pytest 설정 및 fixture (DB 세션, 샘플 데이터)
+   - `test_validators/test_schemas.py`: Pydantic 스키마 검증 테스트 (21개 테스트)
+   - `test_models/test_stock.py`: Stock 모델 CRUD 테스트 (14개 테스트)
+   - `test_models/test_hypertables.py`: Hypertable 모델 테스트 (18개 테스트)
+   - 총 53개 테스트 작성 완료
+   - 결과: 26개 통과 (49%), 27개 실패/에러
+   - 실패 원인: DB 세션 트랜잭션 관리, validator 순서 문제
+
+### 🎯 주요 결정사항
+
+#### 1. 실제 API 데이터 확인 전 ORM/Pydantic 먼저 작성
+- **이유**:
+  - 기본 구조를 먼저 완성하면 나중에 조정만 하면 됨
+  - 현재 스키마 기반으로 작성 → 내일 실제 데이터 확인 후 수정
+  - Pydantic 코드는 수정이 쉬움
+- **장점**:
+  - ORM과 Pydantic의 개념과 구조를 먼저 이해
+  - 실제 데이터 확인 후 무엇을 수정해야 할지 명확히 파악 가능
+
+#### 2. 테스트 일부 실패 상태로 넘어가기
+- **현황**: 53개 테스트 중 26개 통과, 27개 실패/에러
+- **원인**:
+  - `conftest.py`의 트랜잭션 롤백 로직 미완성
+  - 일부 Pydantic validator 순서 문제
+- **결정**: 내일 실제 데이터 확인 후 함께 수정
+- **이유**:
+  - 어차피 실제 데이터 형식에 맞춰 스키마/모델/테스트 모두 조정 필요
+  - 지금 완벽하게 수정해도 내일 다시 바뀔 가능성 높음
+  - 기본 구조 완성이 더 중요
+
+### 💡 배운 점 / 인사이트
+
+1. **ORM의 Foreign Key와 Relationship**
+   - Foreign Key는 DB 레벨 제약조건 (데이터 무결성)
+   - Relationship은 Python 객체 레벨 편의 기능 (코드 가독성)
+   - 둘은 독립적: FK 없이 Relationship만 쓰면 DB 제약 없음
+   - 보통 둘 다 함께 사용하는 것이 베스트 프랙티스
+
+2. **자기 참조 Foreign Key (Self-referential)**
+   - `remote_side` 파라미터로 부모 쪽 컬럼 명시 필요
+   - `backref`로 양방향 관계 자동 생성 가능
+   - 계층 구조 표현에 유용 (섹터, 카테고리 등)
+
+3. **같은 테이블을 여러 번 참조할 때**
+   - `foreign_keys` 파라미터로 명시 필수
+   - ETF-구성종목 관계처럼 역할이 다른 경우 자주 사용
+
+4. **Hypertable의 복합 Primary Key**
+   - TimescaleDB는 시간 컬럼을 포함한 복합키 요구
+   - SQLAlchemy에서는 `primary_key=True`를 여러 컬럼에 지정
+   - 3개 컬럼 복합키도 가능 (time + stock_code + investor_type)
+
+5. **Pydantic Validator 순서**
+   - Validator는 정의 순서대로 실행됨
+   - 다른 필드를 참조하는 validator는 나중에 정의해야 함
+   - `info.data`로 다른 필드 값 접근 가능
+
+6. **pytest fixture의 scope**
+   - `scope="session"`: 전체 테스트 세션 동안 1번만 생성
+   - `scope="function"`: 각 테스트 함수마다 새로 생성
+   - DB 세션은 `function` scope으로 테스트 간 격리
+
+### ⚠️ 주의사항
+
+1. **현재 스키마는 가정 기반**
+   - 실제 인포맥스 API/HTS 데이터 형식과 다를 가능성 높음
+   - 컬럼명, 데이터 타입 등 내일 확인 후 조정 필요
+   - 특히 투자자 유형 코드 (FOREIGN vs FOR vs 외국인 등) 확인 필요
+
+2. **테스트 실패 부분**
+   - DB 세션 트랜잭션 관리 개선 필요
+   - 일부 Pydantic validator 수정 필요
+   - 실제 데이터 확인 후 함께 수정 예정
+
+3. **Pydantic v2 deprecation warning**
+   - `config/settings.py`에서 `class Config` 사용 중
+   - `ConfigDict` 사용으로 변경 권장 (나중에 수정)
+
+### 🐛 발견된 이슈
+
+#### 이슈 1: pytest fixture 트랜잭션 롤백 미작동
+- **증상**: 테스트 간 데이터 간섭 발생
+- **원인**: `conftest.py`의 `begin_nested()` 방식 문제
+- **상태**: 미해결 (실제 데이터 확인 후 수정 예정)
+
+#### 이슈 2: Pydantic validator 순서 문제
+- **증상**: `net_buy_volume` validator가 실행되지 않음
+- **원인**: validator 정의 순서 또는 로직 문제
+- **상태**: 미해결 (실제 데이터 확인 후 수정 예정)
+
+### 📌 다음 작업 (내일 - 윈도우 환경)
+
+**우선순위 1**: 실제 데이터 형식 확인 (회사 윈도우 컴퓨터)
+1. `WINDOWS_CHECKLIST.md` 따라 샘플 데이터 수집
+   - 인포맥스 API: 종목 마스터, 일봉 OHLCV, 투자자별 수급
+   - 증권사 HTS (가능하면)
+2. 샘플 데이터를 JSON/CSV로 저장 (각 5-10건)
+3. 데이터 형식 비교 문서 작성 (`DATA_FORMAT_COMPARISON.md`)
+4. 맥으로 전송
+
+**우선순위 2**: 스키마/모델/Pydantic 조정 (맥)
+1. 샘플 데이터와 현재 스키마 비교
+2. 필요시 수정:
+   - `database/schema/init_schema.sql`
+   - `database/models.py`
+   - `validators/schemas.py`
+   - 테스트 코드
+3. ALTER TABLE 또는 재생성
+4. 모든 테스트 통과 확인
+
+**우선순위 3**: Phase 2 계속 진행
+1. `collectors/infomax.py` 작성
+2. ETL 파이프라인 구축
+3. 데이터 수집 테스트
+
+**참고 문서**:
+- `WINDOWS_CHECKLIST.md` (윈도우 환경 작업 가이드)
+- `TODO.md` → Phase 2 섹션
+
+---
+
 ## 템플릿 (작업 완료시 아래 형식으로 추가)
 
 ```markdown

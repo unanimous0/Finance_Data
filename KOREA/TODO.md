@@ -1,7 +1,7 @@
 # 📝 TODO - 작업 목록
 
-> **마지막 업데이트**: 2026-02-17 21:30
-> **현재 Phase**: Phase 1 완료 ✅ → Phase 2 대기 중 (윈도우 환경 필요)
+> **마지막 업데이트**: 2026-02-18 22:00
+> **현재 Phase**: Phase 1 완료 ✅ → Phase 2 진행 중 (ORM/Pydantic/테스트 완료, API 연동 대기)
 
 ---
 
@@ -95,8 +95,12 @@
   - [x] 커스텀 예외 클래스 정의
   - [x] DataCollectionError, ValidationError 등 ✅
 
-- [ ] **database/models.py** (미완성 - Phase 2에서 진행)
-  - SQLAlchemy ORM 모델은 데이터 형식 확인 후 작성
+- [x] **database/models.py** ✅ 완료 (2026-02-18)
+  - [x] SQLAlchemy ORM 모델 10개 정의 완료
+  - [x] Stock, Sector, IndexComponent, FloatingShares, ETFPortfolios
+  - [x] MarketCapDaily, OHLCVDaily, InvestorTrading (Hypertable)
+  - [x] DataCollectionLogs, DataQualityChecks
+  - ⚠️ 실제 API 데이터 확인 후 조정 필요
 
 ### 테스트 및 검증 ✅ 완료
 
@@ -142,11 +146,13 @@
     - [ ] 투자자별 수급 수집 함수
   - [ ] API 키 테스트
 
-- [ ] **데이터 검증 로직**
-  - [ ] `validators/schemas.py` (Pydantic 스키마)
-    - [ ] StockSchema
-    - [ ] OHLCVSchema
-    - [ ] InvestorTradingSchema
+- [x] **데이터 검증 로직** (부분 완료)
+  - [x] `validators/schemas.py` (Pydantic 스키마) ✅ 완료 (2026-02-18)
+    - [x] StockSchema
+    - [x] OHLCVDailySchema
+    - [x] InvestorTradingSchema
+    - [x] 나머지 7개 스키마 모두 완료
+    - ⚠️ 실제 API 데이터 확인 후 조정 필요
   - [ ] `validators/quality_checks.py`
     - [ ] NULL 체크
     - [ ] 중복 체크
@@ -163,9 +169,13 @@
   - [ ] 에러 핸들링 및 재시도 로직
   - [ ] 데이터 수집 로그 기록 (data_collection_logs 테이블)
 
-- [ ] **테스트**
+- [x] **테스트** (부분 완료)
+  - [x] `tests/conftest.py` - pytest 설정 및 fixture ✅ (2026-02-18)
+  - [x] `tests/test_validators/test_schemas.py` - Pydantic 스키마 테스트 ✅
+  - [x] `tests/test_models/test_stock.py` - Stock 모델 테스트 ✅
+  - [x] `tests/test_models/test_hypertables.py` - Hypertable 테스트 ✅
+  - ⚠️ 테스트 일부 실패 (53개 중 26개 통과) - 실제 데이터 확인 후 수정
   - [ ] `tests/test_collectors/test_infomax.py`
-  - [ ] `tests/test_validators/test_schemas.py`
   - [ ] `tests/test_etl/test_pipeline.py`
   - [ ] 실제 API 호출 테스트 (소량 데이터)
 
