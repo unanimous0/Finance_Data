@@ -476,6 +476,76 @@
 
 ---
 
+## 2026-02-19 (수) - 데이터 검증, 스키마 정리, 유동주식수 적재
+
+### ✅ 완료 작업
+
+1. **DB 복원 (덤프 파일)**
+   - Windows 환경에서 생성한 `korea_stock_data.dump` 복원
+   - pg_restore 버전 불일치 해결 (PG15 → PG17 바이너리 사용)
+   - `--no-owner --no-privileges` 옵션으로 권한 문제 해결
+   - TimescaleDB 확장 먼저 활성화 후 복원 성공
+
+2. **전체 데이터 품질 검증 (4단계)**
+   - **기본 현황**: 레코드 수, 날짜 범위, 종목 수 확인
+   - **정합성**: OHLCV 논리 체크 (high >= low 등) 전부 통과, NULL/음수 없음
+   - **스팟체크**: 삼성전자, SK하이닉스, NAVER, 현대차, POSCO홀딩스 — CSV 원본과 100% 일치
+   - **연속성**: 1,008 거래일, 갭은 공휴일/연휴만 (정상)
+
+3. **불필요 컬럼 정리**
+   - `market_cap_daily.shares_outstanding` 삭제 (전부 NULL)
+   - `investor_trading` 5개 컬럼 삭제 (net_buy_volume, buy_volume, sell_volume, buy_value, sell_value — 전부 NULL)
+   - investor_trading은 `net_buy_value`(순매수금액)만 유지
+
+4. **종목 매핑 검증**
+   - CSV 종목명 ↔ DB stocks 종목명 대조
+   - 3,726개 정확 매칭 (중복 없음, 공백 차이 없음)
+   - 23개 미매칭: 상장폐지 종목 (CSV에만 존재)
+   - 94개 누락: 신규 상장 ETF (CSV 원본에 데이터 없음)
+
+5. **유동주식수 데이터 적재**
+   - xlsx 3개 파일 (KOSPI + KOSDAQ 2분할) → floating_shares 테이블
+   - 1,052,045건 적재 (2,546개 종목, 2022-01-03 ~ 2026-02-19)
+   - openpyxl 패키지 설치 (xlsx 읽기용)
+
+6. **프로젝트 정리**
+   - `korea_stock_data.dump` 삭제 (복원 완료, 168MB)
+   - `__pycache__` 6개 디렉토리 삭제
+   - Excel 임시 잠금 파일 삭제
+
+### 🎯 주요 결정사항
+
+#### 1. 스키마 정리 — 데이터 없는 컬럼 삭제
+- **배경**: investor_trading의 volume 관련 컬럼, market_cap_daily의 shares_outstanding이 전부 NULL
+- **결정**: 삭제
+- **이유**: CSV 원본에 해당 데이터가 없으며, 향후 필요시 ALTER TABLE로 재추가 가능
+
+#### 2. 94개 ETF 데이터 누락 — 별도 수집 예정
+- **배경**: stocks 마스터에는 있지만 시계열 데이터 없음
+- **원인**: CSV 수집 시점에 해당 ETF가 포함되지 않음 (종목명 불일치 아님)
+- **결정**: 별도로 데이터 수집하여 보충 예정
+
+### 💡 배운 점 / 인사이트
+
+1. **pg_restore 버전 호환성**
+   - 덤프를 만든 PG 버전의 pg_restore를 사용해야 함
+   - macOS에서 여러 PG 버전 공존 시 `/opt/homebrew/opt/postgresql@17/bin/` 경로 직접 지정
+
+2. **TimescaleDB 덤프 복원 순서**
+   - DB 생성 → `CREATE EXTENSION timescaledb` → pg_restore (이 순서 필수)
+   - `--clean` 옵션 사용 시 Hypertable 관련 에러 발생할 수 있음
+
+3. **데이터 검증은 적재 직후 필수**
+   - 적재 후 바로 검증하지 않으면 문제를 늦게 발견
+   - NULL 비율, 논리 정합성, 원본 대조를 체계적으로 수행
+
+### 📌 다음 작업
+
+1. 94개 ETF 시계열 데이터 수집 및 적재
+2. Phase 2 진행 (API 연동, ETL 파이프라인)
+
+---
+
 ## 2026-02-19 (수) - 전체 시장 데이터 적재 완료 🎉
 
 ### ✅ 완료 작업

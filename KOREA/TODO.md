@@ -1,12 +1,15 @@
 # 📝 TODO - 작업 목록
 
-> **마지막 업데이트**: 2026-02-19 17:30
-> **현재 Phase**: Phase 2 부분 완료 ✅ (데이터 적재 완료) → API 연동 대기
+> **마지막 업데이트**: 2026-02-19 21:00
+> **현재 Phase**: Phase 1 완료 ✅ (데이터 적재 및 검증 완료) → Phase 2 준비 중
 
 ---
 
 ## 🔥 긴급/중요 (최우선)
 
+- [ ] **94개 ETF 시계열 데이터 보충** (데이터 수집 필요)
+  - 신규 상장 ETF로 CSV 원본에 없었던 종목들
+  - 조회 SQL: `SELECT stock_code, stock_name FROM stocks s LEFT JOIN (SELECT DISTINCT stock_code FROM ohlcv_daily) o ON s.stock_code = o.stock_code WHERE o.stock_code IS NULL;`
 - [ ] **API 연동 준비** (Windows 또는 Mac)
   - 인포맥스 API 문서 검토
   - 일별 업데이트 전략 수립
@@ -139,6 +142,19 @@
 - [x] **데이터베이스 스키마 조정** ✅ (2026-02-19)
   - [x] PRIMARY KEY 추가 (3개 Hypertable)
   - [x] ON CONFLICT 지원 확인
+
+- [x] **데이터 검증 및 스키마 정리** ✅ (2026-02-19)
+  - [x] 전체 데이터 품질 검증 (NULL, 음수, 논리 정합성)
+  - [x] OHLCV 스팟체크: CSV 원본과 DB 값 100% 일치 확인
+  - [x] 거래일 연속성 검증 (공휴일/연휴 갭만 확인)
+  - [x] 종목명 매핑 정확성 검증 (중복 없음, 3,726개 정확 매칭)
+  - [x] 불필요 컬럼 삭제 (shares_outstanding, volume 관련 5개)
+  - [x] investor_trading → net_buy_value만 유지
+
+- [x] **유동주식수 데이터 적재** ✅ (2026-02-19)
+  - [x] xlsx 3개 파일 (KOSPI + KOSDAQ 2개) 읽기
+  - [x] 1,052,045건 적재 (2,546개 종목)
+  - [x] 기간: 2022-01-03 ~ 2026-02-19
 
 ### 🔄 진행 중 / 대기 중
 
