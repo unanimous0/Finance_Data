@@ -44,10 +44,17 @@ class Stock(Base):
         comment="종목명"
     )
 
+    standard_code = Column(
+        String(12),           # 국제표준코드 (ISIN) 12자리
+        unique=True,          # 제약: 고유값 (중복 불가)
+        nullable=True,        # NULL 허용
+        comment="국제표준코드 (ISIN)"
+    )
+
     market = Column(
         String(10),
-        nullable=False,
-        comment="시장구분 (KOSPI/KOSDAQ)"
+        nullable=True,        # NULL 허용으로 변경
+        comment="시장구분 (KOSPI/KOSDAQ/ETF)"
     )
 
     sector_id = Column(
