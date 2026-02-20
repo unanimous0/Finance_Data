@@ -804,6 +804,69 @@
 
 ---
 
+## 2026-02-20 (금) - 일별 업데이트 파이프라인 구축 + 멀티스레드 병렬화
+
+### ✅ 완료 작업
+
+1. **Infomax API 수집기 구현** (`collectors/infomax.py`)
+   - `InfomaxClient` 클래스 (thread-safe 공유 rate limiter)
+   - `get_hist()`: OHLCV + 발행주식수 조회 → ohlcv_daily, market_cap_daily
+   - `get_investor()`: 4개 투자자 타입 수급 조회 → investor_trading
+   - Rate limit: 1.05초/요청 (60회/분 Lite 플랜)
+   - `_rate_lock` + `_rate_last_call` 클래스 변수로 멀티스레드 공유 rate limiter 구현
+
+2. **일별 업데이트 스크립트 구현** (`scripts/daily_update.py`, 624줄)
+   - DB 마지막 날짜 기준 자동 범위 계산 (start: MAX(time)+1, end: 어제)
+   - STEP 1: OHLCV + 시가총액 수집 (전 종목 3,820개)
+   - STEP 2: 투자자별 수급 수집 (KOSPI+KOSDAQ 2,748개)
+   - 특이사항 자동 감지: 거래정지, OHLCV오류, 가격급등락(±29.5%), 대규모순매수도(500억↑)
+   - 보고서 자동 생성: `reports/daily_update_YYYYMMDD.txt`
+   - 단독 실행: `python scripts/daily_update.py [YYYYMMDD]`
+
+3. **일별 스케줄러 구현** (`schedulers/daily_scheduler.py`)
+   - APScheduler 기반 매일 16:30 KST 자동 실행
+   - 로그: `logs/scheduler.log`
+   - ⚠️ `next_run_time` AttributeError 버그 있음 → 수정 필요
+
+4. **일별 업데이트 속도 분석**
+   - 총 API 호출: OHLCV 3,820번 + 수급 2,748번 = **6,568번**
+   - Rate Limit 60회/분 → 이론 최소 소요: **약 1시간 50분** (실제 약 2시간)
+   - 병목: API Rate Limit (코드 개선으로 뚫을 수 없는 한계)
+
+5. **멀티스레드 병렬화 적용**
+   - `ThreadPoolExecutor(max_workers=4)` — STEP1, STEP2 각각 적용
+   - DB 쓰기는 메인 스레드에서만 처리 (psycopg2 thread-safety 고려)
+   - 실제 효과: API latency 0.1초로 짧아 개선 폭 미미 (~10%)
+   - 공유 rate limiter 덕분에 rate limit 초과 없음 (독립 rate limiter는 access_limit 에러 확인됨)
+
+6. **Bulk API 탐색** (근본적 속도 개선 가능성 조사)
+   - `/api/market/*`, `/api/date/*`, `/api/stock/hist?market=KOSPI` 등 탐색
+   - 결과: **날짜별 전 종목 bulk API 없음** (종목별 호출만 지원)
+
+### 🎯 주요 결정사항
+
+#### 1. 일별 업데이트 2시간 수용
+- Rate Limit이 근본 한계, 코드로 해결 불가
+- 16:30 실행 → 18:30 완료 → 사용에 지장 없음
+- 속도 개선: Infomax 플랜 업그레이드만이 해결책
+
+#### 2. 멀티스레드 구조 유지
+- 현재 효과는 미미하지만 플랜 업그레이드 시 즉시 활용 가능
+- DB 쓰기를 메인 스레드에서만 처리하여 thread-safe 보장
+
+### ⚠️ 주의사항
+
+1. **독립 rate limiter 사용 금지**: 스레드별 독립 throttle 사용 시 access_limit 에러 발생 확인됨
+2. **APScheduler next_run_time 버그**: `daily_scheduler.py` 실행 시 AttributeError 발생, 수정 필요
+
+### 📌 다음 작업
+
+1. `daily_scheduler.py` next_run_time 버그 수정 후 실제 실행 테스트
+2. 94개 ETF 시계열 데이터 보충
+3. 서버 구축 (맥미니 구매 후 설정)
+
+---
+
 ## 템플릿 (작업 완료시 아래 형식으로 추가)
 
 ```markdown

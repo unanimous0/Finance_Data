@@ -7,13 +7,10 @@
 
 ## 🔥 긴급/중요 (최우선)
 
-- [ ] **Infomax API 일별 업데이트 파이프라인 구축**
-  - `/api/stock/hist` → ohlcv_daily, market_cap_daily
-  - `/api/stock/investor` → investor_trading (net_buy_value, net_buy_volume)
-  - `/api/stock/code` + `/api/stock/expired` → stocks 마스터 업데이트
-  - 증분 업데이트 로직 (마지막 수집일 다음날부터)
+- [ ] **`daily_scheduler.py` next_run_time 버그 수정 후 실제 실행 테스트**
 - [ ] **94개 ETF 시계열 데이터 보충** (API `/api/stock/hist` 활용)
   - 조회 SQL: `SELECT stock_code, stock_name FROM stocks s LEFT JOIN (SELECT DISTINCT stock_code FROM ohlcv_daily) o ON s.stock_code = o.stock_code WHERE o.stock_code IS NULL;`
+- [ ] **서버 구축** (맥미니 구매 후 설정)
 
 ---
 
@@ -171,13 +168,12 @@
 
 ### 맥 환경에서 진행 (윈도우 작업 후)
 
-- [ ] **인포맥스 API 연동**
-  - [ ] API 문서 검토
-  - [ ] `collectors/infomax.py` 작성
-    - [ ] 종목 마스터 수집 함수
-    - [ ] 일봉 OHLCV 수집 함수
-    - [ ] 투자자별 수급 수집 함수
-  - [ ] API 키 테스트
+- [x] **인포맥스 API 연동** ✅ (2026-02-20)
+  - [x] `collectors/infomax.py` 작성 (thread-safe InfomaxClient)
+  - [x] `get_hist()` — OHLCV + 시가총액
+  - [x] `get_investor()` — 투자자별 수급 (4개 타입)
+  - [x] `scripts/daily_update.py` — 일별 업데이트 + 특이사항 감지 + 보고서 생성
+  - [x] 멀티스레드 병렬화 (ThreadPoolExecutor, 공유 rate limiter)
 
 - [x] **데이터 검증 로직** (부분 완료)
   - [x] `validators/schemas.py` (Pydantic 스키마) ✅ 완료 (2026-02-18)
@@ -220,21 +216,18 @@
 
 ---
 
-## ⏰ Phase 3: 스케줄링 및 자동화 (예정)
+## ⏰ Phase 3: 스케줄링 및 자동화 (진행 중)
 
-- [ ] **APScheduler 설정**
-  - [ ] `schedulers/jobs.py` (개별 작업 정의)
-  - [ ] `schedulers/scheduler.py` (스케줄러 메인)
-  - [ ] 일별 수집 작업 (18:00 실행)
-  - [ ] 비정기 작업 트리거 (종목 마스터 등)
+- [x] **APScheduler 설정** ✅ (2026-02-20)
+  - [x] `schedulers/daily_scheduler.py` 작성 (매일 16:30 KST)
+  - ⚠️ `next_run_time` AttributeError 버그 → 수정 필요
+
+- [ ] **실제 실행 테스트 및 안정화**
+  - [ ] `daily_scheduler.py` 버그 수정
+  - [ ] 1주일 이상 무인 자동 수집 확인
 
 - [ ] **모니터링**
-  - [ ] 수집 성공/실패 로그
   - [ ] `scripts/check_collection_status.py` (상태 확인 스크립트)
-
-- [ ] **문서화**
-  - [ ] 스케줄러 실행 가이드
-  - [ ] 장애 대응 매뉴얼
 
 **완료 기준**: 1주일 이상 무인 자동 수집 성공
 

@@ -1,7 +1,7 @@
 # 🏢 한국 주식시장 데이터 중앙 관리 시스템
 
-> **마지막 업데이트**: 2026-02-20 (수급거래량 적재, FnGuide 크롤링 완료)
-> **프로젝트 상태**: Phase 1 완료 ✅ → Phase 2 API 연동 준비 중
+> **마지막 업데이트**: 2026-02-20 (일별 업데이트 파이프라인 구축, 멀티스레드 병렬화)
+> **프로젝트 상태**: Phase 2 완료 ✅ → Phase 3 스케줄러 안정화 중
 > **Repository**: https://github.com/unanimous0/Finance_Data/tree/main/KOREA
 
 ---
@@ -17,12 +17,13 @@
 - ✅ 우선순위: 종목 마스터 → 일봉 OHLCV → 투자자별 수급
 
 **현재 위치**:
-- Phase 1 완료 ✅ (DB 구축, 핵심 모듈, 데이터 적재 및 검증)
+- Phase 1·2 완료 ✅
   - **20.6M+ 레코드** 적재 완료 (2022-2026, 4년치)
-  - 3,726개 종목 × OHLCV/시가총액/투자자수급(거래대금+거래량)/유동주식수 데이터
-  - 데이터 품질 검증 완료 (정합성, 연속성, 스팟체크)
-  - 스키마 정리 완료 (불필요 컬럼 삭제)
-- 다음: Phase 2 (94개 ETF 데이터 보충, API 연동)
+  - 일별 업데이트 파이프라인 구축 완료 (`collectors/infomax.py`, `scripts/daily_update.py`)
+  - 멀티스레드 병렬화 적용 (ThreadPoolExecutor, 공유 rate limiter)
+  - 특이사항 감지 + 보고서 자동 생성
+- Phase 3 진행 중: `schedulers/daily_scheduler.py` 버그 수정 후 실전 가동 예정
+- 미완료: 94개 ETF 시계열 데이터 보충
 
 ---
 
@@ -189,7 +190,7 @@ KOREA/
 │   └── models.py          # ORM 모델 (10개)
 │
 ├── collectors/            # 데이터 수집기
-│   └── infomax.py        # 인포맥스 API 수집기 (예정)
+│   └── infomax.py        # 인포맥스 API 수집기 (InfomaxClient, thread-safe)
 │
 ├── validators/            # 데이터 검증
 │   └── schemas.py        # Pydantic 스키마 (10개)
@@ -200,16 +201,17 @@ KOREA/
 │   └── load.py           # DB 적재
 │
 ├── schedulers/            # 스케줄링
-│   └── jobs.py           # APScheduler 작업
+│   └── daily_scheduler.py  # APScheduler 매일 16:30 자동 실행
 │
 ├── utils/                 # 유틸리티
 │   ├── logger.py         # Loguru 로깅
 │   └── exceptions.py     # 커스텀 예외
 │
 ├── scripts/               # 실행 스크립트
-│   ├── test_api_format.py       # API 형식 테스트
-│   ├── collect_historical_data.py  # 2년치 데이터 수집
-│   └── verify_data.py    # 데이터 검증
+│   ├── daily_update.py          # 일별 업데이트 (OHLCV+시가총액+수급, 특이사항 감지, 보고서)
+│   ├── crawl_floating_shares.py # FnGuide 유동주식수 크롤링 (월 1~2회)
+│   ├── load_all_data_from_csv.py  # 초기 CSV 적재
+│   └── ...
 │
 ├── tests/                 # 테스트 코드
 │   ├── conftest.py       # pytest 설정
@@ -395,27 +397,21 @@ SELECT add_compression_policy('ohlcv_daily', INTERVAL '30 days');
 
 **완료 기준 달성**: ✅
 
-### Phase 2: 데이터 수집기 개발 (진행 중)
+### Phase 2: 데이터 수집기 개발 ✅ 완료
 
-**완료**:
 - [x] SQLAlchemy ORM 모델 (10개)
 - [x] Pydantic 검증 스키마 (10개)
-- [x] pytest 테스트 코드 (기본 구조)
+- [x] `collectors/infomax.py` — InfomaxClient (thread-safe 공유 rate limiter)
+- [x] `scripts/daily_update.py` — 일별 업데이트 파이프라인 (멀티스레드, 보고서 생성)
+- [x] 20.6M+ 레코드 초기 적재 완료 (4년치)
 
-**대기 중** (Windows 환경 필요):
-- [ ] 인포맥스 API 데이터 형식 확인
-- [ ] API 연동 (collectors/infomax.py)
-- [ ] ETL 파이프라인 구축
-- [ ] 2년치 데이터 수집
+**완료 기준**: 수동으로 데이터 수집 → DB 저장 성공 ✅
 
-**완료 기준**: 수동으로 데이터 수집 → DB 저장 성공
+### Phase 3: 스케줄링 및 자동화 (진행 중)
 
-### Phase 3: 스케줄링 및 자동화 (예정)
-
-- [ ] APScheduler 설정
-- [ ] 일별 수집 작업 (18:00 실행)
-- [ ] 모니터링 및 알림
-- [ ] 장애 대응 매뉴얼
+- [x] `schedulers/daily_scheduler.py` 작성 (매일 16:30 KST)
+- [ ] next_run_time 버그 수정 후 실전 가동
+- [ ] 1주일 이상 무인 자동 수집 확인
 
 **완료 기준**: 1주일 이상 무인 자동 수집 성공
 
