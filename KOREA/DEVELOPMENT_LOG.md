@@ -5,6 +5,91 @@
 
 ---
 
+## 2026-02-20 (금) - 스케줄러 버그 수정 / 2-19 데이터 수집 / 재수집 모드 추가
+
+### ✅ 완료 작업
+
+1. **`daily_scheduler.py` next_run_time 버그 수정**
+   - 증상: `AttributeError: 'Job' object has no attribute 'next_run_time'`
+   - 원인: APScheduler 4.x에서 `next_run_time` 속성 제거 + `scheduler.start()` 전 호출
+   - 수정: `CronTrigger.get_next_fire_time(None, now)` 로 대체
+
+2. **2026-02-19 데이터 수집 (설 연휴 직후 첫 거래일)**
+   - 12:46 첫 수집: 3,820개 중 2,077개만 성공 (45% 실패)
+   - 원인 분석: 인포맥스 API가 설 연휴(2/16~18) 직후 데이터 처리 중 — 오전에는 일부 종목 데이터 미준비 상태 (`success=True, results=[]` 반환)
+   - 오후 15:26 재수집: 1,743건 추가 성공 (실패 0건) → 최종 3,820건 완성
+
+3. **`--missing-only` 재수집 모드 추가 (`scripts/daily_update.py`)**
+   - 특정 날짜에 이미 수집된 종목은 스킵, 누락된 종목만 재수집
+   - 소요 시간 ~53분 (전체 재실행 2시간 대비 1/3)
+   - 사용법: `python scripts/daily_update.py 20260219 --missing-only`
+   - 내부 함수: `get_missing_ohlcv_stocks()`, `get_missing_investor_stocks()` 추가
+
+### 🎯 주요 결정사항
+
+#### 연휴 직후 데이터 수집 전략
+- 설날/추석 연휴 후 첫 거래일은 **오전 수집 금지** → 오후 늦게 수집
+- 또는 수집 후 실패 종목 많으면 `--missing-only`로 재수집
+
+#### 인포맥스 API 특성 확인
+- API는 항상 `HTTP 200, success=True` 반환
+- 데이터 없으면 `results=[]` (success=False는 실제로 발생 안 함)
+- 스케줄러 `end = today-1` 로직: 매일 16:30 실행 시 "어제"까지만 수집
+  → 당일 데이터는 다음날 스케줄러에서 수집됨
+
+### 📊 최종 데이터 현황 (2026-02-20 기준)
+
+| 테이블 | 레코드 수 | 최신 날짜 |
+|--------|----------|---------|
+| ohlcv_daily | 3,261,771건 | 2026-02-19 |
+| market_cap_daily | 3,261,771건 | 2026-02-19 |
+| investor_trading | 13,042,796건 | 2026-02-19 |
+
+### 📌 다음 작업
+
+- 스케줄러 실전 가동 (16:30 자동 실행 모니터링)
+- 94개 ETF 시계열 데이터 보충
+- 서버 구축 (맥미니 구매 후 설정)
+
+---
+
+## 2026-02-20 (금) - 일별 업데이트 파이프라인 구축 + 멀티스레드 병렬화
+
+### ✅ 완료 작업
+
+1. **인포맥스 API 수집기 구현 (`collectors/infomax.py`)**
+   - `InfomaxClient` 클래스: thread-safe 공유 rate limiter
+   - `get_hist()`: OHLCV + 시가총액 (`/api/stock/hist`)
+   - `get_investor()`: 투자자별 수급 4개 타입 (`/api/stock/investor`)
+   - 핵심: 클래스 변수 `_rate_lock`, `_rate_last_call`으로 멀티스레드 간 rate 공유
+
+2. **일별 업데이트 스크립트 구현 (`scripts/daily_update.py`)**
+   - ThreadPoolExecutor(max_workers=4) 병렬 수집
+   - 특이사항 자동 감지: 거래정지, OHLCV오류, 가격급등락(±29.5%), 대규모순매수도(500억↑)
+   - 보고서 자동 생성: `reports/daily_update_YYYYMMDD.txt`
+
+3. **스케줄러 구현 (`schedulers/daily_scheduler.py`)**
+   - APScheduler BlockingScheduler, 매일 16:30 KST (월~금)
+
+### 🎯 속도 분석 결과
+
+- Infomax Lite 플랜: 60회/분 = 1.05s/req
+- 전체 종목: OHLCV 3,820건 + 수급 2,748건 = 6,568 API calls
+- 최소 소요: 6,568 × 1.05s = **1시간 55분** (Rate limit이 근본 한계)
+- 멀티스레드 효과: latency(~0.1s) overlap으로 **~10% 개선** (2시간 → 1시간 50분)
+
+### 🔍 bulk API 탐색 결과
+
+- 날짜별 전 종목 bulk API 없음 (종목별 호출만 지원)
+- 속도 개선을 위해선 Infomax 상위 플랜 업그레이드만이 해결책
+
+### ⚠️ 주의사항
+
+1. **독립 rate limiter 사용 금지**: 스레드별 독립 throttle 사용 시 access_limit 에러
+2. **DB 쓰기 메인 스레드 전용**: psycopg2는 thread-safe하지 않아 메인 스레드에서만 UPSERT
+
+---
+
 ## 2026-02-17 (월) - 프로젝트 초기 설정
 
 ### ✅ 완료 작업

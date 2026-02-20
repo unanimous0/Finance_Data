@@ -1,16 +1,17 @@
 # 📝 TODO - 작업 목록
 
 > **마지막 업데이트**: 2026-02-20
-> **현재 Phase**: Phase 1 완료 ✅ → Phase 2 API 연동 준비 중
+> **현재 Phase**: Phase 3 스케줄러 실전 가동 중
 
 ---
 
 ## 🔥 긴급/중요 (최우선)
 
-- [ ] **`daily_scheduler.py` next_run_time 버그 수정 후 실제 실행 테스트**
+- [ ] **스케줄러 1주일 실전 가동 모니터링** (16:30 자동 수집 정상 동작 확인)
 - [ ] **94개 ETF 시계열 데이터 보충** (API `/api/stock/hist` 활용)
   - 조회 SQL: `SELECT stock_code, stock_name FROM stocks s LEFT JOIN (SELECT DISTINCT stock_code FROM ohlcv_daily) o ON s.stock_code = o.stock_code WHERE o.stock_code IS NULL;`
 - [ ] **서버 구축** (맥미니 구매 후 설정)
+- [ ] **연휴 직후 재수집 루틴** — 설/추석 직후 첫 거래일은 `--missing-only` 확인 필요
 
 ---
 
@@ -220,11 +221,16 @@
 
 - [x] **APScheduler 설정** ✅ (2026-02-20)
   - [x] `schedulers/daily_scheduler.py` 작성 (매일 16:30 KST)
-  - ⚠️ `next_run_time` AttributeError 버그 → 수정 필요
+  - [x] `next_run_time` AttributeError 버그 수정 (`CronTrigger.get_next_fire_time` 사용)
+
+- [x] **2026-02-19 데이터 수집 및 재수집 모드 구현** ✅ (2026-02-20)
+  - [x] 설 연휴 직후 API 데이터 지연 원인 분석
+  - [x] `--missing-only` 재수집 모드 추가
+  - [x] 3,820건(OHLCV) + 10,992건(수급) 100% 완성
 
 - [ ] **실제 실행 테스트 및 안정화**
-  - [ ] `daily_scheduler.py` 버그 수정
   - [ ] 1주일 이상 무인 자동 수집 확인
+  - [ ] 연휴 직후 재수집 루틴 점검
 
 - [ ] **모니터링**
   - [ ] `scripts/check_collection_status.py` (상태 확인 스크립트)
