@@ -94,6 +94,37 @@ def get_stocks(conn, include_etf: bool = True) -> list[tuple[str, str]]:
         return cur.fetchall()
 
 
+def get_missing_ohlcv_stocks(conn, target_date: date) -> list[tuple[str, str]]:
+    """target_date에 ohlcv_daily 데이터가 없는 활성 종목 목록"""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT s.stock_code, s.stock_name
+            FROM stocks s
+            WHERE s.is_active = TRUE
+              AND s.stock_code NOT IN (
+                  SELECT stock_code FROM ohlcv_daily WHERE time = %s
+              )
+            ORDER BY s.stock_code
+        """, (target_date,))
+        return cur.fetchall()
+
+
+def get_missing_investor_stocks(conn, target_date: date) -> list[tuple[str, str]]:
+    """target_date에 investor_trading 데이터가 없는 KOSPI/KOSDAQ 종목 목록"""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT s.stock_code, s.stock_name
+            FROM stocks s
+            WHERE s.is_active = TRUE
+              AND s.market IN ('KOSPI', 'KOSDAQ')
+              AND s.stock_code NOT IN (
+                  SELECT DISTINCT stock_code FROM investor_trading WHERE time = %s
+              )
+            ORDER BY s.stock_code
+        """, (target_date,))
+        return cur.fetchall()
+
+
 # ── 병렬 수집 worker (module-level, pickle 가능) ──────────────────────────
 def _fetch_hist(client, code, name, start, end):
     rows = client.get_hist(code, start, end)
@@ -251,9 +282,10 @@ def get_prev_close(conn, target_date: date) -> dict[str, float]:
 
 
 # ── 메인 업데이트 로직 ────────────────────────────────────────────────────
-def run_update(target_date: date = None) -> dict:
+def run_update(target_date: date = None, missing_only: bool = False) -> dict:
     """
     일별 업데이트 실행
+    missing_only=True: target_date에 누락된 종목만 재수집 (이미 수집된 종목 스킵)
     Returns: 결과 딕셔너리 (보고서 생성용)
     """
     started_at = datetime.now(KST)
@@ -270,8 +302,13 @@ def run_update(target_date: date = None) -> dict:
             conn.close()
             return {}
 
-    all_stocks   = get_stocks(conn, include_etf=True)
-    kospi_kosdaq = get_stocks(conn, include_etf=False)
+    if missing_only and target_date:
+        all_stocks   = get_missing_ohlcv_stocks(conn, target_date)
+        kospi_kosdaq = get_missing_investor_stocks(conn, target_date)
+        print(f"  [재수집 모드] ohlcv 누락: {len(all_stocks)}개 | 수급 누락: {len(kospi_kosdaq)}개")
+    else:
+        all_stocks   = get_stocks(conn, include_etf=True)
+        kospi_kosdaq = get_stocks(conn, include_etf=False)
     code_to_name = {c: n for c, n in all_stocks}
 
     total_stocks    = len(all_stocks)
@@ -608,9 +645,9 @@ def save_report(report_text: str, target_date: date) -> Path:
 
 
 # ── 진입점 ────────────────────────────────────────────────────────────────
-def main(target_date: date = None):
+def main(target_date: date = None, missing_only: bool = False):
     try:
-        result = run_update(target_date)
+        result = run_update(target_date, missing_only)
         report = generate_report(result)
 
         # 콘솔 출력
@@ -633,13 +670,21 @@ def main(target_date: date = None):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
+    # --missing-only 플래그 파싱
+    missing_only_flag = "--missing-only" in sys.argv
+    date_args = [a for a in sys.argv[1:] if not a.startswith("--")]
+
+    if date_args:
         try:
-            td = datetime.strptime(sys.argv[1], "%Y%m%d").date()
+            td = datetime.strptime(date_args[0], "%Y%m%d").date()
         except ValueError:
-            print("날짜 형식 오류. 사용법: python daily_update.py YYYYMMDD")
+            print("날짜 형식 오류. 사용법: python daily_update.py YYYYMMDD [--missing-only]")
             sys.exit(1)
     else:
         td = None
 
-    main(td)
+    if missing_only_flag and td is None:
+        print("--missing-only는 날짜 지정 시에만 사용 가능합니다.")
+        sys.exit(1)
+
+    main(td, missing_only_flag)

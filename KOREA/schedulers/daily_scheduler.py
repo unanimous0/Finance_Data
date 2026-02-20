@@ -82,13 +82,14 @@ def main():
     )
 
     now = datetime.now(KST)
-    next_run = scheduler.get_job("daily_update").next_run_time
+    trigger = CronTrigger(day_of_week="mon-fri", hour=16, minute=30, timezone=KST)
+    next_run = trigger.get_next_fire_time(None, now)
 
     logger.info("="*60)
     logger.info("  한국 주식 일별 데이터 업데이트 스케줄러")
     logger.info("="*60)
     logger.info(f"  현재 시각  : {now.strftime('%Y-%m-%d %H:%M:%S KST')}")
-    logger.info(f"  다음 실행  : {next_run.strftime('%Y-%m-%d %H:%M:%S KST')}")
+    logger.info(f"  다음 실행  : {next_run.strftime('%Y-%m-%d %H:%M:%S KST') if next_run else '미정'}")
     logger.info(f"  실행 주기  : 매일 16:30 (월~금, KST)")
     logger.info(f"  대상 테이블: ohlcv_daily, market_cap_daily, investor_trading")
     logger.info(f"  보고서 저장: reports/daily_update_YYYYMMDD.txt")
