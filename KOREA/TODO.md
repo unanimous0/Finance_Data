@@ -1,19 +1,19 @@
 # 📝 TODO - 작업 목록
 
-> **마지막 업데이트**: 2026-02-19 21:00
-> **현재 Phase**: Phase 1 완료 ✅ (데이터 적재 및 검증 완료) → Phase 2 준비 중
+> **마지막 업데이트**: 2026-02-20
+> **현재 Phase**: Phase 1 완료 ✅ → Phase 2 API 연동 준비 중
 
 ---
 
 ## 🔥 긴급/중요 (최우선)
 
-- [ ] **94개 ETF 시계열 데이터 보충** (데이터 수집 필요)
-  - 신규 상장 ETF로 CSV 원본에 없었던 종목들
+- [ ] **Infomax API 일별 업데이트 파이프라인 구축**
+  - `/api/stock/hist` → ohlcv_daily, market_cap_daily
+  - `/api/stock/investor` → investor_trading (net_buy_value, net_buy_volume)
+  - `/api/stock/code` + `/api/stock/expired` → stocks 마스터 업데이트
+  - 증분 업데이트 로직 (마지막 수집일 다음날부터)
+- [ ] **94개 ETF 시계열 데이터 보충** (API `/api/stock/hist` 활용)
   - 조회 SQL: `SELECT stock_code, stock_name FROM stocks s LEFT JOIN (SELECT DISTINCT stock_code FROM ohlcv_daily) o ON s.stock_code = o.stock_code WHERE o.stock_code IS NULL;`
-- [ ] **API 연동 준비** (Windows 또는 Mac)
-  - 인포맥스 API 문서 검토
-  - 일별 업데이트 전략 수립
-  - 데이터 증분 업데이트 로직
 
 ---
 
@@ -155,6 +155,17 @@
   - [x] xlsx 3개 파일 (KOSPI + KOSDAQ 2개) 읽기
   - [x] 1,052,045건 적재 (2,546개 종목)
   - [x] 기간: 2022-01-03 ~ 2026-02-19
+
+- [x] **수급 순매수거래량(net_buy_volume) 적재** ✅ (2026-02-20)
+  - [x] 13~16번 CSV (외인/기관계/연기금/개인 순매수거래량)
+  - [x] `scripts/load_net_buy_volume.py` 작성
+  - [x] 4종류 × 3,257,951건 전부 채움 (NULL 0건)
+
+- [x] **FnGuide 웹 크롤링 - 발행주식수/유동주식수/유동비율** ✅ (2026-02-20)
+  - [x] `scripts/crawl_floating_shares.py` 작성
+  - [x] 2026-02-19 기준 2,635개 종목 저장 (차단 0회)
+  - [x] floating_ratio: FnGuide 사이트 값 우선
+  - [x] 업데이트 주기: 월 1~2회 수동 실행으로 결정
 
 ### 🔄 진행 중 / 대기 중
 

@@ -718,6 +718,92 @@
 
 ---
 
+## 2026-02-20 (금) - 수급거래량 적재, FnGuide 크롤링, 데이터 정비
+
+### ✅ 완료 작업
+
+1. **investor_trading net_buy_volume 전부 채움**
+   - 기존 상태: net_buy_volume 전부 NULL (13,031,804건)
+   - 13~16번 CSV (순매수거래량 외인/기관계/연기금/개인) 로드
+   - `scripts/load_net_buy_volume.py` 작성 (COPY → temp table → UPDATE 방식)
+   - 결과: 4개 투자자 타입 × 3,257,951건 전부 채움 (NULL 0건)
+   - investor_trading 테이블 완비: net_buy_value(거래대금) + net_buy_volume(거래량) 모두 완성
+
+2. **FnGuide 웹 크롤링 - 발행주식수/유동주식수/유동비율**
+   - Infomax API에 유동주식수/유동비율 데이터 없음 확인 → FnGuide 크롤링으로 대체
+   - URL: `https://comp.fnguide.com/SVO2/asp/SVD_Main.asp?pGB=1&gicode=A{code}&NewMenuID=101&stkGb=701`
+   - `scripts/crawl_floating_shares.py` 작성 (BeautifulSoup4 + lxml)
+   - 2026-02-19 기준 KOSPI/KOSDAQ 2,748개 종목 크롤링
+   - 결과: 2,635개 성공 / 113개 데이터없음(우선주 등) / 차단 0회
+   - floating_ratio: FnGuide 사이트 값 우선 (지수산정주식수 기준), 없으면 직접 계산
+   - floating_shares 테이블에 base_date=2026-02-19 레코드 2,635건 저장 (비율 포함 2,608건)
+
+3. **floating_ratio NULL 원인 파악**
+   - 191개 종목, 9,551레코드에서 floating_ratio=NULL (base_date < 2026-02-19)
+   - 원인: 기존 xlsx의 유동주식수 > 12_발행주식수.csv의 발행주식수 (유상증자 등 미반영)
+   - 예: 코다코(046070) 유동 42M > 발행 1M (40배), 스튜디오산타클로스 30배 등
+   - 처리: 과거 데이터는 NULL 그대로 유지, 2026-02-19부터 FnGuide 크롤링 데이터로 정상화
+
+4. **차단 감지 로직 개선 (크롤러)**
+   - 초기: 짧은 응답(50자) → 차단으로 오인하여 스크립트 중단 오류 발생
+   - 수정: 짧은 응답 = 우선주 등 데이터없는 종목으로 처리, 실제 차단 키워드만 차단 감지
+   - 연속 15건 이상 데이터없음 → 90초 대기 후 재시도 로직 추가
+
+### 🎯 주요 결정사항
+
+#### 1. 유동주식수/유동비율 업데이트 주기: 월 1~2회
+- **배경**: FnGuide 크롤링은 2,748종목 기준 약 23분 소요
+- **이유**: 유동주식수/비율은 자주 변하는 데이터가 아님
+- **방식**: `scripts/crawl_floating_shares.py` 수동 실행 (월 1~2회)
+
+#### 2. floating_ratio 값 기준: FnGuide 사이트 값 우선
+- **배경**: FnGuide 비율 분모 = 지수산정주식수 (발행주식수보통주와 다름)
+- **결정**: 사이트 값이 산업 표준이므로 우선 사용, 없을 경우 직접 계산(유동/발행)
+- **비율불일치 104건**: 오류 아님, 분모 차이로 인한 구조적 차이
+
+#### 3. 과거 floating_ratio NULL 데이터 처리
+- **결정**: 과거 데이터(~2026-02-18)는 NULL 그대로 유지
+- **이유**: 올바른 과거 발행주식수 데이터 없으며, 사이트는 최근값만 제공
+- **이후**: 2026-02-19부터 FnGuide 크롤링 데이터로 정상 업데이트 시작
+
+### 💡 배운 점 / 인사이트
+
+1. **FnGuide 유동비율 분모 = 지수산정주식수**
+   - 유동주식수 / 지수산정주식수 × 100 (한국거래소 KOSPI 지수 산정 기준)
+   - 발행주식수(보통주)와 다름: 우선주 등 포함 여부 차이
+   - SK하이닉스: 사이트 73.77% vs 직접계산 75.35% 차이 발생
+   - 우선주 없는 종목(삼성전자, NAVER 등)은 두 값이 일치
+
+2. **웹 크롤링 차단 감지 전략**
+   - 특정 종목 페이지 없음(50자 응답) ≠ IP 차단
+   - 실제 차단은 응답 본문에 키워드("access denied", "captcha" 등) 존재
+   - 연속 데이터없음 패턴으로 감지하는 것이 더 신뢰성 높음
+
+3. **COPY + UPDATE 패턴 (대량 UPDATE 최적화)**
+   - UPDATE 직접 실행 대신 임시 테이블 COPY 후 JOIN UPDATE
+   - 3.27M건 업데이트를 투자자 타입별 수분 내 완료
+
+### ⚠️ 주의사항
+
+1. **우선주 종목 (예: 000087 하이트진로2우B)**
+   - FnGuide에 페이지 없음 → 크롤링 결과 없음 (정상)
+   - floating_shares에 데이터 없어도 무관 (유동주식수 개념이 우선주에는 부적합)
+
+2. **floating_ratio NULL 191종목 (과거 데이터)**
+   - 해결하지 않은 채로 유지 (향후 레거시 데이터로 취급)
+   - 2026-02-19 이후 데이터는 정상값
+
+### 📌 다음 작업
+
+1. Infomax API로 일별 업데이트 파이프라인 구축
+   - ohlcv_daily, market_cap_daily: `/api/stock/hist`
+   - investor_trading: `/api/stock/investor`
+   - stocks 마스터: `/api/stock/code`, `/api/stock/expired`
+2. 94개 누락 ETF 시계열 데이터 보충 (`/api/stock/hist`)
+3. APScheduler 일별 자동화 (Phase 3)
+
+---
+
 ## 템플릿 (작업 완료시 아래 형식으로 추가)
 
 ```markdown
