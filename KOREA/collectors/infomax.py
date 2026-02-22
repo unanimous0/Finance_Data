@@ -152,6 +152,76 @@ class InfomaxClient:
             })
         return rows
 
+    # ── 현재 상장 종목 목록 (/api/stock/code) ──────────────────────────────
+    def get_stock_codes(self) -> list[dict]:
+        """
+        현재 상장 종목 목록 전체 조회
+        반환: [{"code", "name", "market", "listing_date", "standard_code"}, ...]
+
+        API 응답 필드: code, kr_name, market, equity_type, isin, listed_date
+        """
+        data = self._get("/api/stock/code", {})
+        if not data:
+            return []
+
+        # market 숫자코드 → DB 문자열 변환
+        # API: 1=거래소(KOSPI), 2=거래소기타, 5=KRX, 7=코스닥, 8=코스닥기타
+        MARKET_MAP = {"1": "KOSPI", "2": "KOSPI", "5": "KOSPI",
+                      "7": "KOSDAQ", "8": "KOSDAQ"}
+
+        rows = []
+        for r in data.get("results", []):
+            code = r.get("code")
+            if not code:
+                continue
+            mkt_raw = str(r.get("market", ""))
+            market  = MARKET_MAP.get(mkt_raw, mkt_raw.upper() if mkt_raw else None)
+            # equity_type EF/EN/MF/RT → ETF로 통합
+            eq_type = r.get("equity_type", "")
+            if eq_type and eq_type not in ("ST",):
+                market = "ETF"
+            rows.append({
+                "code":          str(code).strip(),
+                "name":          r.get("kr_name", ""),
+                "market":        market,
+                "listing_date":  self._parse_date(r.get("listed_date")),
+                "standard_code": r.get("isin"),
+            })
+        return rows
+
+    # ── 상장폐지 종목 목록 (/api/stock/expired) ─────────────────────────────
+    def get_expired_codes(self, start_date: Optional[date] = None,
+                          end_date: Optional[date] = None) -> list[dict]:
+        """
+        상장폐지 종목 목록 조회
+        start_date: 폐지일 기준 시작일 (None = API 기본값 today-365)
+        end_date:   폐지일 기준 종료일 (None = API 기본값 today)
+        반환: [{"code", "name", "delisting_date"}, ...]
+
+        API 응답 필드: isin, code, market_type, equity_type, kr_name, listed_date, delisted_date
+        """
+        params: dict = {}
+        if start_date:
+            params["startDate"] = start_date.strftime("%Y%m%d")
+        if end_date:
+            params["endDate"] = end_date.strftime("%Y%m%d")
+
+        data = self._get("/api/stock/expired", params)
+        if not data:
+            return []
+
+        rows = []
+        for r in data.get("results", []):
+            code = r.get("code")
+            if not code:
+                continue
+            rows.append({
+                "code":           str(code).strip(),
+                "name":           r.get("kr_name", ""),
+                "delisting_date": self._parse_date(r.get("delisted_date")),
+            })
+        return rows
+
     @staticmethod
     def _parse_date(val) -> Optional[date]:
         if val is None:

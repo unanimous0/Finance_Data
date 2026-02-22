@@ -5,6 +5,65 @@
 
 ---
 
+## 2026-02-22 (일) - Phase 4 완료: 품질 체크·백업·종목 마스터 자동 갱신·프로젝트 정리
+
+### ✅ 완료 작업
+
+1. **데이터 품질 체크 자동화** (`validators/quality_checks.py`)
+   - 5종 체크: NULL 비율, 중복 레코드, OHLCV 논리 오류(high<low 등), 거래일 연속성 갭, 수급 합산 검증
+   - 결과 `data_quality_checks` 테이블 저장 → 이력 관리
+
+2. **PostgreSQL 백업 자동화** (`scripts/backup_db.py`)
+   - `pg_dump -Fc` 포맷 (압축, `pg_restore`로 복구 가능)
+   - `backups/backup_YYYYMMDD_HHMM.dump` 저장
+   - 7일 초과 파일 자동 삭제, 빈 파일(실패 잔재) 자동 삭제
+
+3. **품질/수집 모니터링 스크립트**
+   - `scripts/data_quality_report.py`: 최근 N일 품질 체크 이력 테이블 출력
+   - `scripts/check_collection_status.py`: 날짜별 수집 현황, 누락 감지
+
+4. **스케줄러에 주간 백업 추가** (`schedulers/daily_scheduler.py`)
+   - 매주 일요일 03:00 KST — `run_backup()` 자동 실행
+
+5. **종목 마스터 자동 갱신** (`collectors/infomax.py` + `scripts/daily_update.py`)
+   - `InfomaxClient.get_stock_codes()`: `/api/stock/code` — 현재 상장 종목 전체 조회
+     - API 필드: `code`, `kr_name`, `market`(숫자코드→KOSPI/KOSDAQ/ETF 변환), `equity_type`, `isin`, `listed_date`
+     - equity_type ST 외 → "ETF"로 통합
+   - `InfomaxClient.get_expired_codes(start_date, end_date)`: `/api/stock/expired` — 상장폐지 종목 조회
+     - API 기본값 `startDate=today-365` 한계 → DB `MIN(listing_date)`를 `startDate`로 전달
+   - `sync_stock_master()`: 신규 상장 `ON CONFLICT DO NOTHING` INSERT, 상장폐지 soft delete (`is_active=FALSE`, `delisting_date`)
+   - `daily_update.py` STEP 0으로 실행 (매일 자동)
+
+6. **Read-only DB 계정 생성**
+   - 계정명: `korea_stock_reader`
+   - 타 프로젝트에서 읽기 전용으로 DB 접근 가능
+
+7. **프로젝트 불필요 파일 정리**
+   - 삭제: `api/` 폴더, `etl/` 폴더, `notebooks/` 폴더
+   - 삭제: `tests/test_etl/`, `tests/test_collectors/` (빈 폴더)
+   - 삭제: `scripts/` 1회성 스크립트 전체 (test_*, load_*, inspect_*, check_environment.py, crawl_floating_shares.py, setup_readonly_user.py, *.sh)
+   - 이동: `database/korea_stock_data.dump` → `backups/`
+   - 제거: `daily_update.py`의 불필요 import (`threading`, `io`)
+
+### 🎯 주요 결정사항
+
+#### 1. `/api/stock/expired` startDate 커버리지
+- API 기본값 `today-365`로는 전체 폐지 이력 누락 가능
+- 해결: `sync_stock_master()`에서 `SELECT MIN(listing_date) FROM stocks WHERE is_active=TRUE`로 최초 상장일 쿼리 → 해당 날짜부터 폐지 이력 조회
+
+#### 2. 1회성 스크립트 삭제 결정
+- 초기 적재·검증용 스크립트들은 이미 역할 완수, 코드베이스 정리 차원에서 전부 삭제
+- git 이력에 남아 있으므로 필요 시 복구 가능
+
+### 📌 다음 작업
+
+- 2026-02-20 데이터 수동 수집: `python scripts/daily_update.py 20260220`
+- 스케줄러 재가동: `nohup python schedulers/daily_scheduler.py &`
+- 94개 ETF 시계열 데이터 보충
+- 서버 구축 (맥미니)
+
+---
+
 ## 2026-02-20 (금) - 스케줄러 버그 수정 / 2-19 데이터 수집 / 재수집 모드 추가
 
 ### ✅ 완료 작업

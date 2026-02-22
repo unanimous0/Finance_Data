@@ -9,9 +9,7 @@
 """
 
 import sys
-import io
 import time
-import threading
 import traceback
 from pathlib import Path
 from datetime import date, datetime, timedelta
@@ -27,6 +25,7 @@ sys.path.insert(0, str(project_root))
 
 from config.settings import settings
 from collectors.infomax import InfomaxClient
+from validators.quality_checks import run_quality_checks
 
 KST = ZoneInfo("Asia/Seoul")
 REPORTS_DIR = project_root / "reports"
@@ -267,6 +266,76 @@ def analyze_anomalies(ohlcv_rows: list[dict],
     return anomalies
 
 
+# ── 종목 마스터 자동 갱신 ────────────────────────────────────────────────
+def sync_stock_master(conn, client) -> dict:
+    """
+    STEP 0: 종목 마스터 갱신
+    - /api/stock/code    → 신규 상장 종목 INSERT
+    - /api/stock/expired → 상장폐지 종목 is_active=False UPDATE
+
+    Returns: {"new_listed": [...], "delisted": [...], "errors": [...]}
+    """
+    result = {"new_listed": [], "delisted": [], "errors": []}
+
+    # DB 전체 종목 코드 + 활성 여부
+    with conn.cursor() as cur:
+        cur.execute("SELECT stock_code, is_active FROM stocks")
+        db_stocks = {row[0]: row[1] for row in cur.fetchall()}
+
+    # ── 신규 상장 종목 ─────────────────────────────────────────
+    try:
+        api_stocks = client.get_stock_codes()
+        for s in api_stocks:
+            code = s["code"]
+            if not code or code in db_stocks:
+                continue
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO stocks
+                        (stock_code, stock_name, market, standard_code, listing_date, is_active)
+                    VALUES (%s, %s, %s, %s, %s, TRUE)
+                    ON CONFLICT (stock_code) DO NOTHING
+                """, (code, s["name"], s["market"], s["standard_code"], s["listing_date"]))
+            conn.commit()
+            result["new_listed"].append(code)
+    except Exception as e:
+        result["errors"].append(f"신규 상장 조회 실패: {e}")
+
+    # ── 상장폐지 종목 ──────────────────────────────────────────
+    try:
+        # DB 활성 종목 중 가장 오래된 상장일을 startDate로 사용
+        # → API 기본값(today-365)보다 넓게 조회해 누락 방지
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT MIN(listing_date) FROM stocks
+                WHERE is_active = TRUE AND listing_date IS NOT NULL
+            """)
+            oldest_listing = cur.fetchone()[0]
+
+        expired_start = oldest_listing if oldest_listing else date(2000, 1, 1)
+        expired = client.get_expired_codes(start_date=expired_start)
+        for s in expired:
+            code = s["code"]
+            if not code:
+                continue
+            # DB에 있고 현재 is_active=True인 경우만 처리
+            if db_stocks.get(code) is True:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE stocks
+                        SET is_active      = FALSE,
+                            delisting_date = %s,
+                            updated_at     = NOW()
+                        WHERE stock_code = %s AND is_active = TRUE
+                    """, (s["delisting_date"], code))
+                conn.commit()
+                result["delisted"].append(code)
+    except Exception as e:
+        result["errors"].append(f"상장폐지 조회 실패: {e}")
+
+    return result
+
+
 # ── 전일 종가 조회 ────────────────────────────────────────────────────────
 def get_prev_close(conn, target_date: date) -> dict[str, float]:
     """target_date 직전 영업일의 종가 딕셔너리"""
@@ -302,6 +371,29 @@ def run_update(target_date: date = None, missing_only: bool = False) -> dict:
             conn.close()
             return {}
 
+    # ─────────────────────────────────────────────────────────
+    # STEP 0: 종목 마스터 갱신 (신규 상장 / 상장폐지 자동 반영)
+    # ─────────────────────────────────────────────────────────
+    print("[0/2] 종목 마스터 갱신 중...")
+    master_sync = {"new_listed": [], "delisted": [], "errors": []}
+    try:
+        master_sync = sync_stock_master(conn, client)
+        if master_sync["new_listed"]:
+            codes_str = ", ".join(master_sync["new_listed"][:5])
+            suffix    = f" 외 {len(master_sync['new_listed'])-5}개" if len(master_sync["new_listed"]) > 5 else ""
+            print(f"  ✅ 신규 상장 {len(master_sync['new_listed'])}개 추가: {codes_str}{suffix}")
+        if master_sync["delisted"]:
+            codes_str = ", ".join(master_sync["delisted"][:5])
+            suffix    = f" 외 {len(master_sync['delisted'])-5}개" if len(master_sync["delisted"]) > 5 else ""
+            print(f"  ✅ 상장폐지 처리 {len(master_sync['delisted'])}개: {codes_str}{suffix}")
+        if not master_sync["new_listed"] and not master_sync["delisted"] and not master_sync["errors"]:
+            print("  ✅ 변동 없음 (신규 상장 / 상장폐지 없음)")
+        for err in master_sync["errors"]:
+            print(f"  ⚠️  {err}")
+    except Exception as e:
+        print(f"  ⚠️  종목 마스터 갱신 실패 (수집은 계속 진행): {e}")
+        master_sync["errors"].append(str(e))
+
     if missing_only and target_date:
         all_stocks   = get_missing_ohlcv_stocks(conn, target_date)
         kospi_kosdaq = get_missing_investor_stocks(conn, target_date)
@@ -328,6 +420,7 @@ def run_update(target_date: date = None, missing_only: bool = False) -> dict:
         "started_at":     started_at,
         "start_date":     start_date,
         "end_date":       end_date,
+        "master_sync":    master_sync,
         "ohlcv":          {"success": 0, "fail": 0, "rows": 0, "changed": 0, "skipped": 0, "fail_codes": []},
         "market_cap":     {"rows": 0, "changed": 0, "skipped": 0},
         "investor":       {"success": 0, "fail": 0, "rows": 0, "changed": 0, "skipped": 0, "fail_codes": []},
@@ -488,6 +581,7 @@ def generate_report(result: dict) -> str:
     s_date   = result["start_date"]
     e_date   = result["end_date"]
 
+    master_sync = result.get("master_sync", {})
     ohlcv    = result["ohlcv"]
     mktcap   = result["market_cap"]
     investor = result["investor"]
@@ -513,6 +607,31 @@ def generate_report(result: dict) -> str:
     lines.append(f"  완료 일시 : {finished.strftime('%Y-%m-%d %H:%M:%S KST')}")
     lines.append(f"  소요 시간 : {int(elapsed//3600)}시간 {int(elapsed%3600//60)}분 {int(elapsed%60)}초")
     lines.append(f"  업데이트 기간 : {s_date} ~ {e_date}")
+    lines.append("")
+
+    # ── 종목 마스터 갱신 ───────────────────────────────────────
+    sub("0. 종목 마스터 갱신")
+    new_listed = master_sync.get("new_listed", [])
+    delisted   = master_sync.get("delisted",   [])
+    ms_errors  = master_sync.get("errors",     [])
+
+    if new_listed:
+        codes_str = ", ".join(new_listed[:10])
+        suffix = f" 외 {len(new_listed)-10}개" if len(new_listed) > 10 else ""
+        lines.append(f"\n  신규 상장  : {len(new_listed)}개  →  {codes_str}{suffix}")
+    else:
+        lines.append("\n  신규 상장  : 없음")
+
+    if delisted:
+        codes_str = ", ".join(delisted[:10])
+        suffix = f" 외 {len(delisted)-10}개" if len(delisted) > 10 else ""
+        lines.append(f"  상장폐지   : {len(delisted)}개  →  {codes_str}{suffix}")
+    else:
+        lines.append("  상장폐지   : 없음")
+
+    if ms_errors:
+        for err in ms_errors:
+            lines.append(f"  ⚠️  {err}")
     lines.append("")
 
     # ── 수집 요약 ──────────────────────────────────────────────
@@ -657,6 +776,12 @@ def main(target_date: date = None, missing_only: bool = False):
         end_date = result["end_date"]
         fpath = save_report(report, end_date)
         print(f"\n📁 보고서 저장: {fpath}")
+
+        # 품질 체크 (수집 완료 후 자동 실행)
+        try:
+            run_quality_checks(end_date)
+        except Exception as qc_err:
+            print(f"\n⚠️  품질 체크 중 오류 (업데이트 결과에는 영향 없음): {qc_err}")
 
     except Exception as e:
         err_msg = traceback.format_exc()

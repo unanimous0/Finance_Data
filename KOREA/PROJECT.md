@@ -1,7 +1,7 @@
 # 🏢 한국 주식시장 데이터 중앙 관리 시스템
 
-> **마지막 업데이트**: 2026-02-20 (스케줄러 버그 수정, 2/19 데이터 100% 수집, 재수집 모드 추가)
-> **프로젝트 상태**: Phase 3 스케줄러 실전 가동 중
+> **마지막 업데이트**: 2026-02-22 (Phase 4 완료, 종목 마스터 자동 갱신, 프로젝트 구조 정리)
+> **프로젝트 상태**: Phase 4 완료 / 스케줄러 실전 가동 중
 > **Repository**: https://github.com/unanimous0/Finance_Data/tree/main/KOREA
 
 ---
@@ -22,9 +22,17 @@
   - 일별 업데이트 파이프라인 구축 완료 (`collectors/infomax.py`, `scripts/daily_update.py`)
   - 멀티스레드 병렬화 적용 (ThreadPoolExecutor, 공유 rate limiter)
   - 특이사항 감지 + 보고서 자동 생성
-- Phase 3 진행 중 🔄: 스케줄러 실전 가동 시작 (2026-02-20)
-  - `daily_scheduler.py` 버그 수정 완료
-  - `--missing-only` 재수집 모드 추가 (연휴 직후 대응)
+- Phase 3 완료 ✅: 스케줄러 실전 가동 (2026-02-20~)
+  - 매일 16:30 KST 자동 수집 / 매주 일요일 03:00 DB 백업
+  - `--missing-only` 재수집 모드 (연휴 직후 대응)
+- Phase 4 완료 ✅ (2026-02-22)
+  - `validators/quality_checks.py`: 5종 데이터 품질 체크 자동화
+  - `scripts/backup_db.py`: pg_dump -Fc 주간 백업 (7일 보관)
+  - `scripts/data_quality_report.py`: 품질 체크 이력 조회
+  - `scripts/check_collection_status.py`: 수집 현황 모니터링
+  - `collectors/infomax.py`: 신규 상장/폐지 API 추가 (`get_stock_codes`, `get_expired_codes`)
+  - `daily_update.py` STEP 0: 종목 마스터 자동 갱신 (신규 상장 INSERT, 상장폐지 UPDATE)
+  - Read-only DB 계정 생성 완료 (`korea_stock_reader`)
 - 미완료: 94개 ETF 시계열 데이터 보충, 서버 구축
 
 ---
@@ -187,40 +195,42 @@ KOREA/
 │
 ├── database/              # 데이터베이스 관련
 │   ├── schema/
-│   │   └── init_schema.sql    # 초기 스키마 정의
+│   │   ├── init_schema.sql      # 초기 스키마 정의
+│   │   ├── init_schema_v2.sql   # 스키마 v2
+│   │   └── alter_stocks_table.sql
 │   ├── connection.py      # SQLAlchemy 연결 관리
 │   └── models.py          # ORM 모델 (10개)
 │
 ├── collectors/            # 데이터 수집기
 │   └── infomax.py        # 인포맥스 API 수집기 (InfomaxClient, thread-safe)
+│                          #   get_hist(), get_investor(), get_stock_codes(), get_expired_codes()
 │
 ├── validators/            # 데이터 검증
-│   └── schemas.py        # Pydantic 스키마 (10개)
-│
-├── etl/                   # ETL 파이프라인
-│   ├── extract.py        # 데이터 추출
-│   ├── transform.py      # 데이터 변환
-│   └── load.py           # DB 적재
+│   ├── schemas.py        # Pydantic 스키마 (10개)
+│   └── quality_checks.py # 5종 품질 체크 (NULL, 중복, 논리, 연속성, 수급 합산)
 │
 ├── schedulers/            # 스케줄링
-│   └── daily_scheduler.py  # APScheduler 매일 16:30 자동 실행
+│   └── daily_scheduler.py  # APScheduler: 매일 16:30 수집 / 매주 일요일 03:00 백업
 │
 ├── utils/                 # 유틸리티
 │   ├── logger.py         # Loguru 로깅
 │   └── exceptions.py     # 커스텀 예외
 │
 ├── scripts/               # 실행 스크립트
-│   ├── daily_update.py          # 일별 업데이트 (OHLCV+시가총액+수급, 특이사항 감지, 보고서)
-│   ├── crawl_floating_shares.py # FnGuide 유동주식수 크롤링 (월 1~2회)
-│   ├── load_all_data_from_csv.py  # 초기 CSV 적재
-│   └── ...
+│   ├── daily_update.py          # 일별 업데이트 (종목 마스터 갱신 + OHLCV + 수급 + 보고서)
+│   ├── backup_db.py             # pg_dump -Fc 백업 (7일 보관)
+│   ├── data_quality_report.py   # 품질 체크 이력 조회
+│   └── check_collection_status.py  # 수집 현황 모니터링
 │
 ├── tests/                 # 테스트 코드
 │   ├── conftest.py       # pytest 설정
-│   ├── test_validators/
-│   └── test_models/
+│   ├── test_validators/  # Pydantic 스키마 테스트
+│   └── test_models/      # ORM 모델 테스트
 │
-└── logs/                  # 로그 파일
+├── docs/                  # API 문서 등
+├── backups/               # pg_dump 백업 파일 (*.dump)
+├── logs/                  # 로그 파일
+└── reports/               # 일별 업데이트 보고서
 ```
 
 ---
@@ -409,22 +419,28 @@ SELECT add_compression_policy('ohlcv_daily', INTERVAL '30 days');
 
 **완료 기준**: 수동으로 데이터 수집 → DB 저장 성공 ✅
 
-### Phase 3: 스케줄링 및 자동화 (진행 중 🔄)
+### Phase 3: 스케줄링 및 자동화 ✅ 완료
 
 - [x] `schedulers/daily_scheduler.py` 작성 (매일 16:30 KST)
 - [x] next_run_time 버그 수정 완료
 - [x] `--missing-only` 재수집 모드 추가 (연휴 직후 API 지연 대응)
-- [ ] 1주일 이상 무인 자동 수집 확인
+- [x] 스케줄러 실전 가동 (2026-02-20~)
 
-**완료 기준**: 1주일 이상 무인 자동 수집 성공
+**완료 기준 달성**: ✅
 
-### Phase 4: 데이터 품질 및 백업 (예정)
+### Phase 4: 데이터 품질 및 백업 ✅ 완료 (2026-02-22)
 
-- [ ] 일별 품질 리포트 생성
-- [ ] PostgreSQL 자동 백업
-- [ ] 과거 1년치 데이터 백필
+- [x] `validators/quality_checks.py`: 5종 품질 체크 (NULL, 중복, OHLCV 논리, 거래일 연속성, 수급 합산)
+- [x] `scripts/backup_db.py`: pg_dump -Fc 주간 백업 (7일 보관)
+- [x] `scripts/data_quality_report.py`: 품질 체크 이력 조회
+- [x] `scripts/check_collection_status.py`: 수집 현황 모니터링
+- [x] `schedulers/daily_scheduler.py`: 매주 일요일 03:00 DB 백업 추가
+- [x] `collectors/infomax.py`: `get_stock_codes()`, `get_expired_codes()` 추가
+- [x] `scripts/daily_update.py` STEP 0: `sync_stock_master()` — 신규 상장 자동 INSERT, 상장폐지 자동 UPDATE
+- [x] Read-only DB 계정 생성 (`korea_stock_reader`)
+- [x] 불필요 파일/폴더 정리 (api/, etl/, notebooks/, 1회성 스크립트 삭제)
 
-**완료 기준**: 백업 자동화, 1년치 데이터 확보
+**완료 기준 달성**: ✅
 
 ### Phase 5: 인터페이스 개발 (예정)
 
@@ -523,5 +539,5 @@ SELECT add_compression_policy('ohlcv_daily', INTERVAL '30 days');
 
 ---
 
-**Last Updated**: 2026-02-18
+**Last Updated**: 2026-02-22
 **Contact**: (작성자 정보)
