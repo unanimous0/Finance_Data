@@ -1,7 +1,7 @@
 # 📝 TODO - 작업 목록
 
-> **마지막 업데이트**: 2026-02-22
-> **현재 Phase**: Phase 4 완료 / 스케줄러 실전 가동 중
+> **마지막 업데이트**: 2026-02-23
+> **현재 Phase**: Phase 4 완료 / 스케줄러 재가동 필요
 
 ---
 
@@ -9,7 +9,8 @@
 
 - [ ] **94개 ETF 시계열 데이터 보충** (API `/api/stock/hist` 활용)
   - 조회 SQL: `SELECT stock_code, stock_name FROM stocks s LEFT JOIN (SELECT DISTINCT stock_code FROM ohlcv_daily) o ON s.stock_code = o.stock_code WHERE o.stock_code IS NULL;`
-- [ ] **2026-02-20 데이터 수동 수집**: `python scripts/daily_update.py 20260220`
+- [x] **2026-02-20 데이터 수동 수집** ✅ (2026-02-23): OHLCV 3,822건 / 수급 2,747종목, 실패 0건
+- [ ] **2026-02-23 데이터 수집** (장 마감 후): `python scripts/daily_update.py 20260223`
 - [ ] **스케줄러 재가동**: `nohup python schedulers/daily_scheduler.py &`
 - [ ] **서버 구축** (맥미니 구매 후 설정)
 - [ ] **연휴 직후 재수집 루틴** — 설/추석 직후 첫 거래일은 `--missing-only` 확인 필요

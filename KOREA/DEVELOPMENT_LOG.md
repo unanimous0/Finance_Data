@@ -5,6 +5,69 @@
 
 ---
 
+## 2026-02-23 (월) - 2/20 데이터 수집 완료 + 거래정지 탐지 로직 개선
+
+### ✅ 완료 작업
+
+1. **2026-02-20 데이터 수집 완료**
+   - 백그라운드 실행: `PYTHONPATH=. PYTHONUNBUFFERED=1 nohup python -u scripts/daily_update.py 20260220 > logs/update_20260220.log 2>&1 &`
+   - 첫 실행 시 Python 출력 버퍼링 문제로 로그 파일 비어있음 → `-u` + `PYTHONUNBUFFERED=1` 옵션으로 해결
+   - 결과: OHLCV 3,822건 / 시가총액 3,822건 / 수급 2,747종목 — 실패 0건
+   - 품질 체크 5종 이상 없음, 보고서 저장: `reports/daily_update_20260220.txt`
+   - 가격급등 11건 (한화생명·미래에셋생명 등 보험주), 가격급락 1건 감지
+
+2. **거래정지 탐지 로직 개선** (`scripts/daily_update.py`)
+   - **기존**: `volume=0 AND close>0` → 단순 1일 체크 (노이즈 다수)
+   - **개선**: DB 쿼리로 연속 무거래일수 계산, 임계값별 3단계 분류
+
+   | 연속일 | 분류 | 대상 |
+   |--------|------|------|
+   | 1~2일 | 스킵 | 일상적 무거래 (소형주·ETF) |
+   | 3~4일 | 거래정지의심 🟡 | 스팩 제외 |
+   | 5일+ | 거래정지 🔴 | 스팩 제외 |
+   | 5일+ (스팩) | 무거래(스팩) ⚪ | 스팩 종목 별도 분류 |
+
+   - 신규 함수 `get_halt_suspects(conn, target_date)`: SQL Window Function(ROW_NUMBER)으로 연속일수 계산 (최대 90일 소급)
+   - 상수 변경: `THRESHOLD_VOLUME_ZERO` → `THRESHOLD_HALT_SUSPECT=3`, `THRESHOLD_HALT_CONFIRM=5`
+   - 보고서 type_order / emoji 추가 (거래정지의심🟡, 무거래(스팩)⚪)
+
+### 🎯 주요 결정사항
+
+#### 1. 거래정지 분류 기준 (3일/5일)
+- **고려한 대안**: 전일 종가와 당일 종가 동일 여부 체크
+- **기각 이유**: `volume=0`이면 종가는 항상 동일 → 조건 추가 효과 없음, 권리락/배당락 적용 시 오히려 진짜 거래정지를 놓칠 수 있음
+- **채택**: 연속일수 기반 분류 — 단순하고 의미 있는 신호
+
+#### 2. 스팩 별도 분리
+- SPAC 합병 전까지 수개월 무거래가 정상 → 일반 거래정지와 동일 분류 시 노이즈
+- `"스팩" in stock_name` 으로 판별, 5일+ 이상만 `무거래(스팩)` 으로 별도 표시
+
+#### 3. 연속일수 조회 방식
+- 매일 OHLCV 저장 후 DB에서 쿼리 (in-memory 처리 불가)
+- `get_halt_suspects(conn, end_date)` → `analyze_anomalies(..., halt_suspects)` 로 전달
+- Window Function: `ROW_NUMBER() OVER (PARTITION BY stock_code ORDER BY time DESC)` — 거래일 기준 연속일, 공휴일 자동 무시
+
+### 💡 배운 점 / 인사이트
+
+#### Infomax API 플랜별 속도 비교
+| 플랜 | 제한 | 딜레이 | 예상 소요 | 요금 |
+|------|------|--------|---------|------|
+| Lite | 60회/분 | 1.05s | ~110분 | 10만원 |
+| Standard | 120회/분 | 0.5s | ~55분 | 25만원 |
+| Pro | 180회/분 | 0.33s | ~36분 | 50만원 |
+
+- 현재 Lite 플랜 사용 (`collectors/infomax.py` REQ_DELAY=1.05)
+- 플랜 업그레이드 시 코드 변경 없이 `REQ_DELAY` 값만 조정하면 됨
+
+### 📌 다음 작업
+
+- 2026-02-23 데이터 수집 (장 마감 후 16:30~): `python scripts/daily_update.py 20260223`
+- 스케줄러 재가동: `nohup python schedulers/daily_scheduler.py &`
+- 94개 ETF 시계열 데이터 보충
+- 서버 구축 (맥미니)
+
+---
+
 ## 2026-02-22 (일) - Phase 4 완료: 품질 체크·백업·종목 마스터 자동 갱신·프로젝트 정리
 
 ### ✅ 완료 작업

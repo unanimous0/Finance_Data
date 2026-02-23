@@ -38,7 +38,8 @@ MAX_WORKERS = 4
 
 # 특이사항 임계값
 THRESHOLD_PRICE_CHANGE  = 0.295   # 가격 변동 29.5% 이상 (상한/하한가 근접)
-THRESHOLD_VOLUME_ZERO   = True    # 거래량 0 = 거래정지
+THRESHOLD_HALT_SUSPECT  = 3   # 거래량 0 연속 3~4일 → 거래정지 의심
+THRESHOLD_HALT_CONFIRM  = 5   # 거래량 0 연속 5일 이상 → 거래정지 (스팩도 동일)
 THRESHOLD_LARGE_NET_BUY = 5e10    # 순매수 500억 이상 (거액 유입/이탈)
 
 
@@ -193,10 +194,14 @@ def upsert_batch(conn, sql: str, rows: list[tuple]) -> tuple[int, int]:
 # ── 특이사항 분석 ─────────────────────────────────────────────────────────
 def analyze_anomalies(ohlcv_rows: list[dict],
                       investor_rows: list[dict],
-                      prev_close: dict) -> list[dict]:
+                      prev_close: dict,
+                      halt_suspects: dict) -> list[dict]:
     """
     특이사항 목록 반환
     각 항목: {"type", "stock_code", "stock_name", "date", "detail", "value"}
+
+    halt_suspects: get_halt_suspects() 결과 {stock_code: (consecutive_days, close_price)}
+                   연속 무거래일이 THRESHOLD_HALT_SUSPECT 미만인 종목은 포함되지 않음
     """
     anomalies = []
 
@@ -210,14 +215,34 @@ def analyze_anomalies(ohlcv_rows: list[dict],
         low   = r["low_price"]   or 0
         vol   = r["volume"]      or 0
 
-        # 거래량 0 → 거래정지/관리종목
-        if vol == 0 and close > 0:
-            anomalies.append({
-                "type": "거래정지",
-                "stock_code": code, "stock_name": name, "date": dt,
-                "detail": f"거래량=0, 종가={close:,}원",
-                "value": 0,
-            })
+        # 거래량 0 → 연속일수 기반 분류
+        # 1~2일은 소형주/ETF의 일상적 무거래일 수 있으므로 노이즈로 스킵
+        if vol == 0 and close > 0 and code in halt_suspects:
+            consec, _ = halt_suspects[code]
+            is_spac = "스팩" in name
+            if is_spac:
+                # 스팩은 합병 전까지 장기 무거래가 정상 → 5일+ 이상만 별도 표시
+                if consec >= THRESHOLD_HALT_CONFIRM:
+                    anomalies.append({
+                        "type": "무거래(스팩)",
+                        "stock_code": code, "stock_name": name, "date": dt,
+                        "detail": f"거래량=0 연속 {consec}일, 종가={close:,}원",
+                        "value": consec,
+                    })
+            elif consec >= THRESHOLD_HALT_CONFIRM:
+                anomalies.append({
+                    "type": "거래정지",
+                    "stock_code": code, "stock_name": name, "date": dt,
+                    "detail": f"거래량=0 연속 {consec}일, 종가={close:,}원",
+                    "value": consec,
+                })
+            else:  # THRESHOLD_HALT_SUSPECT <= consec < THRESHOLD_HALT_CONFIRM
+                anomalies.append({
+                    "type": "거래정지의심",
+                    "stock_code": code, "stock_name": name, "date": dt,
+                    "detail": f"거래량=0 연속 {consec}일, 종가={close:,}원",
+                    "value": consec,
+                })
 
         # OHLCV 논리 오류
         if high and low and high < low:
@@ -348,6 +373,51 @@ def get_prev_close(conn, target_date: date) -> dict[str, float]:
             ORDER BY stock_code, time DESC
         """, (target_date,))
         return {row[0]: row[1] for row in cur.fetchall()}
+
+
+# ── 거래정지 의심 종목 조회 (연속 무거래일수) ─────────────────────────────
+def get_halt_suspects(conn, target_date: date) -> dict[str, tuple[int, float]]:
+    """
+    target_date 기준 volume=0 연속일수 조회 (DB 직접 쿼리)
+    반환: {stock_code: (consecutive_days, close_price)}
+           consecutive_days: target_date 포함 연속 무거래 거래일 수
+           90일 이상 연속이면 90으로 표시 (상한선)
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            WITH recent AS (
+                SELECT
+                    stock_code,
+                    volume,
+                    close_price,
+                    ROW_NUMBER() OVER (PARTITION BY stock_code ORDER BY time DESC) AS rn
+                FROM ohlcv_daily
+                WHERE time <= %s
+                  AND time > %s - INTERVAL '90 days'
+            ),
+            zero_today AS (
+                -- target_date(rn=1)에 volume=0인 종목만 추림
+                SELECT stock_code, close_price
+                FROM recent
+                WHERE rn = 1 AND volume = 0 AND close_price > 0
+            ),
+            first_nonzero AS (
+                -- 과거로 거슬러 올라가 첫 번째 volume>0 날의 rn을 찾음
+                SELECT r.stock_code, MIN(r.rn) AS nonzero_rn
+                FROM recent r
+                JOIN zero_today z ON z.stock_code = r.stock_code
+                WHERE r.volume > 0
+                GROUP BY r.stock_code
+            )
+            SELECT
+                z.stock_code,
+                -- nonzero_rn=5 이면 rn 1~4가 연속 0 → 4일
+                COALESCE(fn.nonzero_rn - 1, 90) AS consecutive_days,
+                z.close_price
+            FROM zero_today z
+            LEFT JOIN first_nonzero fn ON fn.stock_code = z.stock_code
+        """, (target_date, target_date))
+        return {row[0]: (int(row[1]), float(row[2])) for row in cur.fetchall()}
 
 
 # ── 메인 업데이트 로직 ────────────────────────────────────────────────────
@@ -560,10 +630,12 @@ def run_update(target_date: date = None, missing_only: bool = False) -> dict:
     # STEP 3: 특이사항 분석
     # ─────────────────────────────────────────────────────────
     print("\n[분석] 특이사항 감지 중...")
+    halt_suspects = get_halt_suspects(conn, end_date)
     result["anomalies"] = analyze_anomalies(
         result["ohlcv_data"],
         result["investor_data"],
         prev_close,
+        halt_suspects,
     )
     print(f"  ✅ 특이사항 {len(result['anomalies'])}건 감지")
 
@@ -703,8 +775,8 @@ def generate_report(result: dict) -> str:
         for a in anomalies:
             by_type[a["type"]].append(a)
 
-        type_order = ["거래정지", "OHLCV오류", "가격급등", "가격급락",
-                      "대규모순매수", "대규모순매도"]
+        type_order = ["거래정지", "거래정지의심", "무거래(스팩)", "OHLCV오류",
+                      "가격급등", "가격급락", "대규모순매수", "대규모순매도"]
         sorted_types = sorted(by_type.keys(),
                               key=lambda t: type_order.index(t) if t in type_order else 99)
 
@@ -714,6 +786,8 @@ def generate_report(result: dict) -> str:
             items = by_type[atype]
             emoji = {
                 "거래정지":     "🔴",
+                "거래정지의심": "🟡",
+                "무거래(스팩)": "⚪",
                 "OHLCV오류":    "❌",
                 "가격급등":     "📈",
                 "가격급락":     "📉",
