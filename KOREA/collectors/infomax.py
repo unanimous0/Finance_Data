@@ -239,12 +239,9 @@ class InfomaxClient:
             return out
 
         all_stocks: dict[str, dict] = {}
-        all_stocks.update(_fetch({"market": "1", "type": "ST"}))   # KOSPI 주식
-        all_stocks.update(_fetch({"market": "2"}))                  # KOSPI 기타
+        all_stocks.update(_fetch({"market": "1", "type": "ST"}))        # KOSPI 주식
         all_stocks.update(_fetch_split({"market": "7", "type": "ST"}))  # KOSDAQ 주식
-        all_stocks.update(_fetch_split({"type": "EF"}))             # ETF
-        for eq in ("EN", "MF", "RT", "IF", "DR", "SW", "SR", "EW", "BC", "FS"):
-            all_stocks.update(_fetch({"type": eq}))                 # 기타 소규모
+        all_stocks.update(_fetch_split({"type": "EF"}))                 # ETF
 
         return list(all_stocks.values())
 
