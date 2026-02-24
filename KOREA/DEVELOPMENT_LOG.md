@@ -27,11 +27,10 @@
    - **해결**: `code` 파라미터 2자리 prefix(00~49) 분리 + `startswith()` 필터링
      - KOSPI ST: market=1 단일 호출 (919개, 1,000 미만)
      - KOSDAQ ST: market=7 + prefix 분리 (1,801개 ✅)
-     - ETF: type=EF + prefix 분리 (1,579개 ✅)
-     - 기타 소규모: EN/MF/RT/IF/DR/SW/SR/EW/BC/FS 각 단일 호출
+     - ETF EF: type=EF + prefix 분리 (1,579개 ✅)
    - **MARKET_MAP 버그 수정**: API가 숫자코드가 아닌 한글 텍스트(`거래소(코스피)`) 반환 → 양쪽 대응
    - **equity_type 버그 수정**: `'ST'`만 체크하던 것을 `'주식'`도 추가 (한글 반환 대응)
-   - 결과: 단일 호출 1,000개 → **4,299개** 전종목 수집
+   - 결과: 단일 호출 1,000개 → **3가지 구분(KOSPI/KOSDAQ/ETF) 전종목 수집**
 
 4. **DB 정합성 정비**
    - `investor_trading` ETF 데이터 혼입 제거: **2,925,544건 삭제** (CSV 초기 적재 시 ETF 수급까지 포함됐던 오류)
@@ -43,6 +42,13 @@
    - ETF listing_date NULL 1,072개 → API에서 일괄 업데이트 → **잔여 1개** (481200만)
      - 0106J0(대신 KOSPI200 X클래스), 0120X0(유진 챔피언 X클래스): 2025-10-27 업데이트
      - **481200(SOL 미국테크TOP10인버스)**: API 어디에도 없음 → 청산 의심, 내일 재확인 필요
+
+5. **기타 유형 종목 전면 제거** (`collectors/infomax.py` + DB)
+   - **발견**: `equity_type not in {'ST','주식'} → market="ETF"` 로직으로 EN/MF/RT/IF/DR/SW/SR/EW/BC/FS 유형 종목들이 ETF로 오분류
+   - 해당 유형: 수익증권(EN), 뮤추얼펀드(MF), 리츠(RT), 인프라펀드(IF), 파생상품(DR), 워런트(SW/SR/EW), 기업채권(BC), 구조화상품(FS) 등
+   - **DB 삭제**: 30개 종목 (`stocks` 테이블) + 관련 OHLCV/시가총액 등 연쇄 삭제
+   - **코드 단순화**: `get_stock_codes()`에서 기타 유형 단일 호출 제거 → KOSPI/KOSDAQ/ETF 3가지만 수집
+   - **근거**: 이 시스템의 목적(주식+ETF 시세·수급)에 불필요한 유형, DB에 이미 있던 30개도 의도치 않게 혼입된 것
 
 ### 🎯 주요 결정사항
 
@@ -63,13 +69,20 @@
 - ETF는 투자자별 수급 수집 대상 아님 → 전체 삭제
 - 2/19 이후 API 수집분은 처음부터 올바르게 KOSPI+KOSDAQ만 수집 중
 
+#### 4. 수집 종목 유형 확정: KOSPI 주식 / KOSDAQ 주식 / ETF 3가지만
+- EN/MF/RT/IF/DR/SW/SR/EW/BC/FS 등 기타 equity_type은 수집 대상 외
+- `get_stock_codes()`: `_fetch({"market":"1","type":"ST"})` + `_fetch_split({"market":"7","type":"ST"})` + `_fetch_split({"type":"EF"})` 3호출로 단순화
+- `stocks` 테이블의 market 값은 KOSPI / KOSDAQ / ETF 3가지만 존재 (기타 유형 삭제 완료)
+
 ### 💡 배운 점 / 인사이트
 - API `success=True` + `results=[]`는 데이터 미확정(오전) 또는 진짜 없는 종목 두 가지 케이스
 - ETF 중 특수 코드(01xxxA, 01xxxB 등 신탁형)는 일반 종목 조회 API에 미등재되나 hist 데이터는 존재
 - 481200 같은 청산 ETF: expired API에도 없고 code API에도 없는 상태로 남아있을 수 있음
+- `equity_type not in STOCK_TYPES → ETF` 로직은 기타 파생상품/펀드까지 ETF로 오분류 → 명시적으로 `type=EF`만 ETF 처리
 
 ### 📌 다음 작업
 - 481200 청산 여부 재확인 후 is_active=FALSE 처리
+- 94개 ETF 과거 OHLCV 보충 (사용자가 엑셀 파일 제공 예정)
 - 스케줄러 재가동 (19:00 이후로 시간 변경 고려)
 - 서버 구축 (맥미니)
 

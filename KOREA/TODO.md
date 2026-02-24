@@ -8,12 +8,19 @@
 ## 🔥 긴급/중요 (최우선)
 
 - [x] **97개 신규 ETF 시계열 데이터 보충** ✅ (2026-02-24)
-  - 94개: 2/19 신규 상장 → 과거 데이터 없음 (정상)
+  - 94개: 2/19 신규 상장 → 과거 데이터 없음 (정상, 엑셀 파일 수령 후 처리 예정)
   - 3개(01669A/01777A/01221D): 2022-01-13~2026-02-19 OHLCV 삽입 완료
 - [x] **2026-02-20 데이터 수동 수집** ✅ (2026-02-23): OHLCV 3,822건 / 수급 2,747종목, 실패 0건
 - [x] **2026-02-23 데이터 수집** ✅ (2026-02-24 오후): OHLCV 3,821건 / 수급 2,747건, 실패 1건
+- [x] **DB 정합성 정비** ✅ (2026-02-24)
+  - investor_trading ETF 데이터 2,925,544건 삭제
+  - EN/MF/RT/IF/DR/SW/SR/EW/BC/FS 기타 유형 30개 종목 삭제
+  - get_stock_codes() 단순화: KOSPI/KOSDAQ/ETF 3가지만 수집
 - [ ] **481200(SOL 미국테크TOP10인버스) 청산 여부 확인** → is_active=FALSE 처리
   - API code/expired 모두 미등재, 2/23 데이터 없음, 2/20 거래량=0
+- [ ] **94개 ETF 과거 OHLCV 보충** (엑셀 파일 수령 후 처리)
+  - listing_date 전부 있음, ohlcv_daily 데이터만 없는 상태
+  - 쿼리: `SELECT s.stock_code, s.stock_name, s.listing_date FROM stocks s WHERE s.market='ETF' AND s.stock_code NOT IN (SELECT DISTINCT stock_code FROM ohlcv_daily WHERE time <= '2026-02-13') AND s.is_active=TRUE ORDER BY s.listing_date, s.stock_code`
 - [ ] **스케줄러 재가동**: `nohup python schedulers/daily_scheduler.py &`
   - 수집 시간 19:00 이후로 변경 검토 (당일 데이터 확정: 16:40/18:40)
 - [ ] **서버 구축** (맥미니 구매 후 설정)
