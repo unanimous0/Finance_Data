@@ -256,13 +256,14 @@ def analyze_anomalies(ohlcv_rows: list[dict],
         # 전일 대비 급등락 (상/하한가 근접)
         prev = prev_close.get(code)
         if prev and prev > 0 and close > 0:
-            chg_rate = abs(close - prev) / prev
+            signed_rate = (close - prev) / prev
+            chg_rate = abs(signed_rate)
             if chg_rate >= THRESHOLD_PRICE_CHANGE:
-                direction = "급등" if close > prev else "급락"
+                direction = "급등" if signed_rate > 0 else "급락"
                 anomalies.append({
                     "type": f"가격{direction}",
                     "stock_code": code, "stock_name": name, "date": dt,
-                    "detail": f"전일종가={prev:,}원 → 당일종가={close:,}원 ({chg_rate*100:+.1f}%)",
+                    "detail": f"전일종가={prev:,}원 → 당일종가={close:,}원 ({signed_rate*100:+.1f}%)",
                     "value": chg_rate,
                 })
 
@@ -795,11 +796,13 @@ def generate_report(result: dict) -> str:
                 "대규모순매도": "💸",
             }.get(atype, "⚠️")
 
-            lines.append(f"  {emoji} [{atype}] {len(items)}건")
+            sorted_items = sorted(items, key=lambda x: abs(x.get("value", 0) or 0), reverse=True)
+            display_items = sorted_items[:30] if atype in ("가격급등", "가격급락") else sorted_items
+            total_label = f" (TOP {len(display_items)} / 전체 {len(items)}건)" if atype in ("가격급등", "가격급락") and len(items) > 30 else f" {len(items)}건"
+            lines.append(f"  {emoji} [{atype}]{total_label}")
             lines.append(f"  {'날짜':<12} {'종목코드':<10} {'종목명':<18} {'상세'}")
             lines.append(f"  {'-'*68}")
-            # 가장 큰 값 순으로 정렬
-            for a in sorted(items, key=lambda x: abs(x.get("value", 0) or 0), reverse=True):
+            for a in display_items:
                 dt_str   = str(a["date"]) if a["date"] else "-"
                 lines.append(
                     f"  {dt_str:<12} {a['stock_code']:<10} "

@@ -155,39 +155,98 @@ class InfomaxClient:
     # ── 현재 상장 종목 목록 (/api/stock/code) ──────────────────────────────
     def get_stock_codes(self) -> list[dict]:
         """
-        현재 상장 종목 목록 전체 조회
+        현재 상장 종목 목록 전체 조회 (API 1,000개 상한 우회)
+
+        전략:
+          - 1,000개 미만 구간: 단일 호출
+          - 1,000개 이상 구간: code 파라미터로 2자리 prefix(00~49) 분리
+            → startswith() 필터링으로 해당 prefix 종목만 추출
+          처리 대상:
+          - KOSPI:  market=1(주식) + market=2(기타)  → 각 단일 호출
+          - KOSDAQ: market=7 + type=ST               → prefix 분리
+          - ETF:    type=EF                           → prefix 분리
+          - 기타:   EN,MF,RT,IF,DR,SW,SR,EW,BC,FS   → 각 단일 호출
+
         반환: [{"code", "name", "market", "listing_date", "standard_code"}, ...]
-
-        API 응답 필드: code, kr_name, market, equity_type, isin, listed_date
         """
-        data = self._get("/api/stock/code", {})
-        if not data:
-            return []
+        # API 응답 market 필드(한글) → DB market 값 (숫자코드도 대응)
+        MARKET_MAP = {
+            "거래소(코스피)": "KOSPI", "거래소기타": "KOSPI",
+            "코스닥": "KOSDAQ", "코스닥기타": "KOSDAQ",
+            "1": "KOSPI", "2": "KOSPI", "5": "KOSPI",
+            "7": "KOSDAQ", "8": "KOSDAQ",
+        }
+        # 일반 주식 equity_type (한글/영문 모두 대응)
+        STOCK_TYPES = {"ST", "주식"}
 
-        # market 숫자코드 → DB 문자열 변환
-        # API: 1=거래소(KOSPI), 2=거래소기타, 5=KRX, 7=코스닥, 8=코스닥기타
-        MARKET_MAP = {"1": "KOSPI", "2": "KOSPI", "5": "KOSPI",
-                      "7": "KOSDAQ", "8": "KOSDAQ"}
-
-        rows = []
-        for r in data.get("results", []):
+        def _parse(r: dict) -> Optional[dict]:
             code = r.get("code")
             if not code:
-                continue
-            mkt_raw = str(r.get("market", ""))
-            market  = MARKET_MAP.get(mkt_raw, mkt_raw.upper() if mkt_raw else None)
-            # equity_type EF/EN/MF/RT → ETF로 통합
+                return None
+            market = MARKET_MAP.get(str(r.get("market", "")))
             eq_type = r.get("equity_type", "")
-            if eq_type and eq_type not in ("ST",):
+            if eq_type and eq_type not in STOCK_TYPES:
                 market = "ETF"
-            rows.append({
+            return {
                 "code":          str(code).strip(),
                 "name":          r.get("kr_name", ""),
                 "market":        market,
                 "listing_date":  self._parse_date(r.get("listed_date")),
                 "standard_code": r.get("isin"),
-            })
-        return rows
+            }
+
+        def _fetch(params: dict) -> dict[str, dict]:
+            """단일 호출. 결과를 {code: row} dict로 반환."""
+            data = self._get("/api/stock/code", params)
+            if not data:
+                return {}
+            out = {}
+            for r in data.get("results", []):
+                row = _parse(r)
+                if row:
+                    out[row["code"]] = row
+            return out
+
+        def _fetch_split(params: dict) -> dict[str, dict]:
+            """
+            1,000개 이상 시 2자리 prefix(00~49)로 분리 수집.
+            각 prefix별 호출 후 startswith()로 정밀 필터링.
+            """
+            data = self._get("/api/stock/code", params)
+            if not data:
+                return {}
+            results = data.get("results", [])
+            if len(results) < 1000:
+                out = {}
+                for r in results:
+                    row = _parse(r)
+                    if row:
+                        out[row["code"]] = row
+                return out
+            # 1,000개 이상 → 2자리 prefix 분리 (한국 주식 코드 현재 범위: 00~49)
+            out = {}
+            for i in range(50):
+                prefix = f"{i:02d}"
+                sub = self._get("/api/stock/code", {**params, "code": prefix})
+                if not sub:
+                    continue
+                for r in sub.get("results", []):
+                    if not str(r.get("code", "")).startswith(prefix):
+                        continue
+                    row = _parse(r)
+                    if row:
+                        out[row["code"]] = row
+            return out
+
+        all_stocks: dict[str, dict] = {}
+        all_stocks.update(_fetch({"market": "1", "type": "ST"}))   # KOSPI 주식
+        all_stocks.update(_fetch({"market": "2"}))                  # KOSPI 기타
+        all_stocks.update(_fetch_split({"market": "7", "type": "ST"}))  # KOSDAQ 주식
+        all_stocks.update(_fetch_split({"type": "EF"}))             # ETF
+        for eq in ("EN", "MF", "RT", "IF", "DR", "SW", "SR", "EW", "BC", "FS"):
+            all_stocks.update(_fetch({"type": eq}))                 # 기타 소규모
+
+        return list(all_stocks.values())
 
     # ── 상장폐지 종목 목록 (/api/stock/expired) ─────────────────────────────
     def get_expired_codes(self, start_date: Optional[date] = None,
