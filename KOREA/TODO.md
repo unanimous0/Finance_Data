@@ -1,7 +1,7 @@
 # 📝 TODO - 작업 목록
 
 > **마지막 업데이트**: 2026-02-24
-> **현재 Phase**: Phase 4 완료 / 스케줄러 재가동 필요
+> **현재 Phase**: Phase 4 완료 / 94개 ETF 적재 완료 / 스케줄러 재가동 필요
 
 ---
 
@@ -22,9 +22,19 @@
   - 상장폐지는 sync_stock_master()가 이미 자동 처리 (pykrx 추가 불필요)
 - [ ] **481200(SOL 미국테크TOP10인버스) 청산 여부 확인** → is_active=FALSE 처리
   - API code/expired 모두 미등재, 2/23 데이터 없음, 2/20 거래량=0
-- [ ] **94개 ETF 과거 OHLCV 보충** (엑셀 파일 수령 후 처리)
-  - listing_date 전부 있음, ohlcv_daily 데이터만 없는 상태
-  - 쿼리: `SELECT s.stock_code, s.stock_name, s.listing_date FROM stocks s WHERE s.market='ETF' AND s.stock_code NOT IN (SELECT DISTINCT stock_code FROM ohlcv_daily WHERE time <= '2026-02-13') AND s.is_active=TRUE ORDER BY s.listing_date, s.stock_code`
+- [x] **94개 ETF 과거 OHLCV 보충** ✅ (2026-02-24)
+  - 엑셀(`raw_data/종목 결과.xlsx`)에서 94개 ETF OHLCV+시가총액 적재
+  - ohlcv_daily 15,271건, market_cap_daily 15,271건 (271건 신규, 나머지 기존 동일)
+  - 검증: ohlcv_daily 데이터 없는 활성 종목 0개 확인
+- [x] **DB 유니크 인덱스 정비** ✅ (2026-02-24)
+  - UPSERT용 유니크 인덱스 3개 테이블 모두 누락 발견 → 생성 완료
+  - `uq_ohlcv_time_stock` (time, stock_code)
+  - `uq_mktcap_time_stock` (time, stock_code)
+  - `uq_investor_time_stock_type` (time, stock_code, investor_type)
+- [x] **프로젝트 파일 정리** ✅ (2026-02-24)
+  - 삭제: `raw_data/temp/` (248MB), `raw_data/*.xlsx`, `.pytest_cache/`
+  - 삭제: 미사용 코드 (`database/connection.py`, `utils/logger.py`, `utils/exceptions.py`)
+  - 삭제: 구버전 스키마 (`init_schema.sql`, `alter_stocks_table.sql`)
 - [ ] **스케줄러 재가동**: `nohup python schedulers/daily_scheduler.py &`
   - 수집 시간 19:00 이후로 변경 검토 (당일 데이터 확정: 16:40/18:40)
 - [ ] **서버 구축** (맥미니 구매 후 설정)
@@ -96,22 +106,11 @@
   - [x] DB 연결 URL 생성
   - [x] 테스트 완료 ✅
 
-- [x] **database/connection.py**
-  - [x] SQLAlchemy Engine 생성
-  - [x] Connection Pool 설정
-  - [x] Session Factory (컨텍스트 매니저)
-  - [x] `test_connection()` 함수
-  - [x] 테스트 완료 ✅
+- [x] ~~**database/connection.py**~~ (2026-02-24 삭제: 미사용)
 
-- [x] **utils/logger.py**
-  - [x] Loguru 설정
-  - [x] 파일 로깅 (logs/ 폴더)
-  - [x] 콘솔 + 파일 출력
-  - [x] 에러 로그 별도 저장 ✅
+- [x] ~~**utils/logger.py**~~ (2026-02-24 삭제: 미사용)
 
-- [x] **utils/exceptions.py**
-  - [x] 커스텀 예외 클래스 정의
-  - [x] DataCollectionError, ValidationError 등 ✅
+- [x] ~~**utils/exceptions.py**~~ (2026-02-24 삭제: 미사용)
 
 - [x] **database/models.py** ✅ 완료 (2026-02-18)
   - [x] SQLAlchemy ORM 모델 10개 정의 완료
@@ -309,7 +308,9 @@
 
 ## 💡 아이디어 / 향후 고려사항
 
-- [ ] Grafana 대시보드 (데이터 모니터링)
+- [ ] Grafana 대시보드 (데이터 모니터링) → Streamlit 대시보드 페이지로 대체 검토
+  - 수급 분석 프로젝트의 Streamlit 웹앱에 모니터링 페이지 추가
+  - 수집 현황, 품질 체크, 데이터 추이 시각화
 - [ ] 데이터 품질 알림 (Slack, 이메일)
 - [ ] 데이터 버전 관리 (Audit Log)
 - [ ] Docker Compose로 전체 스택 패키징

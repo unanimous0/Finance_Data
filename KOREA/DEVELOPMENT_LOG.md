@@ -5,6 +5,41 @@
 
 ---
 
+## 2026-02-24 (화) - 94개 ETF 적재 + DB 유니크 인덱스 정비 + 프로젝트 정리
+
+### ✅ 완료 작업
+
+1. **94개 ETF OHLCV + 시가총액 적재 완료**
+   - 엑셀(`raw_data/종목 결과.xlsx`) → ohlcv_daily + market_cap_daily UPSERT
+   - 94개 종목 전체 매칭 성공 (case-insensitive UPPER 비교)
+   - 각 15,271건 처리 (신규 271건, 기존 동일 15,000건 스킵)
+   - 검증: ohlcv_daily 데이터 없는 활성 종목 **0개** 확인
+
+2. **DB 유니크 인덱스 정비** (3개 테이블)
+   - **발견**: ohlcv_daily, market_cap_daily, investor_trading 모두 UPSERT용 유니크 인덱스 누락
+   - daily_update.py의 `ON CONFLICT` SQL이 지금까지 동작한 이유: 중복 삽입이 발생하지 않았을 뿐
+   - 생성한 인덱스:
+     - `uq_ohlcv_time_stock` ON ohlcv_daily (time, stock_code)
+     - `uq_mktcap_time_stock` ON market_cap_daily (time, stock_code)
+     - `uq_investor_time_stock_type` ON investor_trading (time, stock_code, investor_type)
+
+3. **프로젝트 파일 정리**
+   - 삭제 (1회성 스크립트): `scripts/load_etf_from_xlsx.py`
+   - 삭제 (초기 적재 원본, ~249MB): `raw_data/temp/` (CSV 14개), `raw_data/종목 결과.xlsx`, `raw_data/1-종목코드_종목명.xlsx`
+   - 삭제 (미사용 코드): `database/connection.py`, `utils/logger.py`, `utils/exceptions.py`
+   - 삭제 (구버전 스키마): `database/schema/init_schema.sql`, `database/schema/alter_stocks_table.sql`
+   - 삭제 (캐시): `.pytest_cache/`
+
+4. **DB 검증 결과** (정리 후 최종 확인)
+   - ohlcv_daily: 3,260,522건 / market_cap_daily: 3,260,522건 (일치)
+   - investor_trading: 10,042,612건
+   - 중복: 0건 (3개 테이블 모두)
+   - OHLCV 논리 오류 (high<low): 0건
+   - 음수 값: 0건
+   - ohlcv 누락 종목: 0개
+
+---
+
 ## 2026-02-24 (화) - 2/23 데이터 수집 + DB 정합성 정비 + API/코드 개선
 
 ### ✅ 완료 작업

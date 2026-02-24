@@ -1,7 +1,7 @@
 # 🏢 한국 주식시장 데이터 중앙 관리 시스템
 
-> **마지막 업데이트**: 2026-02-22 (Phase 4 완료, 종목 마스터 자동 갱신, 프로젝트 구조 정리)
-> **프로젝트 상태**: Phase 4 완료 / 스케줄러 실전 가동 중
+> **마지막 업데이트**: 2026-02-24 (94개 ETF 적재 완료, DB 유니크 인덱스 정비, 프로젝트 정리)
+> **프로젝트 상태**: Phase 4 완료 / 스케줄러 재가동 필요
 > **Repository**: https://github.com/unanimous0/Finance_Data/tree/main/KOREA
 
 ---
@@ -33,22 +33,23 @@
   - `collectors/infomax.py`: 신규 상장/폐지 API 추가 (`get_stock_codes`, `get_expired_codes`)
   - `daily_update.py` STEP 0: 종목 마스터 자동 갱신 (신규 상장 INSERT, 상장폐지 UPDATE)
   - Read-only DB 계정 생성 완료 (`korea_stock_reader`)
-- 미완료: 94개 ETF 시계열 데이터 보충, 서버 구축
+- 94개 ETF 시계열 데이터 보충 ✅ (2026-02-24)
+- DB 유니크 인덱스 3개 테이블 정비 ✅ (2026-02-24)
+- 미완료: 서버 구축
 
 ---
 
-## 📊 현재 데이터 현황 (2026-02-20 기준)
+## 📊 현재 데이터 현황 (2026-02-24 기준)
 
 ### 적재 완료 데이터
 
 | 테이블 | 레코드 수 | 기간 | 종목 수 |
 |--------|----------|------|---------|
-| stocks | 3,820건 | - | 3,820개 |
-| ohlcv_daily | 3,261,771건 | 2022-01-03 ~ 2026-02-19 | 3,820개 |
-| market_cap_daily | 3,261,771건 | 2022-01-03 ~ 2026-02-19 | 3,820개 |
-| investor_trading | 13,042,796건 | 2022-01-03 ~ 2026-02-19 | 3,820개 |
-| floating_shares | ~1,054,680건 | 2022-01-03 ~ 2026-02-19 | ~2,635개 |
-| **합계** | **~20.6M건** | **4년치** | - |
+| stocks | 3,793건 | - | 3,793개 |
+| ohlcv_daily | 3,260,522건 | 2022-01-03 ~ 2026-02-23 | 3,793개 |
+| market_cap_daily | 3,260,522건 | 2022-01-03 ~ 2026-02-23 | 3,793개 |
+| investor_trading | 10,042,612건 | 2022-01-03 ~ 2026-02-23 | 2,748개 (KOSPI+KOSDAQ) |
+| **합계** | **~16.6M건** | **4년치** | - |
 
 ### 투자자 타입별 데이터
 
@@ -82,14 +83,17 @@
 
 ### 데이터 출처
 
-- **원본**: raw_data/temp/ 폴더의 14개 파일 (CSV 11개 + xlsx 3개)
-- **형식**: Pivot (행=날짜, 열=종목명)
-- **변환**: `scripts/load_all_data_from_csv.py`로 정규화 후 적재
+- **초기 적재**: raw_data/temp/ CSV 14개 (2026-02-19, 적재 완료 후 삭제)
+- **94개 ETF 보충**: raw_data/종목 결과.xlsx (2026-02-24, 적재 완료 후 삭제)
+- **일별 업데이트**: `scripts/daily_update.py` + 인포맥스 API
 
-### 미매칭/누락 종목
+### DB 유니크 인덱스 (UPSERT용)
 
-- **23개**: CSV에 있지만 stocks에 없음 (상장폐지 종목)
-- **94개**: stocks에 있지만 CSV에 없음 (신규 상장 ETF, 데이터 보충 필요)
+| 테이블 | 인덱스명 | 컬럼 |
+|--------|---------|------|
+| ohlcv_daily | `uq_ohlcv_time_stock` | (time, stock_code) |
+| market_cap_daily | `uq_mktcap_time_stock` | (time, stock_code) |
+| investor_trading | `uq_investor_time_stock_type` | (time, stock_code, investor_type) |
 
 ---
 
@@ -195,10 +199,7 @@ KOREA/
 │
 ├── database/              # 데이터베이스 관련
 │   ├── schema/
-│   │   ├── init_schema.sql      # 초기 스키마 정의
-│   │   ├── init_schema_v2.sql   # 스키마 v2
-│   │   └── alter_stocks_table.sql
-│   ├── connection.py      # SQLAlchemy 연결 관리
+│   │   └── init_schema_v2.sql   # 현재 스키마 정의
 │   └── models.py          # ORM 모델 (10개)
 │
 ├── collectors/            # 데이터 수집기
@@ -213,8 +214,6 @@ KOREA/
 │   └── daily_scheduler.py  # APScheduler: 매일 16:30 수집 / 매주 일요일 03:00 백업
 │
 ├── utils/                 # 유틸리티
-│   ├── logger.py         # Loguru 로깅
-│   └── exceptions.py     # 커스텀 예외
 │
 ├── scripts/               # 실행 스크립트
 │   ├── daily_update.py          # 일별 업데이트 (종목 마스터 갱신 + OHLCV + 수급 + 보고서)
