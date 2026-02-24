@@ -16,6 +16,10 @@
   - investor_trading ETF 데이터 2,925,544건 삭제
   - EN/MF/RT/IF/DR/SW/SR/EW/BC/FS 기타 유형 30개 종목 삭제
   - get_stock_codes() 단순화: KOSPI/KOSDAQ/ETF 3가지만 수집
+- [x] **주가이벤트의심 탐지 추가** ✅ (2026-02-24)
+  - ±30% 초과 변화 = 이벤트 확정 (한국 가격제한 초과 = 정상 거래 불가)
+  - 보고서 맨 앞 🚨 경고박스 + 수정계수 확인 필요 안내
+  - 상장폐지는 sync_stock_master()가 이미 자동 처리 (pykrx 추가 불필요)
 - [ ] **481200(SOL 미국테크TOP10인버스) 청산 여부 확인** → is_active=FALSE 처리
   - API code/expired 모두 미등재, 2/23 데이터 없음, 2/20 거래량=0
 - [ ] **94개 ETF 과거 OHLCV 보충** (엑셀 파일 수령 후 처리)
