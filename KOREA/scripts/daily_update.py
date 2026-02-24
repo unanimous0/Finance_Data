@@ -37,7 +37,8 @@ REPORTS_DIR.mkdir(exist_ok=True)
 MAX_WORKERS = 4
 
 # 특이사항 임계값
-THRESHOLD_PRICE_CHANGE  = 0.295   # 가격 변동 29.5% 이상 (상한/하한가 근접)
+THRESHOLD_PRICE_EVENT   = 0.30    # 가격 변동 30% 초과 = 한국 가격제한 초과 → 이벤트 확정 (수정계수 필요)
+THRESHOLD_PRICE_CHANGE  = 0.295   # 가격 변동 29.5% 이상 (상한/하한가 근접, 정상 거래 범위 내)
 THRESHOLD_HALT_SUSPECT  = 3   # 거래량 0 연속 3~4일 → 거래정지 의심
 THRESHOLD_HALT_CONFIRM  = 5   # 거래량 0 연속 5일 이상 → 거래정지 (스팩도 동일)
 THRESHOLD_LARGE_NET_BUY = 5e10    # 순매수 500억 이상 (거액 유입/이탈)
@@ -253,12 +254,27 @@ def analyze_anomalies(ohlcv_rows: list[dict],
                 "value": high - low,
             })
 
-        # 전일 대비 급등락 (상/하한가 근접)
+        # 전일 대비 급등락 감지
         prev = prev_close.get(code)
         if prev and prev > 0 and close > 0:
             signed_rate = (close - prev) / prev
             chg_rate = abs(signed_rate)
-            if chg_rate >= THRESHOLD_PRICE_CHANGE:
+            if chg_rate > THRESHOLD_PRICE_EVENT:
+                # ±30% 초과: 한국 가격제한(±30%) 밖 → 정상 거래 불가능 → 이벤트 확정
+                # (무상감자, 주식병합, 주식분할, 유상증자 권리락 등)
+                direction = "상승" if signed_rate > 0 else "하락"
+                event_hint = "주식병합/분할 의심" if signed_rate > 0 else "무상감자/대규모권리락 의심"
+                anomalies.append({
+                    "type": "주가이벤트의심",
+                    "stock_code": code, "stock_name": name, "date": dt,
+                    "detail": (
+                        f"{direction} {chg_rate*100:.1f}%  "
+                        f"{prev:,}원 → {close:,}원  "
+                        f"({signed_rate*100:+.1f}%)  [{event_hint}]"
+                    ),
+                    "value": chg_rate,
+                })
+            elif chg_rate >= THRESHOLD_PRICE_CHANGE:
                 direction = "급등" if signed_rate > 0 else "급락"
                 anomalies.append({
                     "type": f"가격{direction}",
@@ -776,7 +792,8 @@ def generate_report(result: dict) -> str:
         for a in anomalies:
             by_type[a["type"]].append(a)
 
-        type_order = ["거래정지", "거래정지의심", "무거래(스팩)", "OHLCV오류",
+        type_order = ["주가이벤트의심",
+                      "거래정지", "거래정지의심", "무거래(스팩)", "OHLCV오류",
                       "가격급등", "가격급락", "대규모순매수", "대규모순매도"]
         sorted_types = sorted(by_type.keys(),
                               key=lambda t: type_order.index(t) if t in type_order else 99)
@@ -786,6 +803,7 @@ def generate_report(result: dict) -> str:
         for atype in sorted_types:
             items = by_type[atype]
             emoji = {
+                "주가이벤트의심": "🚨",
                 "거래정지":     "🔴",
                 "거래정지의심": "🟡",
                 "무거래(스팩)": "⚪",
@@ -798,8 +816,21 @@ def generate_report(result: dict) -> str:
 
             sorted_items = sorted(items, key=lambda x: abs(x.get("value", 0) or 0), reverse=True)
             display_items = sorted_items[:30] if atype in ("가격급등", "가격급락") else sorted_items
-            total_label = f" (TOP {len(display_items)} / 전체 {len(items)}건)" if atype in ("가격급등", "가격급락") and len(items) > 30 else f" {len(items)}건"
-            lines.append(f"  {emoji} [{atype}]{total_label}")
+            total_label = (
+                f" (TOP {len(display_items)} / 전체 {len(items)}건)"
+                if atype in ("가격급등", "가격급락") and len(items) > 30
+                else f" {len(items)}건"
+            )
+
+            if atype == "주가이벤트의심":
+                # 경고 박스로 강조 출력 — 절대 놓치면 안 되는 항목
+                lines.append(f"  {'!'*W}")
+                lines.append(f"  {emoji} [{atype}]{total_label}  ← ±30% 초과 = 수정계수 확인 필요!")
+                lines.append(f"  {'비수정주가 불연속 발생 가능 → 향후 수정주가 적용 시 이 날짜 기준으로 처리':^{W}}")
+                lines.append(f"  {'!'*W}")
+            else:
+                lines.append(f"  {emoji} [{atype}]{total_label}")
+
             lines.append(f"  {'날짜':<12} {'종목코드':<10} {'종목명':<18} {'상세'}")
             lines.append(f"  {'-'*68}")
             for a in display_items:
