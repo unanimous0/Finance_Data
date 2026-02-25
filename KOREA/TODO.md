@@ -24,10 +24,10 @@
 - [x] **481200(SOL 미국테크TOP10인버스) is_active=FALSE 처리** ✅ (2026-02-25)
   - API code/expired 모두 미등재, 2/23·2/24 데이터 없음, 2/20 거래량=0 → 청산 확정
   - delisting_date=2026-02-24 설정
-- [x] **94개 ETF 과거 OHLCV 보충** ✅ (2026-02-24)
-  - 엑셀(`raw_data/종목 결과.xlsx`)에서 94개 ETF OHLCV+시가총액 적재
-  - ohlcv_daily 15,271건, market_cap_daily 15,271건 (271건 신규, 나머지 기존 동일)
-  - 검증: ohlcv_daily 데이터 없는 활성 종목 0개 확인
+- [x] **94개 ETF 과거 OHLCV 보충** ✅ (2026-02-25 재완료)
+  - 2/24 xlsx 적재 시 실제로는 4건씩만 있었던 것으로 확인 (ON CONFLICT 스킵 오판)
+  - 집 dump(backup_20260224_2357.dump)에서 2/19 이전 15,268건 추출 → 현재 DB UPSERT
+  - ohlcv_daily: 3,249,045 → 3,264,313건 (+15,268건)
 - [x] **DB 유니크 인덱스 정비** ✅ (2026-02-24)
   - UPSERT용 유니크 인덱스 3개 테이블 모두 누락 발견 → 생성 완료
   - `uq_ohlcv_time_stock` (time, stock_code)
