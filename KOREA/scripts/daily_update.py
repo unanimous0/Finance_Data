@@ -38,7 +38,7 @@ MAX_WORKERS = 4
 
 # 특이사항 임계값
 THRESHOLD_PRICE_EVENT   = 0.30    # 가격 변동 30% 초과 = 한국 가격제한 초과 → 이벤트 확정 (수정계수 필요)
-THRESHOLD_PRICE_CHANGE  = 0.295   # 가격 변동 29.5% 이상 (상한/하한가 근접, 정상 거래 범위 내)
+TOP_PRICE_CHANGE_COUNT  = 30      # 급등/급락 각각 상위 N개만 보고서에 표시
 THRESHOLD_HALT_SUSPECT  = 3   # 거래량 0 연속 3~4일 → 거래정지 의심
 THRESHOLD_HALT_CONFIRM  = 5   # 거래량 0 연속 5일 이상 → 거래정지 (스팩도 동일)
 THRESHOLD_LARGE_NET_BUY = 5e10    # 순매수 500억 이상 (거액 유입/이탈)
@@ -205,6 +205,7 @@ def analyze_anomalies(ohlcv_rows: list[dict],
                    연속 무거래일이 THRESHOLD_HALT_SUSPECT 미만인 종목은 포함되지 않음
     """
     anomalies = []
+    price_changes = []  # 급등/급락 전체 수집 → TOP N만 anomalies에 추가
 
     # ── OHLCV 특이사항 ─────────────────────────────────────────
     for r in ohlcv_rows:
@@ -274,14 +275,20 @@ def analyze_anomalies(ohlcv_rows: list[dict],
                     ),
                     "value": chg_rate,
                 })
-            elif chg_rate >= THRESHOLD_PRICE_CHANGE:
-                direction = "급등" if signed_rate > 0 else "급락"
-                anomalies.append({
-                    "type": f"가격{direction}",
+            else:
+                price_changes.append({
+                    "type": "가격급등" if signed_rate > 0 else "가격급락",
                     "stock_code": code, "stock_name": name, "date": dt,
                     "detail": f"전일종가={prev:,}원 → 당일종가={close:,}원 ({signed_rate*100:+.1f}%)",
                     "value": chg_rate,
+                    "signed_rate": signed_rate,
                 })
+
+    # 급등/급락 TOP N만 anomalies에 추가
+    rises = sorted([x for x in price_changes if x["signed_rate"] > 0], key=lambda x: x["value"], reverse=True)
+    drops = sorted([x for x in price_changes if x["signed_rate"] < 0], key=lambda x: x["value"], reverse=True)
+    for item in rises[:TOP_PRICE_CHANGE_COUNT] + drops[:TOP_PRICE_CHANGE_COUNT]:
+        anomalies.append({k: v for k, v in item.items() if k != "signed_rate"})
 
     # ── 투자자 수급 특이사항 ────────────────────────────────────
     # 종목별 날짜별 순매수 집계
