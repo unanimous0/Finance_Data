@@ -29,10 +29,10 @@
 
 ## 🛠️ 기술 스택
 
-- **데이터베이스**: PostgreSQL 15+ + TimescaleDB 2.11+
-- **언어**: Python 3.11+
-- **주요 라이브러리**: SQLAlchemy, Pydantic, APScheduler
-- **데이터 소스**: 인포맥스 API, 증권사 HTS, 웹 크롤링
+- **데이터베이스**: PostgreSQL 17 + TimescaleDB 2.25
+- **언어**: Python 3.14
+- **주요 라이브러리**: SQLAlchemy 2.0, Pydantic 2.x, APScheduler 3.x, psycopg2, Loguru
+- **데이터 소스**: 인포맥스 API (유료), FnGuide 크롤링
 
 ## 🚀 빠른 시작
 
@@ -91,16 +91,17 @@ python schedulers/scheduler.py
 
 ```
 KOREA/
-├── config/              # 설정 관리
-├── database/            # DB 모델, 스키마, 마이그레이션
-├── collectors/          # 데이터 수집기 (인포맥스, HTS, 크롤러)
-├── validators/          # 데이터 검증
-├── etl/                 # ETL 파이프라인
-├── schedulers/          # 스케줄링
-├── api/                 # FastAPI (선택사항)
+├── config/              # 설정 관리 (settings.py)
+├── database/            # DB 스키마(SQL), ORM 모델
+├── collectors/          # 데이터 수집기 (infomax.py)
+├── validators/          # Pydantic 스키마, 품질 체크
+├── schedulers/          # APScheduler (daily_scheduler.py)
+├── scripts/             # 실행 스크립트 (daily_update, backup 등)
 ├── utils/               # 유틸리티
-├── scripts/             # 스크립트
-└── tests/               # 테스트
+├── tests/               # pytest 테스트
+├── logs/                # 로그 파일
+├── reports/             # 일별 수집 보고서
+└── backups/             # pg_dump 백업 파일
 ```
 
 ## 🔍 사용 예시
@@ -137,11 +138,11 @@ with get_session() as session:
 ## 📅 개발 로드맵
 
 - [x] **Phase 1**: 기반 구축 (프로젝트 구조, DB 설정)
-- [ ] **Phase 2**: 데이터 수집기 개발 (인포맥스 API)
-- [ ] **Phase 3**: 스케줄링 및 자동화
-- [ ] **Phase 4**: 데이터 품질 관리
-- [ ] **Phase 5**: API 인터페이스 개발
-- [ ] **Phase 6**: 분봉 데이터 확장
+- [x] **Phase 2**: 데이터 수집기 개발 (인포맥스 API, 16.6M+ 레코드 적재)
+- [x] **Phase 3**: 스케줄링 및 자동화 (매일 16:30 자동 수집)
+- [x] **Phase 4**: 데이터 품질 관리 (5종 체크, 주간 백업, 종목 마스터 자동 갱신)
+- [ ] **Phase 5**: 인터페이스 (다른 프로젝트 연동 가이드)
+- [ ] **Phase 6**: 분봉 데이터 확장, HTS API
 
 ## ⚙️ 설정
 

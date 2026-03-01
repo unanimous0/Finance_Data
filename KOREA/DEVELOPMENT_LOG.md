@@ -5,6 +5,35 @@
 
 ---
 
+## 2026-03-01 (일) - DB 복원 (backup_20260227_2331.dump)
+
+### ✅ 완료 작업
+
+1. **DB 복원** — 회사 PC 덤프 파일 → 맥 DB 최신화
+   - 파일: `backup_20260227_2331.dump` (187MB, pg_dump -Fc 포맷)
+   - 방법: 기존 DB 드롭 후 재생성 → `pg_restore` (TimescaleDB 특성상 `--clean` 사용 불가)
+   - 에러 673건은 모두 무시 가능 (hypertable 청크 제약조건 / role "postgres" 소유권 차이)
+
+2. **복원 결과 검증**
+   - ohlcv_daily: **3,271,899건** (최신: 2026-02-26) ✅
+   - market_cap_daily: **3,271,899건** ✅
+   - investor_trading: **10,075,252건** (최신: 2026-02-26) ✅
+   - floating_shares: **1,034,865건** ✅
+   - stocks: **3,797건** ✅
+
+### 📝 TimescaleDB pg_restore 주의사항
+
+- `pg_restore --clean` 사용 시 hypertable 청크 제약조건 드롭 실패 → **DB 드롭 후 재생성** 방식 사용
+- role 소유권 오류(`role "postgres" does not exist`)는 기능에 영향 없음 — 무시 가능
+- 복원 명령:
+  ```bash
+  dropdb -U unanimous0 korea_stock_data
+  createdb -U unanimous0 korea_stock_data
+  /opt/homebrew/opt/postgresql@17/bin/pg_restore -U unanimous0 -d korea_stock_data <dump_file>
+  ```
+
+---
+
 ## 2026-02-27 (금) - 2/26 데이터 수집 완료
 
 ### ✅ 완료 작업
