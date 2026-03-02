@@ -1,7 +1,7 @@
 # 📝 TODO - 작업 목록
 
-> **마지막 업데이트**: 2026-03-01
-> **현재 Phase**: Phase 4 완료 / DB 복원 완료 / 스케줄러 재가동 필요
+> **마지막 업데이트**: 2026-03-02
+> **현재 Phase**: Phase 4 완료 / DB 복원 완료 / FICS 섹터 크롤링 초기 수집 중
 
 ---
 
@@ -17,6 +17,14 @@
   - 신규 상장 4개 자동 추가: 0155N0, 0162L0, 0162M0, 0162Z0 (당일 데이터 없음 → 정상)
 - [x] **2026-02-26 데이터 수집** ✅ (2026-02-27): OHLCV 3,795건 / 수급 2,720건, 실패 0건
 - [x] **DB 복원** ✅ (2026-03-01): backup_20260227_2331.dump (187MB) → dropdb/createdb/pg_restore, 2/26까지 정상
+- [x] **FnGuide FICS 업종 크롤링 구축** ✅ (2026-03-02)
+  - `stock_sectors` 테이블 생성 (stock_code PK, fics_sector, updated_at)
+  - `scripts/crawl_sector.py` 작성 (2,720개 KOSPI+KOSDAQ, 약 70분 소요)
+  - `schedulers/daily_scheduler.py`: 분기별 잡 추가 (1/4/7/10월 첫 번째 일요일 03:30)
+  - 초기 전체 수집 완료: 섹터 확인 2,607개 / NULL 113개 (우선주·스팩 등)
+  - 인코딩 버그 수정: `resp.content` → `resp.text` (bs4 잘못된 인코딩 감지 문제)
+  - `korea_stock_reader` 읽기 권한 부여 (GRANT SELECT + DEFAULT PRIVILEGES)
+  - 중간 샘플 체크 추가 (crawl_sector.py + daily_update.py)
 - [ ] **2/27~ 누락 데이터 수집**: `python scripts/daily_update.py 20260227` 등
 - [x] **DB 정합성 정비** ✅ (2026-02-24)
   - investor_trading ETF 데이터 2,925,544건 삭제
@@ -236,6 +244,7 @@
 - [x] **모니터링** ✅ (2026-02-22)
   - [x] `scripts/check_collection_status.py` 작성 완료
   - [x] `schedulers/daily_scheduler.py`: 매주 일요일 03:00 백업 추가
+  - [x] `schedulers/daily_scheduler.py`: 분기별 FICS 섹터 크롤링 추가 (2026-03-02)
 
 - [ ] **실제 실행 테스트 및 안정화**
   - [ ] 1주일 이상 무인 자동 수집 확인

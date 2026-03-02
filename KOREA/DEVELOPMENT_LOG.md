@@ -5,6 +5,53 @@
 
 ---
 
+## 2026-03-02 (월) - FnGuide FICS 업종 크롤링 구축
+
+### ✅ 완료 작업
+
+1. **`stock_sectors` 테이블 생성** (flat 구조)
+   - `stock_code VARCHAR(10) PRIMARY KEY REFERENCES stocks(stock_code)`
+   - `fics_sector VARCHAR(100)` — FICS 업종명 (예: "반도체 및 관련장비")
+   - `updated_at TIMESTAMP` — 마지막 수집일시
+   - 기존 `sectors` 테이블(계층형)은 유지하되, 실제 데이터는 `stock_sectors`에만 저장
+
+2. **`scripts/crawl_sector.py` 작성**
+   - 대상: KOSPI + KOSDAQ 활성 종목 (ETF 제외) 약 2,720개
+   - 소스: `https://comp.fnguide.com` — 페이지 텍스트에서 `FICS\s+([^|\n\r\t]+)` 정규식으로 추출
+   - DELAY=1.5초, RETRY=3, TIMEOUT=15, LOG_EVERY=100
+   - `--missing` 플래그: stock_sectors에 없는 종목만 수집 (신규 상장 후 사용)
+   - UPSERT: `ON CONFLICT (stock_code) DO UPDATE SET fics_sector, updated_at`
+   - `requirements.txt`에 `beautifulsoup4` 추가
+
+3. **`schedulers/daily_scheduler.py`에 분기별 잡 추가**
+   - `job_quarterly_sector()` 함수 추가
+   - `CronTrigger(month="1,4,7,10", day="1-7", day_of_week="sun", hour=3, minute=30)`
+   - 분기 첫 번째 일요일 03:30 KST (1/4/7/10월)
+
+4. **초기 전체 수집 완료** — 2,607개 섹터 확인 / 113개 NULL (우선주·스팩·리츠 등)
+
+5. **인코딩 버그 발견 및 수정** ← 수집 1회차에서 한글 깨짐 발생
+   - 원인: `BeautifulSoup(resp.content, "html.parser")` 사용 시 bs4 내부 인코딩 감지(`ptcp154`)가 UTF-8 대신 잘못 적용됨
+   - 수정: `BeautifulSoup(resp.text, "html.parser")` — requests가 HTTP 헤더(`charset=utf-8`) 기준으로 정상 디코딩한 문자열을 전달
+   - 교훈: 인코딩을 명시할 때는 `resp.content + from_encoding`보다 `resp.text`가 더 안전
+   - 재수집 완료 (2회차) — 정상 확인
+
+6. **`korea_stock_reader` 읽기 전용 권한 부여**
+   - 기존에 계정만 생성되고 GRANT가 누락된 상태였음
+   - `GRANT CONNECT`, `GRANT USAGE`, `GRANT SELECT ON ALL TABLES`, `ALTER DEFAULT PRIVILEGES` 적용
+
+7. **중간 데이터 샘플 체크 추가** (10분 이상 수집 작업 공통 정책)
+   - `scripts/crawl_sector.py`: 100번째 종목 수집 후 최근 5건 출력 + 비한글 감지 시 경고
+   - `scripts/daily_update.py` STEP 1/2: 500번째 종목 완료 후 최근 5건 출력 + 이상값 비율 경고
+
+### 📝 설계 결정
+
+- **왜 flat 테이블?**: FnGuide FICS는 단일 문자열로 제공됨 → 계층 구조 불필요
+- **왜 ETF 제외?**: ETF는 FICS 섹터 미적용 (ETF 페이지에 FICS 정보 없음)
+- **왜 인포맥스 API 아님?**: 인포맥스는 업종/지수 API만 있고, 종목별 섹터 분류 API 없음
+
+---
+
 ## 2026-03-01 (일) - DB 복원 (backup_20260227_2331.dump)
 
 ### ✅ 완료 작업

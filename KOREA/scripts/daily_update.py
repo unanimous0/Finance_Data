@@ -582,6 +582,18 @@ def run_update(target_date: date = None, missing_only: bool = False) -> dict:
             if done_count % 500 == 0 or done_count == total_stocks:
                 print(f"  [{done_count:4}/{total_stocks}] 진행 중... (성공:{result['ohlcv']['success']} 실패:{result['ohlcv']['fail']})")
 
+            # 첫 번째 체크포인트: 실제 수집 데이터 샘플 확인
+            if done_count == 500 and all_ohlcv_rows:
+                print(f"  ── 중간 샘플 체크 (최근 수집 5건) ──")
+                for r in all_ohlcv_rows[-5:]:
+                    print(
+                        f"     {r['stock_code']}  {r.get('stock_name','')[:8]:<8}  "
+                        f"{r['date']}  종가={r['close_price'] or 0:,}  거래량={r['volume'] or 0:,}"
+                    )
+                bad = sum(1 for r in all_ohlcv_rows if not r.get("close_price") or r["close_price"] < 0)
+                if bad > len(all_ohlcv_rows) * 0.1:
+                    print(f"  ⚠️  비정상 종가 {bad}건 ({bad/len(all_ohlcv_rows):.0%}) 감지 — 수집 데이터 확인 필요!")
+
     # 잔여 저장
     if ohlcv_batch:
         ch, tot = upsert_batch(conn, OHLCV_SQL, ohlcv_batch)
@@ -640,6 +652,19 @@ def run_update(target_date: date = None, missing_only: bool = False) -> dict:
 
             if done_count % 500 == 0 or done_count == investor_stocks:
                 print(f"  [{done_count:4}/{investor_stocks}] 진행 중... (성공:{result['investor']['success']} 실패:{result['investor']['fail']})")
+
+            # 첫 번째 체크포인트: 실제 수집 데이터 샘플 확인
+            if done_count == 500 and all_investor_rows:
+                print(f"  ── 중간 샘플 체크 (최근 수집 5건) ──")
+                for r in all_investor_rows[-5:]:
+                    print(
+                        f"     {r['stock_code']}  {r.get('stock_name','')[:8]:<8}  "
+                        f"{r['date']}  {r.get('investor_type',''):<8}  "
+                        f"순매수={r.get('net_buy_value') or 0:+,}"
+                    )
+                bad = sum(1 for r in all_investor_rows if r.get("net_buy_value") is None)
+                if bad > len(all_investor_rows) * 0.1:
+                    print(f"  ⚠️  순매수 NULL {bad}건 ({bad/len(all_investor_rows):.0%}) 감지 — 수집 데이터 확인 필요!")
 
     if investor_batch:
         ch, tot = upsert_batch(conn, INVESTOR_SQL, investor_batch)
