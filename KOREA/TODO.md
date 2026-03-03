@@ -1,7 +1,7 @@
 # 📝 TODO - 작업 목록
 
-> **마지막 업데이트**: 2026-03-02
-> **현재 Phase**: Phase 4 완료 / DB 복원 완료 / FICS 섹터 크롤링 초기 수집 중
+> **마지막 업데이트**: 2026-03-03
+> **현재 Phase**: Phase 4 완료 / DB 복원 완료 / FICS 섹터 수집 완료 / 2/27~ 누락 수집 대기
 
 ---
 
@@ -17,6 +17,9 @@
   - 신규 상장 4개 자동 추가: 0155N0, 0162L0, 0162M0, 0162Z0 (당일 데이터 없음 → 정상)
 - [x] **2026-02-26 데이터 수집** ✅ (2026-02-27): OHLCV 3,795건 / 수급 2,720건, 실패 0건
 - [x] **DB 복원** ✅ (2026-03-01): backup_20260227_2331.dump (187MB) → dropdb/createdb/pg_restore, 2/26까지 정상
+- [x] **`scripts/restore_db.sh` 작성** ✅ (2026-03-03)
+  - TimescaleDB pg_restore 후 hypertable 유니크 인덱스 자동 재생성
+  - `bash scripts/restore_db.sh <dump>` 1줄로 복원 완료
 - [x] **FnGuide FICS 업종 크롤링 구축** ✅ (2026-03-02)
   - `stock_sectors` 테이블 생성 (stock_code PK, fics_sector, updated_at)
   - `scripts/crawl_sector.py` 작성 (2,720개 KOSPI+KOSDAQ, 약 70분 소요)

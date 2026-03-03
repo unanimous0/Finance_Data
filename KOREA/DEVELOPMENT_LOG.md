@@ -52,6 +52,61 @@
 
 ---
 
+## 2026-03-03 (화) - TimescaleDB pg_restore 유니크 인덱스 소실 문제 조사 및 해결
+
+### 🔍 문제 발견
+
+다른 PC에서 dump 파일로 복원 후 `daily_update.py` 실행 시 ON CONFLICT 에러 발생.
+
+```
+ERROR: there is no unique or exclusion constraint matching the ON CONFLICT specification
+```
+
+### 📝 원인 분석
+
+TimescaleDB **hypertable 레벨 유니크 인덱스는 `pg_dump`에 포함되지 않음** (설계상 의도적 제외).
+
+- `pg_dump` 시 `uq_ohlcv_time_stock` 등 3개 인덱스가 dump에 없음 → `pg_restore` 후 소실
+- 청크 레벨 PK(`649_649_ohlcv_daily_pkey`)는 dump에 있으나, 부모 인덱스 없이 복원 불가 → 조용히 실패
+- 결과: 복원 후 hypertable에 유니크 제약 전혀 없음 → ON CONFLICT 동작 불가
+
+이 문제는 2/24 유니크 인덱스 최초 생성 이후부터 잠재해 있었으나, 복원 테스트를 안 해서 몰랐음.
+
+### ✅ 해결책: `scripts/restore_db.sh` 작성
+
+`pg_restore` 후 유니크 인덱스 3개를 자동 재생성하는 스크립트 작성.
+
+```bash
+bash scripts/restore_db.sh <dump_file>   # 1줄로 복원 완료
+```
+
+내부 동작 (3단계):
+1. 기존 DB 드롭 + 재생성 (세션 강제 종료 포함)
+2. `pg_restore` 실행
+3. 유니크 인덱스 3개 재생성 (`CREATE UNIQUE INDEX IF NOT EXISTS`)
+
+### ❌ 시도했다 철회한 방법: DELETE+INSERT 방식
+
+ON CONFLICT 없이 DELETE 후 INSERT 방식으로 변경 시도 → 아래 이유로 원상복구:
+- **비원자성**: DELETE → INSERT 사이 장애 시 해당 날짜 데이터 유실
+- **무결성 미보장**: 신규 청크(미래 데이터)에 DB 레벨 중복 방지 없음
+- 복원 경험 차이 없음 (어차피 restore_db.sh 1줄)
+
+### 📝 설계 결정 및 교훈
+
+- **ON CONFLICT UPSERT 유지** — 원자성·무결성 측면에서 우월
+- **복원은 항상 `bash scripts/restore_db.sh`** — bare `pg_restore`는 인덱스 소실로 사용 불가
+- TimescaleDB를 사용할 때 pg_dump/restore는 반드시 인덱스 재생성 절차 포함 필요
+
+### 현재 DB 현황 (복원 후)
+- ohlcv_daily: **3,271,899건** (2022-01-03 ~ 2026-02-26)
+- market_cap_daily: **3,271,899건**
+- investor_trading: **10,075,252건**
+- stock_sectors: **2,720건** (FICS 섹터 확인 2,607건 / NULL 113건)
+- 유니크 인덱스 3개: `uq_ohlcv_time_stock`, `uq_mktcap_time_stock`, `uq_investor_time_stock_type` ✅
+
+---
+
 ## 2026-03-01 (일) - DB 복원 (backup_20260227_2331.dump)
 
 ### ✅ 완료 작업
