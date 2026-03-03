@@ -137,42 +137,59 @@ def _fetch_investor(client, code, name, start, end):
     return code, name, rows
 
 
-# ── DB INSERT ─────────────────────────────────────────────────────────────
+# ── DB UPSERT ─────────────────────────────────────────────────────────────
 OHLCV_SQL = """
 INSERT INTO ohlcv_daily
     (time, stock_code, open_price, high_price, low_price, close_price, volume, trading_value)
 VALUES %s
+ON CONFLICT (time, stock_code) DO UPDATE SET
+    open_price    = EXCLUDED.open_price,
+    high_price    = EXCLUDED.high_price,
+    low_price     = EXCLUDED.low_price,
+    close_price   = EXCLUDED.close_price,
+    volume        = EXCLUDED.volume,
+    trading_value = EXCLUDED.trading_value
+WHERE (ohlcv_daily.open_price, ohlcv_daily.high_price, ohlcv_daily.low_price,
+       ohlcv_daily.close_price, ohlcv_daily.volume, ohlcv_daily.trading_value)
+   IS DISTINCT FROM
+      (EXCLUDED.open_price, EXCLUDED.high_price, EXCLUDED.low_price,
+       EXCLUDED.close_price, EXCLUDED.volume, EXCLUDED.trading_value)
 """
 
 MKTCAP_SQL = """
 INSERT INTO market_cap_daily (time, stock_code, market_cap)
 VALUES %s
+ON CONFLICT (time, stock_code) DO UPDATE SET
+    market_cap = EXCLUDED.market_cap
+WHERE market_cap_daily.market_cap IS DISTINCT FROM EXCLUDED.market_cap
 """
 
 INVESTOR_SQL = """
 INSERT INTO investor_trading
     (time, stock_code, investor_type, net_buy_value, net_buy_volume)
 VALUES %s
+ON CONFLICT (time, stock_code, investor_type) DO UPDATE SET
+    net_buy_value  = EXCLUDED.net_buy_value,
+    net_buy_volume = EXCLUDED.net_buy_volume
+WHERE (investor_trading.net_buy_value, investor_trading.net_buy_volume)
+   IS DISTINCT FROM
+      (EXCLUDED.net_buy_value, EXCLUDED.net_buy_volume)
 """
 
 
-def delete_date_range(conn, start_date: date, end_date: date) -> None:
-    """지정 기간 기존 데이터 삭제 (재삽입 준비)"""
-    with conn.cursor() as cur:
-        cur.execute("DELETE FROM ohlcv_daily WHERE time BETWEEN %s AND %s", (start_date, end_date))
-        cur.execute("DELETE FROM market_cap_daily WHERE time BETWEEN %s AND %s", (start_date, end_date))
-        cur.execute("DELETE FROM investor_trading WHERE time BETWEEN %s AND %s", (start_date, end_date))
-    conn.commit()
-
-
-def insert_batch(conn, sql: str, rows: list[tuple]) -> int:
-    """Returns: total_rows inserted"""
+def upsert_batch(conn, sql: str, rows: list[tuple]) -> tuple[int, int]:
+    """
+    Returns: (changed_rows, total_rows)
+    changed_rows: 실제 INSERT되거나 값이 달라서 UPDATE된 건수
+    total_rows:   시도한 전체 건수 (changed + skipped)
+    """
     if not rows:
-        return 0
+        return 0, 0
     with conn.cursor() as cur:
         psycopg2.extras.execute_values(cur, sql, rows, page_size=500)
+        changed = cur.rowcount  # WHERE 조건 불만족(값 동일)은 카운트 안 됨
     conn.commit()
-    return len(rows)
+    return changed, len(rows)
 
 
 # ── 특이사항 분석 ─────────────────────────────────────────────────────────
@@ -510,10 +527,6 @@ def run_update(target_date: date = None, missing_only: bool = False) -> dict:
     # ─────────────────────────────────────────────────────────
     # STEP 1: OHLCV + 시가총액 수집 (전 종목, 병렬)
     # ─────────────────────────────────────────────────────────
-    # 재수집 모드가 아닐 때: 해당 기간 기존 데이터 먼저 삭제 후 재삽입
-    if not missing_only:
-        delete_date_range(conn, start_date, end_date)
-
     print(f"[1/2] OHLCV + 시가총액 수집 ({total_stocks}개 종목, workers={MAX_WORKERS})...")
 
     ohlcv_batch  = []
@@ -554,13 +567,15 @@ def run_update(target_date: date = None, missing_only: bool = False) -> dict:
 
             # 배치 저장 (500건마다, 메인 스레드에서만 실행)
             if len(ohlcv_batch) >= 500:
-                tot = insert_batch(conn, OHLCV_SQL, ohlcv_batch)
-                result["ohlcv"]["changed"] += tot
+                ch, tot = upsert_batch(conn, OHLCV_SQL, ohlcv_batch)
+                result["ohlcv"]["changed"] += ch
+                result["ohlcv"]["skipped"] += tot - ch
                 result["ohlcv"]["rows"]    += tot
                 ohlcv_batch.clear()
             if len(mktcap_batch) >= 500:
-                tot = insert_batch(conn, MKTCAP_SQL, mktcap_batch)
-                result["market_cap"]["changed"] += tot
+                ch, tot = upsert_batch(conn, MKTCAP_SQL, mktcap_batch)
+                result["market_cap"]["changed"] += ch
+                result["market_cap"]["skipped"] += tot - ch
                 result["market_cap"]["rows"]    += tot
                 mktcap_batch.clear()
 
@@ -581,12 +596,14 @@ def run_update(target_date: date = None, missing_only: bool = False) -> dict:
 
     # 잔여 저장
     if ohlcv_batch:
-        tot = insert_batch(conn, OHLCV_SQL, ohlcv_batch)
-        result["ohlcv"]["changed"] += tot
+        ch, tot = upsert_batch(conn, OHLCV_SQL, ohlcv_batch)
+        result["ohlcv"]["changed"] += ch
+        result["ohlcv"]["skipped"] += tot - ch
         result["ohlcv"]["rows"]    += tot
     if mktcap_batch:
-        tot = insert_batch(conn, MKTCAP_SQL, mktcap_batch)
-        result["market_cap"]["changed"] += tot
+        ch, tot = upsert_batch(conn, MKTCAP_SQL, mktcap_batch)
+        result["market_cap"]["changed"] += ch
+        result["market_cap"]["skipped"] += tot - ch
         result["market_cap"]["rows"]    += tot
 
     result["ohlcv_data"] = all_ohlcv_rows
@@ -627,8 +644,9 @@ def run_update(target_date: date = None, missing_only: bool = False) -> dict:
                     ))
 
             if len(investor_batch) >= 500:
-                tot = insert_batch(conn, INVESTOR_SQL, investor_batch)
-                result["investor"]["changed"] += tot
+                ch, tot = upsert_batch(conn, INVESTOR_SQL, investor_batch)
+                result["investor"]["changed"] += ch
+                result["investor"]["skipped"] += tot - ch
                 result["investor"]["rows"]    += tot
                 investor_batch.clear()
 
@@ -649,8 +667,9 @@ def run_update(target_date: date = None, missing_only: bool = False) -> dict:
                     print(f"  ⚠️  순매수 NULL {bad}건 ({bad/len(all_investor_rows):.0%}) 감지 — 수집 데이터 확인 필요!")
 
     if investor_batch:
-        tot = insert_batch(conn, INVESTOR_SQL, investor_batch)
-        result["investor"]["changed"] += tot
+        ch, tot = upsert_batch(conn, INVESTOR_SQL, investor_batch)
+        result["investor"]["changed"] += ch
+        result["investor"]["skipped"] += tot - ch
         result["investor"]["rows"]    += tot
 
     result["investor_data"] = all_investor_rows
