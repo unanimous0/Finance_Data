@@ -115,12 +115,20 @@ class InfomaxClient:
         return rows
 
     # ── 투자자별 수급 (/api/stock/investor) ────────────────────────────────
+    # API는 bid_value / ask_value를 천원(千원) 단위로 반환
+    # → 원(원화) 단위로 변환하기 위해 × 1,000 적용
+    _INVESTOR_VALUE_UNIT = 1_000
+
     def get_investor(self, code: str,
                      start: date, end: date) -> list[dict]:
         """
         4개 투자자 유형 수급 한 번에 조회 (investor 미입력 = 전체 반환)
         반환: [{"date", "stock_code", "investor_type",
-                "net_buy_value", "net_buy_volume"}, ...]
+                "net_buy_value"(원), "net_buy_volume"(주)}, ...]
+
+        단위 검증:
+          bid_value / bid_volume (원 단위 가정) → 100원 미만이면 천원 단위로 판단
+          정상 한국 주식 범위: 100원 ~ 10,000,000원/주
         """
         params = {
             "code":      code,
@@ -131,8 +139,33 @@ class InfomaxClient:
         if not data:
             return []
 
+        results = data.get("results", [])
+
+        # ── 단위 자동 검증 (거래량 있는 첫 레코드 기준) ──────────────────
+        unit = self._INVESTOR_VALUE_UNIT  # 기본: 천원 단위
+        for r in results:
+            bid_val = r.get("bid_value", 0) or 0
+            bid_vol = r.get("bid_volume", 0) or 0
+            if bid_vol > 0 and bid_val > 0:
+                raw_price = bid_val / bid_vol  # 원 단위 가정 시 역산 단가
+                if raw_price >= 100:
+                    # 이미 원 단위 (예: API 사양 변경 시)
+                    unit = 1
+                else:
+                    # 100원 미만 → 천원 단위 확정
+                    unit = 1_000
+                # 변환 후 역산 단가 이상 범위 경고
+                adj_price = raw_price * unit
+                if not (100 <= adj_price <= 10_000_000):
+                    import warnings
+                    warnings.warn(
+                        f"[investor 단위검증] {code} 역산단가={adj_price:,.0f}원/주 — "
+                        f"정상 범위(100~10,000,000원) 이탈. raw={raw_price:.2f}, unit={unit}"
+                    )
+                break  # 첫 유효 레코드만 검증
+
         rows = []
-        for r in data.get("results", []):
+        for r in results:
             api_investor = r.get("investor", "")
             db_type = INVESTOR_MAP.get(api_investor)
             if db_type is None:
@@ -147,8 +180,8 @@ class InfomaxClient:
                 "date":           self._parse_date(r.get("date")),
                 "stock_code":     r.get("code", code),
                 "investor_type":  db_type,
-                "net_buy_value":  bid_val - ask_val,
-                "net_buy_volume": bid_vol - ask_vol,
+                "net_buy_value":  (bid_val - ask_val) * unit,   # 원 단위
+                "net_buy_volume": bid_vol - ask_vol,             # 주 단위
             })
         return rows
 

@@ -5,6 +5,43 @@
 
 ---
 
+## 2026-03-04 (수) - net_buy_value 단위 오류 발견·수정 (천원→원)
+
+### 🐛 문제 발견
+
+`investor_trading.net_buy_value`가 천원(千원) 단위로 저장되어 있음을 발견.
+
+- 원인: 인포맥스 `/api/stock/investor` API가 `bid_value`, `ask_value`를 **천원 단위**로 반환
+- 증상: 삼성전자 외국인 순매도 32억원 → 실제는 **3.21조원**이어야 함
+  - `net_buy_value / net_buy_volume` = 205원/주 (삼성전자 195,100원과 불일치)
+  - × 1,000 적용 시 205,437원/주 → 정상 범위
+
+### ✅ 완료 작업
+
+1. **DB 기존 데이터 전체 수정**
+   - `UPDATE investor_trading SET net_buy_value = net_buy_value * 1000;`
+   - 대상: 10,096,996건 전체
+   - bigint 범위 사전 검증: max(3.62조) × 1,000 = 3.62경 << bigint 한계(9.2경) ✓
+
+2. **`collectors/infomax.py` 수정** (`get_investor()`)
+   - `(bid_val - ask_val) * unit` 으로 원 단위 변환
+   - 단위 자동 검증 로직 추가: `bid_value / bid_volume`으로 역산 단가 계산
+     - 100원 미만 → 천원 단위(`unit=1000`) 적용
+     - 100원 이상 → 이미 원 단위(`unit=1`) (API 사양 변경 대비)
+     - 변환 후 100원~10,000,000원 범위 이탈 시 경고 발생
+
+### 📝 확인된 단위 정리
+
+| 테이블·컬럼 | 단위 | 비고 |
+|------------|------|------|
+| `ohlcv_daily.trading_value` | 원(₩) | API 직접값 |
+| `ohlcv_daily.open/high/low/close_price` | 원(₩) | API 직접값 |
+| `market_cap_daily.market_cap` | 원(₩) | close × listed_shares 계산 |
+| `investor_trading.net_buy_value` | **원(₩)** | API 천원 단위 → ×1,000 변환 후 저장 |
+| `investor_trading.net_buy_volume` | 주(株) | API 직접값 |
+
+---
+
 ## 2026-03-04 (수) - DB 복원(3/3 덤프) + 데이터 품질 전수 검토 + 2/27·3/3 수집
 
 ### ✅ 완료 작업
