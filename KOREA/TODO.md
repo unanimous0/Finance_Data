@@ -1,7 +1,7 @@
 # 📝 TODO - 작업 목록
 
-> **마지막 업데이트**: 2026-03-04
-> **현재 Phase**: Phase 4 완료 / DB 복원 완료(3/3 덤프) / 2/27·3/3 수집 완료 / 스케줄러 재가동 필요
+> **마지막 업데이트**: 2026-03-07
+> **현재 Phase**: Phase 4 완료 / DB 복원 완료(3/4 덤프) / 스케줄러 재가동 필요
 
 ---
 
@@ -62,6 +62,8 @@
   - 삭제: `raw_data/temp/` (248MB), `raw_data/*.xlsx`, `.pytest_cache/`
   - 삭제: 미사용 코드 (`database/connection.py`, `utils/logger.py`, `utils/exceptions.py`)
   - 삭제: 구버전 스키마 (`init_schema.sql`, `alter_stocks_table.sql`)
+- [x] **DB 복원 (backup_20260304.dump)** ✅ (2026-03-07): 3,279,487건, 최신 데이터 2026-03-03
+- [x] **`scripts/restore_db.sh` --no-owner 추가** ✅ (2026-03-07): Windows 덤프 복원 시 `role "postgres" does not exist` 오류 제거
 - [ ] **스케줄러 재가동**: `nohup python schedulers/daily_scheduler.py &`
   - 수집 시간 19:00 이후로 변경 검토 (당일 데이터 확정: 16:40/18:40)
 - [ ] **서버 구축** (맥미니 구매 후 설정)

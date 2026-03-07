@@ -38,7 +38,7 @@ echo "  ✅ DB 재생성 완료"
 
 # 2. pg_restore
 echo "[2/3] pg_restore 실행 중... (수 분 소요)"
-$PGBIN/pg_restore -U $DB_USER -d $DB_NAME "$DUMP_FILE" 2>&1 | grep -v "경고" || true
+$PGBIN/pg_restore --no-owner -U $DB_USER -d $DB_NAME "$DUMP_FILE" 2>&1 | grep -v "경고" || true
 echo "  ✅ pg_restore 완료"
 
 # 3. 유니크 인덱스 재생성 (TimescaleDB pg_restore 시 항상 소실됨)
