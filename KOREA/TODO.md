@@ -1,7 +1,7 @@
 # 📝 TODO - 작업 목록
 
-> **마지막 업데이트**: 2026-03-07
-> **현재 Phase**: Phase 4 완료 / DB 복원 완료(3/4 덤프) / 스케줄러 재가동 필요
+> **마지막 업데이트**: 2026-03-09
+> **현재 Phase**: Phase 4 완료 / 리눅스 서버 세팅 완료 / 3/4 수집 진행 중
 
 ---
 
@@ -64,7 +64,16 @@
   - 삭제: 구버전 스키마 (`init_schema.sql`, `alter_stocks_table.sql`)
 - [x] **DB 복원 (backup_20260304.dump)** ✅ (2026-03-07): 3,279,487건, 최신 데이터 2026-03-03
 - [x] **`scripts/restore_db.sh` --no-owner 추가** ✅ (2026-03-07): Windows 덤프 복원 시 `role "postgres" does not exist` 오류 제거
-- [ ] **스케줄러 재가동**: `nohup python schedulers/daily_scheduler.py &`
+- [x] **리눅스 서버 Python 환경 세팅** ✅ (2026-03-09)
+  - venv 생성 (`python3 -m venv venv`)
+  - requirements.txt 설치 완료
+  - `.env` 설정 완료 (DB_HOST=/var/run/postgresql, DB_USER=una0, peer 인증)
+  - 인포맥스 API 연결 확인 (3,793개 종목 반환)
+- [ ] **3/4 ~ 3/6 누락 데이터 수집** (2026-03-09 진행 중)
+  - 3/4: tmux `collect` 세션에서 수집 중
+  - 3/5: 대기
+  - 3/6: 대기
+- [ ] **스케줄러 재가동**: tmux 세션으로 실행
   - 수집 시간 19:00 이후로 변경 검토 (당일 데이터 확정: 16:40/18:40)
 - [ ] **서버 구축** (맥미니 구매 후 설정)
 

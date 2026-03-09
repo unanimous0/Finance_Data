@@ -1,6 +1,6 @@
 # 🛠️ 환경 설정 및 데이터 수집 가이드
 
-> **목적**: macOS/Windows 양쪽 환경에서 프로젝트 설정 및 데이터 수집 방법
+> **목적**: macOS/Windows/Linux 환경에서 프로젝트 설정 및 데이터 수집 방법
 >
 > **참고**: 두 환경 모두 동일한 개발 가능, 인포맥스 API는 Windows에서만 접근
 
@@ -10,8 +10,9 @@
 
 1. [macOS 환경 설정](#1-macos-환경-설정)
 2. [Windows 환경 설정](#2-windows-환경-설정)
-3. [데이터 수집 가이드](#3-데이터-수집-가이드-windows-전용)
-4. [트러블슈팅](#4-트러블슈팅)
+3. [Linux 서버 환경 설정](#3-linux-서버-환경-설정)
+4. [데이터 수집 가이드](#4-데이터-수집-가이드-windows-전용)
+5. [트러블슈팅](#5-트러블슈팅)
 
 ---
 
@@ -335,7 +336,128 @@ pytest tests\ -v
 
 ---
 
-## 3. 데이터 수집 가이드 (Windows 전용)
+## 3. Linux 서버 환경 설정
+
+> 현재 운영 환경: Ubuntu, DB 소유자 `una0`
+
+### 3-1. DB 접근 방법 — Peer 인증
+
+리눅스 서버의 PostgreSQL은 **Peer 인증**을 사용한다.
+비밀번호 없이 접속되는 이유는 다음과 같다:
+
+- PostgreSQL에는 여러 인증 방식이 있음
+- **Peer 인증**: 유닉스 소켓으로 접속할 때, **OS 로그인 사용자명 = PostgreSQL 역할명**이면 비밀번호 없이 자동 허용
+- 현재 OS 사용자 `una0` = PostgreSQL 역할 `una0` → 자동 통과
+
+```bash
+# 비밀번호 없이 접속 가능 (소켓 경유, OS user = DB user)
+psql -U una0 -d korea_stock_data
+
+# 비밀번호 필요 (TCP 경유)
+psql -U una0 -h 127.0.0.1 -d korea_stock_data
+
+# 실패 (OS user가 una0인데 postgres로 접속 시도)
+psql -U postgres -d korea_stock_data
+```
+
+### 3-2. .env 설정
+
+Peer 인증을 사용하므로 비밀번호 불필요:
+
+```bash
+cp .env.example .env
+```
+
+```.env
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=korea_stock_data
+DB_USER=una0
+DB_PASSWORD=        # 비워두기 (Peer 인증)
+```
+
+### 3-3. DB 접속 확인
+
+```bash
+# 테이블 목록 확인
+psql -U una0 -d korea_stock_data -c '\dt'
+
+# 레코드 수 확인
+psql -U una0 -d korea_stock_data -c "
+SELECT
+  (SELECT COUNT(*) FROM stocks) AS stocks,
+  (SELECT COUNT(*) FROM ohlcv_daily) AS ohlcv_daily,
+  (SELECT COUNT(*) FROM investor_trading) AS investor_trading;
+"
+
+# 최신 데이터 날짜 확인
+psql -U una0 -d korea_stock_data -c "SELECT MAX(time) FROM ohlcv_daily;"
+```
+
+### 3-4. DB 복원 (덤프 파일에서)
+
+```bash
+# restore_db.sh 사용 (TimescaleDB hypertable 인덱스 자동 재생성 포함)
+bash scripts/restore_db.sh <dump_file>
+
+# 예시
+bash scripts/restore_db.sh backups/backup_20260304.dump
+```
+
+> `--no-owner` 플래그가 포함되어 있어 Windows에서 만든 덤프(소유자 `postgres`)도 오류 없이 복원 가능
+
+### 3-5. 원격 모니터링 — tmux
+
+수집은 수 시간 걸리므로 **tmux**로 실행하면 회사에서 시작하고 집에서 이어볼 수 있다.
+
+#### 기본 개념
+
+tmux는 서버에 터미널 세션을 살려두는 도구다. 로컬 터미널을 닫아도 서버의 tmux 세션은 유지되고, 다른 곳에서 SSH로 접속해 다시 붙을 수 있다.
+
+#### 수집 시작 (회사)
+
+```bash
+cd /home/una0/projects/Finance_Data/KOREA
+
+# tmux 세션 'collect' 만들고 수집 시작
+tmux new-session -d -s collect "venv/bin/python -u scripts/daily_update.py YYYYMMDD 2>&1 | tee /tmp/update_YYYYMMDD.txt"
+
+# 세션 확인
+tmux ls
+```
+
+#### 수집 화면 보기 (집 또는 다른 곳)
+
+```bash
+# SSH 접속 후
+tmux attach -t collect
+```
+
+- 수집이 끝나면 세션이 자동 종료됨
+- `Ctrl+B, D`로 세션을 유지한 채 detach 가능
+
+#### 로그만 보고 싶을 때
+
+```bash
+tail -f /tmp/update_YYYYMMDD.txt
+```
+
+### 3-6. 스케줄러 실행
+
+```bash
+cd /home/una0/projects/Finance_Data/KOREA
+
+# tmux 세션으로 실행 (원격 모니터링 가능)
+tmux new-session -d -s scheduler "venv/bin/python -u schedulers/daily_scheduler.py 2>&1 | tee logs/scheduler.log"
+
+# 실행 확인
+tmux ls
+ps aux | grep daily_scheduler
+```
+
+---
+
+## 4. 데이터 수집 가이드 (Windows 전용)
 
 > 인포맥스 API는 Windows에서만 접근 가능
 
@@ -624,7 +746,7 @@ ORDER BY time DESC LIMIT 10;
 
 ---
 
-## 4. 트러블슈팅
+## 5. 트러블슈팅
 
 ### macOS
 
