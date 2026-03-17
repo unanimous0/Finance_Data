@@ -321,19 +321,24 @@ def sync_stock_master(conn, client) -> dict:
     STEP 0: 종목 마스터 갱신
     - /api/stock/code    → 신규 상장 종목 INSERT
     - /api/stock/expired → 상장폐지 종목 is_active=False UPDATE
+    - 두 API 모두에 없는 DB 활성 종목 → is_active=False UPDATE (ETF 청산 등)
 
-    Returns: {"new_listed": [...], "delisted": [...], "errors": [...]}
+    Returns: {"new_listed": [...], "delisted": [...], "ghost_delisted": [...], "errors": [...]}
     """
-    result = {"new_listed": [], "delisted": [], "errors": []}
+    result = {"new_listed": [], "delisted": [], "ghost_delisted": [], "errors": []}
 
     # DB 전체 종목 코드 + 활성 여부
     with conn.cursor() as cur:
         cur.execute("SELECT stock_code, is_active FROM stocks")
         db_stocks = {row[0]: row[1] for row in cur.fetchall()}
 
+    api_active_codes: set[str] = set()
+    api_expired_codes: set[str] = set()
+
     # ── 신규 상장 종목 ─────────────────────────────────────────
     try:
         api_stocks = client.get_stock_codes()
+        api_active_codes = {s["code"] for s in api_stocks if s["code"]}
         for s in api_stocks:
             code = s["code"]
             if not code or code in db_stocks:
@@ -363,6 +368,7 @@ def sync_stock_master(conn, client) -> dict:
 
         expired_start = oldest_listing if oldest_listing else date(2000, 1, 1)
         expired = client.get_expired_codes(start_date=expired_start)
+        api_expired_codes = {s["code"] for s in expired if s["code"]}
         for s in expired:
             code = s["code"]
             if not code:
@@ -381,6 +387,22 @@ def sync_stock_master(conn, client) -> dict:
                 result["delisted"].append(code)
     except Exception as e:
         result["errors"].append(f"상장폐지 조회 실패: {e}")
+
+    # ── 두 API 모두에 없는 활성 종목 (ETF 청산 등) ────────────────
+    # api_active_codes, api_expired_codes 둘 다 정상 수집된 경우에만 실행
+    if api_active_codes and api_expired_codes is not None:
+        known_api_codes = api_active_codes | api_expired_codes
+        for code, is_active in db_stocks.items():
+            if is_active and code not in known_api_codes:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE stocks
+                        SET is_active  = FALSE,
+                            updated_at = NOW()
+                        WHERE stock_code = %s AND is_active = TRUE
+                    """, (code,))
+                conn.commit()
+                result["ghost_delisted"].append(code)
 
     return result
 
@@ -469,7 +491,7 @@ def run_update(target_date: date = None, missing_only: bool = False) -> dict:
     # STEP 0: 종목 마스터 갱신 (신규 상장 / 상장폐지 자동 반영)
     # ─────────────────────────────────────────────────────────
     print("[0/2] 종목 마스터 갱신 중...")
-    master_sync = {"new_listed": [], "delisted": [], "errors": []}
+    master_sync = {"new_listed": [], "delisted": [], "ghost_delisted": [], "errors": []}
     try:
         master_sync = sync_stock_master(conn, client)
         if master_sync["new_listed"]:
@@ -480,7 +502,11 @@ def run_update(target_date: date = None, missing_only: bool = False) -> dict:
             codes_str = ", ".join(master_sync["delisted"][:5])
             suffix    = f" 외 {len(master_sync['delisted'])-5}개" if len(master_sync["delisted"]) > 5 else ""
             print(f"  ✅ 상장폐지 처리 {len(master_sync['delisted'])}개: {codes_str}{suffix}")
-        if not master_sync["new_listed"] and not master_sync["delisted"] and not master_sync["errors"]:
+        if master_sync["ghost_delisted"]:
+            codes_str = ", ".join(master_sync["ghost_delisted"][:5])
+            suffix    = f" 외 {len(master_sync['ghost_delisted'])-5}개" if len(master_sync["ghost_delisted"]) > 5 else ""
+            print(f"  ✅ API 미등록 종목 비활성화 {len(master_sync['ghost_delisted'])}개: {codes_str}{suffix}")
+        if not any([master_sync["new_listed"], master_sync["delisted"], master_sync["ghost_delisted"], master_sync["errors"]]):
             print("  ✅ 변동 없음 (신규 상장 / 상장폐지 없음)")
         for err in master_sync["errors"]:
             print(f"  ⚠️  {err}")
@@ -732,9 +758,10 @@ def generate_report(result: dict) -> str:
 
     # ── 종목 마스터 갱신 ───────────────────────────────────────
     sub("0. 종목 마스터 갱신")
-    new_listed = master_sync.get("new_listed", [])
-    delisted   = master_sync.get("delisted",   [])
-    ms_errors  = master_sync.get("errors",     [])
+    new_listed      = master_sync.get("new_listed",      [])
+    delisted        = master_sync.get("delisted",        [])
+    ghost_delisted  = master_sync.get("ghost_delisted",  [])
+    ms_errors       = master_sync.get("errors",          [])
 
     if new_listed:
         codes_str = ", ".join(new_listed[:10])
@@ -749,6 +776,13 @@ def generate_report(result: dict) -> str:
         lines.append(f"  상장폐지   : {len(delisted)}개  →  {codes_str}{suffix}")
     else:
         lines.append("  상장폐지   : 없음")
+
+    if ghost_delisted:
+        codes_str = ", ".join(ghost_delisted[:10])
+        suffix = f" 외 {len(ghost_delisted)-10}개" if len(ghost_delisted) > 10 else ""
+        lines.append(f"  API 미등록 비활성화: {len(ghost_delisted)}개  →  {codes_str}{suffix}")
+    else:
+        lines.append("  API 미등록 비활성화: 없음")
 
     if ms_errors:
         for err in ms_errors:
