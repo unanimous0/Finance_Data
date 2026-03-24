@@ -148,7 +148,7 @@ def get_missing_foreign_stocks(conn, target_date: date) -> list[tuple[str, str]]
             FROM stocks s
             WHERE s.is_active = TRUE
               AND s.market IN ('KOSPI', 'KOSDAQ')
-              AND s.stock_name NOT LIKE '%스팩%'
+              AND s.stock_name NOT LIKE '%%스팩%%'
               AND s.stock_code NOT IN (
                   SELECT stock_code FROM foreign_ownership WHERE time = %s
               )
