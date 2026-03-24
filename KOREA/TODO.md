@@ -1,7 +1,7 @@
 # 📝 TODO - 작업 목록
 
-> **마지막 업데이트**: 2026-03-17
-> **현재 Phase**: Phase 4 완료 / 최신 데이터 2026-03-17 / 스케줄러 재가동 필요
+> **마지막 업데이트**: 2026-03-24
+> **현재 Phase**: Phase 4 완료 + foreign_ownership 추가 / 최신 데이터 2026-03-23 / 스케줄러 재가동 필요
 
 ---
 
@@ -86,9 +86,25 @@
   - 472350, 0106J0, 0120X0 비활성화 처리 완료
 - [x] **불필요 파일 정리** ✅ (2026-03-17)
   - ERROR 보고서 3개 삭제, utils/ 폴더 삭제, docs/.gitkeep 삭제
+- [x] **외국인 지분율(foreign_ownership) 수집 추가** ✅ (2026-03-24)
+  - `foreign_ownership` 테이블 생성 (Hypertable)
+  - `collectors/infomax.py`: `get_foreign()` 추가
+  - `scripts/daily_update.py` STEP 3 통합 (ETF/SPAC 제외 ~2,642종목, 매일)
+  - 백필: 2022-01-03~2026-03-20, 1,252,296건 완료 (`collect_foreign_ownership.py`)
+- [x] **investor_trading 단위 버그 수정** ✅ (2026-03-24)
+  - close_price ≥ 100,000원 종목에서 net_buy_value 1/1000 오류
+  - `collectors/infomax.py`: 단위 자동감지 제거, 항상 × 1,000 고정
+  - DB 교정 완료 (0.001x 버그 0건)
+- [x] **UNIT_CHECK 품질 체크 추가** ✅ (2026-03-24)
+  - `validators/quality_checks.py`: `check_investor_unit()` (역산단가 검증)
+- [x] **3/18~3/23 데이터 수집 완료** ✅ (2026-03-24)
+  - 3/23: 신규 상장 0166S0 자동 추가
+- [x] **`get_missing_foreign_stocks()` LIKE 이스케이프 버그 수정** ✅ (2026-03-24)
+  - psycopg2 파라미터 포함 SQL에서 `%%스팩%%` 이스케이프 필요
 - [ ] **스케줄러 재가동**: tmux 세션으로 실행
   - 수집 시간 **19:00 이후**로 변경 (실험으로 확인: 18:40+ 2차 제공 후 99%+ 수집 가능)
   - daily_update.py 기본값이 "어제"까지만 수집 → 당일 수집 시 날짜 명시 필요
+- [ ] **`scripts/collect_foreign_ownership.py` 삭제** (백필 완료, 불필요)
 - [ ] **서버 구축** (맥미니 구매 후 설정)
 
 ---

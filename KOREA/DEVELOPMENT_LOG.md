@@ -5,6 +5,77 @@
 
 ---
 
+## 2026-03-24 (화) - 외국인 지분율 수집 추가 + investor_trading 단위 버그 수정 + 버그 수정
+
+### ✅ 완료 작업
+
+1. **외국인 지분율(foreign_ownership) 테이블 및 수집 추가**
+   - DB: `foreign_ownership` 테이블 생성 (TimescaleDB hypertable)
+     - 컬럼: `time DATE`, `stock_code`, `frn_ownership_ratio`, `frn_ownership_vol`, `frn_limit_ratio`
+     - `listed_shares` 미포함 (ohlcv_daily와 중복)
+     - 인덱스: `idx_foreign_ownership_code_time ON (stock_code, time DESC)`
+   - `collectors/infomax.py`: `get_foreign()` 메서드 추가 (`/api/stock/foreign`)
+   - `scripts/daily_update.py`: STEP 3 외국인 지분율 수집 통합 (매일 16:30)
+     - ETF/SPAC 제외 KOSPI+KOSDAQ ~2,642개 종목, ThreadPoolExecutor 병렬 수집
+   - `scripts/collect_foreign_ownership.py`: 백필 전용 스크립트 (2022-01-03~2026-03-20, 1,252,296건)
+   - `schedulers/daily_scheduler.py`: 주석/설명 업데이트 (외국인지분율 daily_update 통합 반영)
+   - **`frn_limit_ratio` 의미 확인**: 외국인 보유 한도 비율 자체 (KT=49%, SKT=49%)
+     - 소진율은 쿼리 시점에 `frn_ownership_ratio / frn_limit_ratio × 100`으로 계산
+
+2. **investor_trading 단위 버그 수정**
+   - **버그 원인**: `get_investor()`에 단위 자동감지 로직이 있었음
+     - `bid_val / bid_vol` (天원 단위) ≥ 100이면 `unit=1` 사용
+     - close_price ≥ 100,000원 종목은 역산단가가 100+ → `unit=1`로 오인
+     - → net_buy_value가 1/1000 단위(천원)로 저장됨
+   - **수정**: 자동감지 제거, 항상 `unit = 1_000` 고정
+   - **왜 이상치 탐지가 못 잡았나**: `THRESHOLD_LARGE_NET_BUY = 500억` 임계값이 너무 높아
+     - 삼성전자 기관 순매수가 수천억 → 잘못 저장된 수억도 평범하게 보임
+   - **DB 교정**: 수차례 ×1000 / ÷1000 반복 수행
+     - 최종 상태: 0.001x 버그 레코드 0건, too_large 0건
+     - 잔존 32,861건 (ratio 0.01~0.1x): 단위 버그 아님
+       - API 특성상 매수/매도 금액이 거의 균형인 경우 역산단가가 시세와 괴리 발생
+       - 물리적 불가능(net_buy_vol × close > trading_value) 15,148건 포함
+       - 교정 불가 판단 (원시 bid_value/ask_value 미저장), 알려진 이슈로 문서화
+
+3. **UNIT_CHECK 품질 체크 추가**
+   - `validators/quality_checks.py`: `check_investor_unit()` 추가 (6번째 체크)
+   - 역산단가 `|net_buy_value / net_buy_volume|` ≈ 당일 종가 검증
+   - 조건: `|net_buy_volume| ≥ 1,000주`, 임계값: 종가 × 0.1배 미만 or × 10배 초과
+
+4. **3/20 ~ 3/23 데이터 수집 완료**
+   - 3/20: OHLCV 3,799건 / investor_trading 10,876건 / foreign_ownership 2,642건 (첫 정규 수집)
+   - 3/23: OHLCV 3,799건 / investor_trading 10,876건 / foreign_ownership 2,642건
+     - 신규 상장 0166S0 추가 (OHLCV 실패 1건 — 당일 데이터 미제공)
+     - 수급 데이터: 구버전 코드로 수집 → 단위 버그 565건 → 삭제 후 수정 코드로 재수집
+
+5. **버그 수정: `get_missing_foreign_stocks()` LIKE 절 이스케이프**
+   - psycopg2에서 파라미터 포함 SQL의 `%` → `%%` 이스케이프 필요
+   - `LIKE '%스팩%'` → `LIKE '%%스팩%%'` 수정
+   - `--missing-only` 모드에서만 호출되는 함수 → 기존 정규 수집은 영향 없었음
+
+### 📝 설계 결정
+
+- **외국인 지분율 수집 주기**: 주간이 아닌 일별로 결정 (daily_update.py STEP 3 통합)
+  - API 조회 범위: 2002-06-14~현재 (24년치), 3년 청크로 백필
+- **frn_limit_ratio**: 소진율이 아닌 한도 자체 (외국인이 보유 가능한 최대 %)
+  - 소진율(한도 대비 실제 보유 %)은 쿼리 시점에 파생 계산
+- **investor_trading 단위**: API는 항상 千원 단위 → 항상 × 1,000
+  - 단위 자동감지 로직은 고가 종목에서 오인식 버그 유발 → 제거
+
+### 현재 DB 현황 (2026-03-24 기준)
+
+| 테이블 | 레코드 수 | 최신 날짜 |
+|--------|----------|----------|
+| stocks | ~3,800건 (활성 ~3,800) | - |
+| ohlcv_daily | ~3,600,000건 | **2026-03-23** |
+| market_cap_daily | ~3,600,000건 | **2026-03-23** |
+| investor_trading | ~11,200,000건 | **2026-03-23** |
+| foreign_ownership | ~1,260,000건 | **2026-03-23** |
+| floating_shares | 1,034,865건 | 2026-02-19 |
+| stock_sectors | 2,720건 | 2026-03-02 |
+
+---
+
 ## 2026-03-17 (화) - 3/11~3/17 수집 완료 + 인포맥스 제공시간 실험 + sync_stock_master 개선
 
 ### ✅ 완료 작업

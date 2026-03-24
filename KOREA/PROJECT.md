@@ -1,7 +1,7 @@
 # 🏢 한국 주식시장 데이터 중앙 관리 시스템
 
-> **마지막 업데이트**: 2026-03-22
-> **프로젝트 상태**: Phase 4 완료 / 최신 데이터 2026-03-20 / 스케줄러 재가동 필요
+> **마지막 업데이트**: 2026-03-24
+> **프로젝트 상태**: Phase 4 완료 + foreign_ownership 추가 / 최신 데이터 2026-03-23 / 스케줄러 재가동 필요
 > **Repository**: https://github.com/unanimous0/Finance_Data/tree/main/KOREA
 
 ---
@@ -33,48 +33,35 @@
   - `collectors/infomax.py`: 신규 상장/폐지 API 추가 (`get_stock_codes`, `get_expired_codes`)
   - `daily_update.py` STEP 0: 종목 마스터 자동 갱신 (신규 상장 INSERT, 상장폐지 UPDATE)
   - Read-only DB 계정 생성 완료 (`korea_stock_reader`)
-- 94개 ETF 시계열 데이터 보충 ✅ (2026-02-24)
-- DB 유니크 인덱스 3개 테이블 정비 ✅ (2026-02-24)
-- 2/25 데이터 수집 완료 ✅ (2026-02-26): 신규 상장 4종목 자동 감지/추가
-- 2/26 데이터 수집 완료 ✅ (2026-02-27): 실패 0건, 신규 상장/폐지 없음
-- DB 복원 완료 ✅ (2026-03-04): backup_20260303_2247.dump → 3/3까지 데이터 정상
-- 데이터 품질 전수 검토 완료 ✅ (2026-03-04): 삼성전자 2/26 오류 수정, 이상 2건 확인 후 보류
-- 2/27·3/3 누락 데이터 수집 완료 ✅ (2026-03-04)
-- DB 복원 완료 ✅ (2026-03-07): backup_20260304.dump → 3/3까지 데이터 정상 (3,279,487건)
-- `scripts/restore_db.sh` --no-owner 추가 ✅ (2026-03-07): Windows 덤프 복원 시 postgres 롤 없음 오류 제거
-- 리눅스 서버 Python 환경 세팅 완료 ✅ (2026-03-09): venv, requirements.txt, .env, API 연결 확인
-- DB 접근 방식: Peer 인증 (OS user `una0` = PostgreSQL role `una0`, 비밀번호 불필요)
-- 원격 모니터링: tmux 세션 활용 (회사→집 이동 중에도 수집 과정 확인 가능)
-- 3/4~3/9 누락 데이터 수집 완료 ✅ (2026-03-09~10)
-- 3/10 데이터 수집 완료 ✅ (2026-03-11 01:03): 3,798건, 신규 상장 3개(0162Y0/0163Y0/0164G0)
-- 3/11~3/16 데이터 수집 완료 ✅ (2026-03-11~16): 각 3,800건 내외
-- 3/17 데이터 수집 완료 ✅ (2026-03-17 21:21): 3,801건 OHLCV / 10,876건 수급
-- 3/18 데이터 수집 완료 ✅ (2026-03-19 00:57): 3,798건 OHLCV / 10,872건 수급, 상장폐지 204630 자동 처리
-- 3/19 데이터 수집 완료 ✅ (2026-03-19 23:03): 3,798건 OHLCV / 10,872건 수급
-- 3/20 데이터 수집 완료 ✅ (2026-03-21 14:38): 3,799건 OHLCV / 10,876건 수급, 신규 상장 493280
-  - 신규 상장 5개 자동 감지: 0166N0, 0167A0, 0167B0, 0167Z0, 0168K0
+- **외국인 지분율 추가 ✅ (2026-03-24)**
+  - `foreign_ownership` 테이블 생성 (TimescaleDB hypertable)
+  - `collectors/infomax.py`: `get_foreign()` 추가
+  - `daily_update.py` STEP 3: 외국인 지분율 수집 통합 (ETF/SPAC 제외 ~2,642종목)
+  - 백필 완료: 2022-01-03~2026-03-20, 1,252,296건 (`scripts/collect_foreign_ownership.py`)
+- **investor_trading 단위 버그 수정 ✅ (2026-03-24)**
+  - close_price ≥ 100,000원 종목에서 단위 1/1000 오류 → 항상 × 1,000 고정
+  - `validators/quality_checks.py`: UNIT_CHECK 추가 (역산단가 검증, 6번째 체크)
+- 3/17~3/23 데이터 수집 완료 ✅
 - `sync_stock_master()` 개선 ✅ (2026-03-17): API 미등록 종목 자동 비활성화 추가
-  - 상장 API에도 없고 상폐 API에도 없는 활성 종목 → is_active=FALSE (ETF 청산 등)
-  - 472350(1Q 차이나H), 0106J0, 0120X0 비활성화 처리
 - 인포맥스 데이터 제공 시간 실험 완료 ✅ (2026-03-17): 19시 이후 수집 정책 결정
-- 불필요 파일 정리 ✅ (2026-03-17): ERROR 보고서 3개, utils/ 폴더, docs/.gitkeep 삭제
 - 미완료: 스케줄러 재가동 (수집 시간 19:00 이후로 변경)
 
 ---
 
-## 📊 현재 데이터 현황 (2026-03-17 기준)
+## 📊 현재 데이터 현황 (2026-03-24 기준)
 
 ### 적재 완료 데이터
 
 | 테이블 | 레코드 수 | 기간 | 종목 수 |
 |--------|----------|------|---------|
-| stocks | ~3,810건 | - | 활성 ~3,800개 |
-| ohlcv_daily | ~3,540,000건 | 2022-01-03 ~ 2026-03-20 | ~3,800개 |
-| market_cap_daily | ~3,540,000건 | 2022-01-03 ~ 2026-03-20 | ~3,800개 |
-| investor_trading | ~11,100,000건 | 2022-01-03 ~ 2026-03-20 | 2,719개 (KOSPI+KOSDAQ) |
+| stocks | ~3,800건 | - | 활성 ~3,800개 |
+| ohlcv_daily | ~3,600,000건 | 2022-01-03 ~ 2026-03-23 | ~3,800개 |
+| market_cap_daily | ~3,600,000건 | 2022-01-03 ~ 2026-03-23 | ~3,800개 |
+| investor_trading | ~11,200,000건 | 2022-01-03 ~ 2026-03-23 | 2,719개 (KOSPI+KOSDAQ) |
+| foreign_ownership | ~1,260,000건 | 2022-01-03 ~ 2026-03-23 | 2,642개 (ETF/SPAC 제외) |
 | floating_shares | 1,034,865건 | 2022-01-03 ~ 2026-02-19 | 2,546개 |
 | stock_sectors | 2,720건 | - | 2,607개 섹터 확인 / 113개 NULL |
-| **합계** | **~18M건** | **4년치** | - |
+| **합계** | **~20M건** | **4년치** | - |
 
 ### 투자자 타입별 데이터
 
@@ -229,17 +216,17 @@ KOREA/
 │
 ├── collectors/            # 데이터 수집기
 │   └── infomax.py        # 인포맥스 API 수집기 (InfomaxClient, thread-safe)
-│                          #   get_hist(), get_investor(), get_stock_codes(), get_expired_codes()
+│                          #   get_hist(), get_investor(), get_foreign(), get_stock_codes(), get_expired_codes()
 │
 ├── validators/            # 데이터 검증
 │   ├── schemas.py        # Pydantic 스키마 (10개)
-│   └── quality_checks.py # 5종 품질 체크 (NULL, 중복, 논리, 연속성, 수급 합산)
+│   └── quality_checks.py # 6종 품질 체크 (NULL, 중복, 논리, 연속성, 수급 합산, 역산단가 UNIT_CHECK)
 │
 ├── schedulers/            # 스케줄링
 │   └── daily_scheduler.py  # APScheduler: 매일 16:30 수집 / 매주 일요일 03:00 백업
 │
 ├── scripts/               # 실행 스크립트
-│   ├── daily_update.py          # 일별 업데이트 (종목 마스터 갱신 + OHLCV + 수급 + 보고서)
+│   ├── daily_update.py          # 일별 업데이트 (종목 마스터 + OHLCV + 수급 + 외국인지분율 + 보고서)
 │   ├── backup_db.py             # pg_dump -Fc 백업 (7일 보관)
 │   ├── data_quality_report.py   # 품질 체크 이력 조회
 │   └── check_collection_status.py  # 수집 현황 모니터링
@@ -300,7 +287,7 @@ KOREA/
 
 ## 📐 5. 데이터베이스 설계
 
-### 테이블 구조 (10개)
+### 테이블 구조 (11개)
 
 #### 메타데이터 (5개)
 
@@ -342,7 +329,7 @@ FOREIGN KEY: etf_code → stocks, component_code → stocks
 특징: stocks 테이블을 2번 참조 (ETF 자체 + 구성종목)
 ```
 
-#### 시계열 데이터 - Hypertable (3개)
+#### 시계열 데이터 - Hypertable (4개)
 
 **6. market_cap_daily** (시가총액)
 ```sql
@@ -364,7 +351,19 @@ PRIMARY KEY: (time, stock_code, investor_type)  -- 3개 복합키
 Hypertable: time 기준 자동 파티셔닝
 컬럼: time, stock_code, investor_type, net_buy_value, net_buy_volume
 -- net_buy_value: 순매수거래대금 (원), net_buy_volume: 순매수거래량 (주)
--- buy/sell 개별 컬럼 삭제됨 (순(net)값만 사용)
+-- API는 千원 단위 반환 → 항상 × 1,000 적용 (단위 자동감지 제거)
+```
+
+**9. foreign_ownership** (외국인 지분율)
+```sql
+PRIMARY KEY: (time, stock_code)  -- 복합키
+Hypertable: time 기준 자동 파티셔닝
+컬럼: time, stock_code, frn_ownership_ratio, frn_ownership_vol, frn_limit_ratio
+-- frn_ownership_ratio: 외국인 보유 비율 (%)
+-- frn_ownership_vol: 외국인 보유 주수
+-- frn_limit_ratio: 외국인 보유 한도 비율 (%) — 소진율 아님
+-- 소진율 계산: frn_ownership_ratio / frn_limit_ratio × 100
+-- 대상: KOSPI+KOSDAQ (ETF/SPAC 제외), 기간: 2022-01-03~
 ```
 
 #### 모니터링 (2개)
@@ -375,7 +374,7 @@ PRIMARY KEY: id
 컬럼: data_type, collection_date, source, status, records_count, error_message, started_at, completed_at
 ```
 
-**10. data_quality_checks** (품질 체크)
+**11. data_quality_checks** (품질 체크)
 ```sql
 PRIMARY KEY: id
 컬럼: table_name, check_date, check_type, issue_count, details
@@ -565,5 +564,5 @@ SELECT add_compression_policy('ohlcv_daily', INTERVAL '30 days');
 
 ---
 
-**Last Updated**: 2026-02-22
+**Last Updated**: 2026-03-24
 **Contact**: (작성자 정보)
