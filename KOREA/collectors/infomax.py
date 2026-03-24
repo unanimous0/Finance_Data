@@ -1,7 +1,8 @@
 """
 Infomax API 수집기
-- /api/stock/hist    → ohlcv_daily, market_cap_daily
+- /api/stock/hist     → ohlcv_daily, market_cap_daily
 - /api/stock/investor → investor_trading
+- /api/stock/foreign  → foreign_ownership
 """
 
 import time
@@ -141,28 +142,11 @@ class InfomaxClient:
 
         results = data.get("results", [])
 
-        # ── 단위 자동 검증 (거래량 있는 첫 레코드 기준) ──────────────────
-        unit = self._INVESTOR_VALUE_UNIT  # 기본: 천원 단위
-        for r in results:
-            bid_val = r.get("bid_value", 0) or 0
-            bid_vol = r.get("bid_volume", 0) or 0
-            if bid_vol > 0 and bid_val > 0:
-                raw_price = bid_val / bid_vol  # 원 단위 가정 시 역산 단가
-                if raw_price >= 100:
-                    # 이미 원 단위 (예: API 사양 변경 시)
-                    unit = 1
-                else:
-                    # 100원 미만 → 천원 단위 확정
-                    unit = 1_000
-                # 변환 후 역산 단가 이상 범위 경고
-                adj_price = raw_price * unit
-                if not (100 <= adj_price <= 10_000_000):
-                    import warnings
-                    warnings.warn(
-                        f"[investor 단위검증] {code} 역산단가={adj_price:,.0f}원/주 — "
-                        f"정상 범위(100~10,000,000원) 이탈. raw={raw_price:.2f}, unit={unit}"
-                    )
-                break  # 첫 유효 레코드만 검증
+        # API는 항상 천원(千원) 단위로 반환 → 항상 ×1,000 적용
+        # 주의: bid_value/bid_volume으로 단위 자동감지를 시도했으나
+        # 주가 ≥ 100,000원 종목에서 역산단가가 100 이상이 되어 오판하는 버그가 있었음.
+        # (예: 삼성전자 199,400원 → 천원 단위 역산 = 199.4 ≥ 100 → 원으로 오인식)
+        unit = self._INVESTOR_VALUE_UNIT  # 항상 1,000
 
         rows = []
         for r in results:
@@ -308,6 +292,34 @@ class InfomaxClient:
                 "code":           str(code).strip(),
                 "name":           r.get("kr_name", ""),
                 "delisting_date": self._parse_date(r.get("delisted_date")),
+            })
+        return rows
+
+    # ── 외국인 지분율 (/api/stock/foreign) ──────────────────────────────────
+    def get_foreign(self, code: str,
+                    start: date, end: date) -> list[dict]:
+        """
+        외국인 지분율 조회
+        반환: [{"date", "stock_code", "frn_ownership_ratio",
+                "frn_ownership_vol", "frn_limit_ratio", "listed_shares"}, ...]
+        """
+        params = {
+            "code":      code,
+            "startDate": start.strftime("%Y%m%d"),
+            "endDate":   end.strftime("%Y%m%d"),
+        }
+        data = self._get("/api/stock/foreign", params)
+        if not data:
+            return []
+
+        rows = []
+        for r in data.get("results", []):
+            rows.append({
+                "date":                self._parse_date(r.get("date")),
+                "stock_code":          r.get("code", code),
+                "frn_ownership_ratio": r.get("frn_ownership_ratio"),
+                "frn_ownership_vol":   r.get("frn_ownership_vol"),
+                "frn_limit_ratio":     r.get("frn_limit_ratio"),
             })
         return rows
 

@@ -2,7 +2,7 @@
 데이터 수집 + 백업 스케줄러
 
 잡 목록:
-    daily_update      — 매일 16:30 KST (월~금)           OHLCV/시가총액/수급 수집
+    daily_update      — 매일 16:30 KST (월~금)           OHLCV/시가총액/수급/외국인지분율 수집
     weekly_backup     — 매주 일요일 03:00 KST             DB 백업 + 7일 보관
     quarterly_sector  — 분기 첫 번째 일요일 03:30 KST     FICS 업종 크롤링 (1/4/7/10월)
 
@@ -128,7 +128,7 @@ def main():
         max_instances=1,
     )
 
-    # 잡 3: 분기 첫 번째 일요일 03:30 KST (1/4/7/10월) — FICS 업종 크롤링
+    # 잡 4: 분기 첫 번째 일요일 03:30 KST (1/4/7/10월) — FICS 업종 크롤링
     scheduler.add_job(
         job_quarterly_sector,
         trigger=CronTrigger(
@@ -162,7 +162,7 @@ def main():
     logger.info(f"  다음 수집    : {next_daily.strftime('%Y-%m-%d %H:%M KST') if next_daily else '미정'}")
     logger.info(f"  다음 백업    : {next_backup.strftime('%Y-%m-%d %H:%M KST') if next_backup else '미정'}")
     logger.info(f"  다음 섹터    : {next_sector.strftime('%Y-%m-%d %H:%M KST') if next_sector else '미정'}")
-    logger.info(f"  수집 주기    : 매일 16:30 (월~금)")
+    logger.info(f"  수집 주기    : 매일 16:30 (월~금) — OHLCV/시가총액/수급/외국인지분율")
     logger.info(f"  백업 주기    : 매주 일요일 03:00  (7일 보관)")
     logger.info(f"  섹터 주기    : 분기 첫 번째 일요일 03:30 (1/4/7/10월)")
     logger.info(f"  보고서 저장  : reports/daily_update_YYYYMMDD.txt")

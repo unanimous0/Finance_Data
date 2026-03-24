@@ -1,6 +1,6 @@
 """
 일별 데이터 업데이트 스크립트
-대상: ohlcv_daily, market_cap_daily, investor_trading
+대상: ohlcv_daily, market_cap_daily, investor_trading, foreign_ownership
 실행: 매일 16:30 (schedulers/daily_scheduler.py 또는 단독 실행)
 
 사용법:
@@ -126,6 +126,37 @@ def get_missing_investor_stocks(conn, target_date: date) -> list[tuple[str, str]
         return cur.fetchall()
 
 
+def get_foreign_stocks(conn) -> list[tuple[str, str]]:
+    """외국인 지분율 수집 대상: ETF/SPAC 제외 활성 종목"""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT stock_code, stock_name
+            FROM stocks
+            WHERE is_active = TRUE
+              AND market IN ('KOSPI', 'KOSDAQ')
+              AND stock_name NOT LIKE '%스팩%'
+            ORDER BY stock_code
+        """)
+        return cur.fetchall()
+
+
+def get_missing_foreign_stocks(conn, target_date: date) -> list[tuple[str, str]]:
+    """target_date에 foreign_ownership 데이터가 없는 ETF/SPAC 제외 종목"""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT s.stock_code, s.stock_name
+            FROM stocks s
+            WHERE s.is_active = TRUE
+              AND s.market IN ('KOSPI', 'KOSDAQ')
+              AND s.stock_name NOT LIKE '%스팩%'
+              AND s.stock_code NOT IN (
+                  SELECT stock_code FROM foreign_ownership WHERE time = %s
+              )
+            ORDER BY s.stock_code
+        """, (target_date,))
+        return cur.fetchall()
+
+
 # ── 병렬 수집 worker (module-level, pickle 가능) ──────────────────────────
 def _fetch_hist(client, code, name, start, end):
     rows = client.get_hist(code, start, end)
@@ -134,6 +165,11 @@ def _fetch_hist(client, code, name, start, end):
 
 def _fetch_investor(client, code, name, start, end):
     rows = client.get_investor(code, start, end)
+    return code, name, rows
+
+
+def _fetch_foreign(client, code, name, start, end):
+    rows = client.get_foreign(code, start, end)
     return code, name, rows
 
 
@@ -174,6 +210,21 @@ ON CONFLICT (time, stock_code, investor_type) DO UPDATE SET
 WHERE (investor_trading.net_buy_value, investor_trading.net_buy_volume)
    IS DISTINCT FROM
       (EXCLUDED.net_buy_value, EXCLUDED.net_buy_volume)
+"""
+
+FOREIGN_SQL = """
+INSERT INTO foreign_ownership
+    (time, stock_code, frn_ownership_ratio, frn_ownership_vol, frn_limit_ratio)
+VALUES %s
+ON CONFLICT (time, stock_code) DO UPDATE SET
+    frn_ownership_ratio = EXCLUDED.frn_ownership_ratio,
+    frn_ownership_vol   = EXCLUDED.frn_ownership_vol,
+    frn_limit_ratio     = EXCLUDED.frn_limit_ratio
+WHERE (foreign_ownership.frn_ownership_ratio, foreign_ownership.frn_ownership_vol,
+       foreign_ownership.frn_limit_ratio)
+   IS DISTINCT FROM
+      (EXCLUDED.frn_ownership_ratio, EXCLUDED.frn_ownership_vol,
+       EXCLUDED.frn_limit_ratio)
 """
 
 
@@ -515,21 +566,24 @@ def run_update(target_date: date = None, missing_only: bool = False) -> dict:
         master_sync["errors"].append(str(e))
 
     if missing_only and target_date:
-        all_stocks   = get_missing_ohlcv_stocks(conn, target_date)
-        kospi_kosdaq = get_missing_investor_stocks(conn, target_date)
-        print(f"  [재수집 모드] ohlcv 누락: {len(all_stocks)}개 | 수급 누락: {len(kospi_kosdaq)}개")
+        all_stocks    = get_missing_ohlcv_stocks(conn, target_date)
+        kospi_kosdaq  = get_missing_investor_stocks(conn, target_date)
+        foreign_stocks = get_missing_foreign_stocks(conn, target_date)
+        print(f"  [재수집 모드] ohlcv 누락: {len(all_stocks)}개 | 수급 누락: {len(kospi_kosdaq)}개 | 지분율 누락: {len(foreign_stocks)}개")
     else:
-        all_stocks   = get_stocks(conn, include_etf=True)
-        kospi_kosdaq = get_stocks(conn, include_etf=False)
+        all_stocks    = get_stocks(conn, include_etf=True)
+        kospi_kosdaq  = get_stocks(conn, include_etf=False)
+        foreign_stocks = get_foreign_stocks(conn)
     code_to_name = {c: n for c, n in all_stocks}
 
     total_stocks    = len(all_stocks)
     investor_stocks = len(kospi_kosdaq)
+    foreign_count   = len(foreign_stocks)
 
     print(f"\n{'='*70}")
     print(f"  일별 업데이트 시작: {started_at.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  업데이트 기간: {start_date} ~ {end_date}")
-    print(f"  전체 종목: {total_stocks}개 | 수급 대상: {investor_stocks}개")
+    print(f"  전체 종목: {total_stocks}개 | 수급 대상: {investor_stocks}개 | 지분율 대상: {foreign_count}개")
     print(f"{'='*70}\n")
 
     # 전일 종가 (급등락 감지용)
@@ -544,6 +598,7 @@ def run_update(target_date: date = None, missing_only: bool = False) -> dict:
         "ohlcv":          {"success": 0, "fail": 0, "rows": 0, "changed": 0, "skipped": 0, "fail_codes": []},
         "market_cap":     {"rows": 0, "changed": 0, "skipped": 0},
         "investor":       {"success": 0, "fail": 0, "rows": 0, "changed": 0, "skipped": 0, "fail_codes": []},
+        "foreign":        {"success": 0, "fail": 0, "rows": 0, "changed": 0, "skipped": 0, "fail_codes": []},
         "ohlcv_data":     [],   # 분석용 raw rows
         "investor_data":  [],   # 분석용 raw rows
         "anomalies":      [],
@@ -702,9 +757,59 @@ def run_update(target_date: date = None, missing_only: bool = False) -> dict:
     print(f"  ✅ 수급 {result['investor']['rows']:,}건 저장 (변경:{result['investor']['changed']:,} / 스킵:{result['investor']['skipped']:,})")
 
     # ─────────────────────────────────────────────────────────
-    # STEP 3: 특이사항 분석
+    # STEP 3: 외국인 지분율 수집 (ETF/SPAC 제외, 병렬)
     # ─────────────────────────────────────────────────────────
-    print("\n[분석] 특이사항 감지 중...")
+    print(f"\n[3/3] 외국인 지분율 수집 ({foreign_count}개 종목, workers={MAX_WORKERS})...")
+
+    foreign_batch = []
+    done_count    = 0
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(_fetch_foreign, client, code, name, start_date, end_date): code
+            for code, name in foreign_stocks
+        }
+        for future in as_completed(futures):
+            code, name, rows = future.result()
+            done_count += 1
+
+            if not rows:
+                result["foreign"]["fail"] += 1
+                result["foreign"]["fail_codes"].append(code)
+            else:
+                result["foreign"]["success"] += 1
+                for r in rows:
+                    if r["date"] is None:
+                        continue
+                    foreign_batch.append((
+                        r["date"], r["stock_code"],
+                        r["frn_ownership_ratio"],
+                        r["frn_ownership_vol"],
+                        r["frn_limit_ratio"],
+                    ))
+
+            if len(foreign_batch) >= 500:
+                ch, tot = upsert_batch(conn, FOREIGN_SQL, foreign_batch)
+                result["foreign"]["changed"] += ch
+                result["foreign"]["skipped"] += tot - ch
+                result["foreign"]["rows"]    += tot
+                foreign_batch.clear()
+
+            if done_count % 500 == 0 or done_count == foreign_count:
+                print(f"  [{done_count:4}/{foreign_count}] 진행 중... (성공:{result['foreign']['success']} 실패:{result['foreign']['fail']})")
+
+    if foreign_batch:
+        ch, tot = upsert_batch(conn, FOREIGN_SQL, foreign_batch)
+        result["foreign"]["changed"] += ch
+        result["foreign"]["skipped"] += tot - ch
+        result["foreign"]["rows"]    += tot
+
+    print(f"  ✅ 지분율 {result['foreign']['rows']:,}건 저장 (변경:{result['foreign']['changed']:,} / 스킵:{result['foreign']['skipped']:,})")
+
+    # ─────────────────────────────────────────────────────────
+    # STEP 4: 특이사항 분석
+    # ─────────────────────────────────────────────────────────
+    print("\n[분석] 특이사항 감지 중... (STEP 4)")
     halt_suspects = get_halt_suspects(conn, end_date)
     result["anomalies"] = analyze_anomalies(
         result["ohlcv_data"],
@@ -732,6 +837,7 @@ def generate_report(result: dict) -> str:
     ohlcv    = result["ohlcv"]
     mktcap   = result["market_cap"]
     investor = result["investor"]
+    foreign  = result["foreign"]
     anomalies = result["anomalies"]
 
     lines = []
@@ -805,9 +911,13 @@ def generate_report(result: dict) -> str:
         f"  {'투자자별 수급':<18} {investor['success']:>7,} {investor['fail']:>7,} "
         f"{investor['rows']:>11,} {investor['changed']:>10,} {investor['skipped']:>11,}"
     )
-    total_rows    = ohlcv['rows']    + mktcap['rows']    + investor['rows']
-    total_changed = ohlcv['changed'] + mktcap['changed'] + investor['changed']
-    total_skipped = ohlcv['skipped'] + mktcap['skipped'] + investor['skipped']
+    lines.append(
+        f"  {'외국인 지분율':<18} {foreign['success']:>7,} {foreign['fail']:>7,} "
+        f"{foreign['rows']:>11,} {foreign['changed']:>10,} {foreign['skipped']:>11,}"
+    )
+    total_rows    = ohlcv['rows']    + mktcap['rows']    + investor['rows']    + foreign['rows']
+    total_changed = ohlcv['changed'] + mktcap['changed'] + investor['changed'] + foreign['changed']
+    total_skipped = ohlcv['skipped'] + mktcap['skipped'] + investor['skipped'] + foreign['skipped']
     lines.append(f"  {'-'*68}")
     lines.append(
         f"  {'합계':<18} {'':>14} "
@@ -844,6 +954,18 @@ def generate_report(result: dict) -> str:
     if investor['fail_codes']:
         codes_str = ', '.join(investor['fail_codes'][:20])
         suffix = f" 외 {investor['fail']-20}개" if investor['fail'] > 20 else ""
+        lines.append(f"    실패 코드  : {codes_str}{suffix}")
+
+    lines.append(f"\n  [foreign_ownership]")
+    lines.append(f"    전체 건수  : {foreign['rows']:,}건")
+    lines.append(f"    신규/변경  : {foreign['changed']:,}건")
+    lines.append(f"    스킵(동일) : {foreign['skipped']:,}건")
+    lines.append(f"    성공 종목  : {foreign['success']:,}개")
+    lines.append(f"    실패 종목  : {foreign['fail']:,}개")
+    lines.append(f"    수집 대상  : ETF/SPAC 제외 KOSPI+KOSDAQ")
+    if foreign['fail_codes']:
+        codes_str = ', '.join(foreign['fail_codes'][:20])
+        suffix = f" 외 {foreign['fail']-20}개" if foreign['fail'] > 20 else ""
         lines.append(f"    실패 코드  : {codes_str}{suffix}")
     lines.append("")
 
@@ -908,7 +1030,7 @@ def generate_report(result: dict) -> str:
             lines.append("")
 
     # ── 실패 종목 상세 ─────────────────────────────────────────
-    if ohlcv['fail'] > 0 or investor['fail'] > 0:
+    if ohlcv['fail'] > 0 or investor['fail'] > 0 or foreign['fail'] > 0:
         sub("4. API 수집 실패 종목")
         lines.append("\n  ※ 실패 원인: API 응답 없음 / 해당 날짜 데이터 없음 (휴장일, 신규상장 전)")
 
@@ -920,6 +1042,11 @@ def generate_report(result: dict) -> str:
         if investor['fail_codes']:
             lines.append(f"\n  수급 실패 ({investor['fail']}개):")
             for c in investor['fail_codes']:
+                lines.append(f"    - {c}")
+
+        if foreign['fail_codes']:
+            lines.append(f"\n  지분율 실패 ({foreign['fail']}개):")
+            for c in foreign['fail_codes']:
                 lines.append(f"    - {c}")
         lines.append("")
 

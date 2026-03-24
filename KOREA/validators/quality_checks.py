@@ -12,6 +12,11 @@
     RANGE_CHECK
         - ohlcv_daily: 고가 < 저가, 고가 < 시가/종가, 종가 <= 0
 
+    UNIT_CHECK
+        - investor_trading: |net_buy_value / net_buy_volume| ≈ 당일 종가여야 함
+          역산단가가 종가의 0.1배 미만 or 10배 초과 → 단위 오류 의심
+          (API 단위 변경, 천원/원 혼용 버그 등 감지)
+
     CONSISTENCY_CHECK
         - ohlcv_daily ↔ market_cap_daily 종목 수 불일치
         - investor_trading: KOSPI/KOSDAQ 종목 중 4개 투자자 유형 미달
@@ -226,6 +231,67 @@ def check_ohlcv_range(conn, check_date: date) -> dict:
     }
 
 
+# ── 단위 체크 ─────────────────────────────────────────────────────────────────
+def check_investor_unit(conn, check_date: date) -> dict:
+    """
+    investor_trading 단위 검증
+
+    역산단가 = |net_buy_value / net_buy_volume| ≈ 당일 종가여야 함.
+    종가 대비 0.1배 미만 or 10배 초과면 단위 오류 의심.
+
+    조건:
+      - |net_buy_volume| >= 1,000주  (소량 거래는 비율이 노이즈라 제외)
+      - close_price > 0
+      - net_buy_value != 0
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT
+                i.stock_code,
+                i.investor_type,
+                o.close_price,
+                i.net_buy_value,
+                i.net_buy_volume,
+                ABS(i.net_buy_value::numeric / i.net_buy_volume) AS implied_price
+            FROM investor_trading i
+            JOIN ohlcv_daily o ON o.time = i.time AND o.stock_code = i.stock_code
+            WHERE i.time = %s
+              AND o.close_price > 0
+              AND i.net_buy_value  != 0
+              AND ABS(i.net_buy_volume) >= 1000
+              AND (
+                  ABS(i.net_buy_value::numeric / i.net_buy_volume) < o.close_price * 0.1
+               OR ABS(i.net_buy_value::numeric / i.net_buy_volume) > o.close_price * 10
+              )
+            ORDER BY i.stock_code, i.investor_type
+        """, (check_date,))
+        bad_rows = cur.fetchall()
+
+    issue_count = len(bad_rows)
+    details = {
+        "unit_error_count": issue_count,
+        "threshold": "역산단가 < 종가×0.1 or > 종가×10",
+        "samples": [
+            {
+                "stock_code":    r[0],
+                "investor_type": r[1],
+                "close_price":   r[2],
+                "net_buy_value": r[3],
+                "net_buy_volume": r[4],
+                "implied_price": float(r[5]),
+                "ratio_to_close": round(float(r[5]) / r[2], 4),
+            }
+            for r in bad_rows[:20]
+        ],
+    }
+    return {
+        "table":       "investor_trading",
+        "type":        "UNIT_CHECK",
+        "issue_count": issue_count,
+        "details":     details,
+    }
+
+
 # ── 일관성 체크 ───────────────────────────────────────────────────────────────
 def check_ohlcv_market_cap_consistency(conn, check_date: date) -> dict:
     """
@@ -356,6 +422,7 @@ def run_quality_checks(check_date: date = None) -> list[dict]:
         check_ohlcv_null,
         check_ohlcv_range,
         check_investor_null,
+        check_investor_unit,
         check_investor_type_completeness,
         check_ohlcv_market_cap_consistency,
     ]
