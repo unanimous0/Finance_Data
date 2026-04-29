@@ -5,6 +5,160 @@
 
 ---
 
+## 2026-04-25 ~ 04-30 - 배당(Dividends) 데이터 시스템 구축 + LENS 연동
+
+> **목적**: LENS 프로젝트의 배당 화면/종목차익 베이시스 계산용 데이터 소스 구축. DART 공시를 단일 진실 소스로.
+
+### ✅ 완료 작업
+
+#### 1. DB 스키마 + ORM (`database/schema/dividends_schema.sql`, `database/models.py`)
+- `dividends` 테이블 신규 (정관변경 시대의 복잡성 반영)
+- 핵심 설계:
+  - **Surrogate PK + UNIQUE (code, fiscal_year, period, version)** — 정정공시 이력 보존
+  - **5종 날짜 필드**: `board_resolution_date` (이사회 결의일), `announced_at` (공시 접수), `record_date` (배당기준일), `ex_date` (배당락일), `pay_date` (지급일)
+  - **`charter_group` (A/B)** — A=정관변경(이사회 결의로 기준일 지정), B=미변경(결산일=기준일)
+  - **`source` enum**: DART/SEIBro/KRX/ESTIMATE
+  - **`is_latest` flag** — 같은 (code, fy, period) 그룹의 최신 version만 TRUE
+  - **`corp_name`** (DART 공시 시점 회사명, stocks.stock_name fallback)
+  - **`raw_text_url`** + `dart_rcp_no` (원문 추적)
+- Hypertable 미적용 — 이벤트 기반 데이터, PK가 surrogate라 부적합
+
+#### 2. DART API 수집기 (`collectors/dart.py`)
+- `DartClient` 클래스 (rate limit 60/min, thread-safe)
+- 주요 메서드:
+  - `get_corp_code_map()` — corp_code ↔ stock_code 매핑 (3,961개)
+  - `search_disclosures()` — 페이지네이션 자동 (max_pages=50)
+  - `get_dividend_decisions()` — '현금ㆍ현물배당결정' 필터 + **자회사 공시 자동 제외**
+  - `get_charter_changes()` — 정관변경 공시
+  - `get_document_xml()` — 본문 다운로드 + **인코딩 자동 감지** (UTF-8/CP949 혼재)
+  - `parse_dividend_decision()` — 본문 파싱 (amount, yield_pct, dates, dividend_class, period)
+  - `is_subsidiary_disclosure()` — 본문 키워드 다중 패턴 검사 (자회사 misattribution 차단)
+  - `classify_charter_group()` — 정관 본문에서 A/B 분류
+
+#### 3. 백필 시스템 (`scripts/backfill_dividends.py`)
+- 2022-01-01 ~ 현재 전 종목 백필
+- 디스크 캐시: `cache/dart/list/{yyyymmdd_yyyymmdd}.json` + `cache/dart/document/{rcp_no}.xml` (1.3GB, gitignore)
+- ON CONFLICT DO NOTHING + version 자동 부여 + is_latest 마킹
+- ex_date 산출: ohlcv_daily 거래일 캘린더 우선, 미래는 `holidays.KR` + 근로자의 날 fallback
+
+#### 4. 정관변경 분류 (`scripts/classify_charter_groups.py` + `verify_charter_groups.py`)
+- 종목별 주주총회소집공고 본문 분석 → A/B 분류
+- record_date 휴리스틱과 cross-check (불일치 케이스 별도 보고)
+- 결과: A 266 / B 289 / NULL 28
+- 분류 결과 JSON 저장 (`cache/dart/charter_classification.json`)
+
+#### 5. 추정 엔진 (`estimators/dividend_estimator.py`)
+- 과거 N년(기본 5년) 패턴으로 미래 배당 추정 (source='ESTIMATE')
+- amount: 직전 평균, record_date: 직전 동기 (월·일) 투영
+- ex_date: ohlcv_daily 거래일 기반 직전 영업일
+
+#### 6. LENS Export (`scripts/export_dividends.py`)
+- DB → `/home/una0/projects/LENS/data/dividends.json` (원자적 tmp→rename)
+- LENS 합의 형식: 14개 필드 + revisions 배열 임베드
+- COALESCE(stocks.stock_name, dividends.corp_name) — 상폐 종목도 이름 표시
+
+#### 7. daily_update.py 통합 (`scripts/daily_update.py::run_dividend_pipeline`)
+- 매일 daily_update 마지막 단계로 자동 실행
+- 자동 갭 backfill (DB MAX(announced_at) + 1 ~ end_date+1)
+- `refresh_future_ex_dates()` — ohlcv가 채워질 때마다 미래 ex_date 자동 정확화
+- LENS export 자동 갱신
+
+### 🐛 발견·해결한 주요 버그
+
+#### Bug-1: DART list.json 5,000건 한도
+- **증상**: 결산기 peak month(2~3월)의 일부 종목 누락
+- **원인**: DART API가 페이지 제한 (page 100 × max 50 = 5,000) → AJ네트웍스(095570) 등 정상 종목이 list에서 빠짐
+- **단계별 해결**:
+  - 월별 chunks (52개) → 누적 1,393건 → **1,378건만 적재**
+  - 주별 chunks (226개) → 누적 6,541건 → **5,159건 추가 적재** (5배)
+  - 일별 chunks (1,580개) → 누적 8,598건 → **2,214건 추가 적재** (최종)
+- **결론**: 일별 chunks가 가장 안전. `day_chunks()` 함수 채택
+
+#### Bug-2: DART 본문 인코딩 깨짐
+- 거래소 자율공시(800/900XXX rcp_no)는 EUC-KR/CP949 인코딩
+- UTF-8로 강제 디코딩 → 한글 깨짐 → 정규식 미매칭 → 파싱 실패
+- 해결: `_decode_xml_bytes()` 헬퍼 추가 (`<?xml encoding="..."?>` 우선, UTF-8 strict 시도, CP949 fallback)
+- 효과: 첫 백필 파싱률 79% → 99%
+
+#### Bug-3: 자회사 misattribution (가장 위험했던 버그)
+- **증상**: 콜마홀딩스(024720) 2024 H1 yield_pct 41.749% — 평균 1~2% 대비 비정상
+- **원인**: DART에서 `(자회사의 주요경영사항)` 공시는 모회사 corp_code로 들어옴 → 우리는 모회사 배당으로 잘못 매핑. 예: ㈜연우(비상장)의 배당 4,033원이 콜마홀딩스 배당으로 잡힘 → 모회사 주가 9,660원 대비 yield 41% 폭발
+- **이중 필터 적용**:
+  - 1차: `report_nm`에 "자회사" 포함 시 스킵 (951건)
+  - 2차: 본문 키워드 6개 패턴 (`is_subsidiary_disclosure`) — 주요자회사명 / 자회사의 주요경영사항 / [비상장] 마커 / 지주회사+자회사 / 100% 자회사+비상장 / (안전망) 자회사+비상장+1주당+지주회사
+- **Retroactive**: 캐시된 본문 5,982건 + 캐시 누락 942건 다운로드 후 검증 → 총 **954건 자회사 misattribution 제거**
+
+#### Bug-4: ex_date 미래 record_date 처리
+- **증상**: 신한지주 2026 Q2 record=2026-04-30, ex_date=2026-04-24 (4영업일 차이)
+- **원인**: backfill 시점에 ohlcv_daily가 record_date보다 과거까지만 있어, business_day_before가 ohlcv 마지막 거래일을 반환
+- **해결**:
+  - `business_day_before` 보강 — ohlcv 범위 밖이면 `holidays.KR` + 근로자의 날 적용한 weekday 추정
+  - `refresh_future_ex_dates()` 함수 추가 — daily_update 끝에 자동 호출, ohlcv가 채워지면 정확값으로 자동 갱신
+
+#### Bug-5: yield_pct NULL (378건)
+- **원인**: DART 공시 본문에 "시가배당율(%) 보통주식 -" (회사가 미공시한 케이스)
+- **해결**: ohlcv_daily의 ex_date 종가로 일괄 recompute (`amount / close_price * 100`) — 355건 채움
+- **잔여 12건**: ohlcv 자체가 없는 상폐 종목 → NULL 유지
+
+### 🎯 주요 결정사항
+
+1. **LENS-Finance_Data 분리 아키텍처**:
+   - LENS는 DB 직접 쿼리 X, **JSON 파일 contract**로 통신
+   - export 경로: `/home/una0/projects/LENS/data/dividends.json` (mtime 기반 자동 reload)
+2. **자회사 공시 차단 정책**: 비상장 자회사 배당은 모회사 주가와 무관 → DB 적재 자체를 차단
+3. **추정값과 확정값 같은 테이블**: source 컬럼으로 구분 (`DART`/`SEIBro`/`KRX`/`ESTIMATE`)
+4. **정정공시 보존**: 같은 (code, fy, period)에 version 1, 2, 3... 저장 후 is_latest로 최신만 노출
+5. **한국 시장 영업일 규칙**: `holidays.KR` (공공 공휴일) + 근로자의 날 5/1 (거래소 휴장) — 12/31 폐장은 ohlcv가 자연 반영
+
+### 💡 배운 점 / 인사이트
+
+1. **DART API 한도 (5,000건)는 문서에 명시 안 됨** — peak month 데이터 누락은 운 좋게 다른 데이터(AJ네트웍스)와 비교해서 발견
+2. **본문 인코딩 검증의 중요성** — replacement character (`�`)는 정규식이 못 잡으면 파싱 실패가 silent fail
+3. **자회사 misattribution은 yield 필터로만 발견** — yield 정상 범위 안에 숨어있는 케이스는 본문 패턴 매칭 필수
+4. **이중 안전망 (report_nm + 본문 키워드)** — 한 가지 필터만으론 우회 케이스 다수
+5. **Retroactive 검증의 가치** — 새 필터 적용 후 기존 데이터에 소급 적용해야 진짜 정리 완료
+
+### 📊 최종 데이터 규모 (2026-04-30 기준)
+
+| 지표 | 값 |
+|------|------|
+| 전체 dividends row | 6,922 |
+| is_latest=TRUE (LENS export) | 6,492 |
+| 종목 수 | 1,465 |
+| 정정공시 그룹 | 840 |
+| name NULL | 0 |
+| yield_pct NULL (의미 있는 케이스) | 12 (모두 상폐 종목) |
+| 자회사 misattribution 제거 | 954건 |
+| 데이터 범위 | 2021 ~ 2026 (6년) |
+| DART 캐시 디스크 사용 | 1.3GB (gitignore) |
+
+### 🔧 신규/변경 파일
+
+**신규**:
+- `database/schema/dividends_schema.sql`
+- `collectors/dart.py`
+- `scripts/backfill_dividends.py`
+- `scripts/export_dividends.py`
+- `scripts/classify_charter_groups.py`
+- `scripts/verify_charter_groups.py`
+- `scripts/analyze_missing_dividends.py`
+- `estimators/dividend_estimator.py`
+
+**변경**:
+- `database/models.py` (Dividend 클래스 추가)
+- `config/settings.py` (DART_API_KEY, LENS_EXPORT_PATH 등)
+- `.env.example` / `.env`
+- `scripts/daily_update.py` (`run_dividend_pipeline()` 통합)
+
+### 📌 남은 작업
+
+1. **코일러레이트 검증** (옵션): corp_code(공시 제출자) vs 본문 corp_name 일치 검증 자동화
+2. **SEIBro/KRX 검증 모듈** (Plan C): 사용자 보류 결정 — 운영 중 필요 시 추가
+3. **추정 엔진 활성화**: 현재 코드는 있으나 자동 실행 안 함. LENS가 추정값 필요 시 daily_update에 통합
+4. **외인지분율 익일 수집 패턴**: 인포맥스 API가 외인 데이터를 익일 새벽~오전에 제공 → 당일 daily_update 시 누락 → `--missing-only` 익일 보충 필요
+
+---
+
 ## 2026-03-24 (화) - 외국인 지분율 수집 추가 + investor_trading 단위 버그 수정 + 버그 수정
 
 ### ✅ 완료 작업

@@ -1069,6 +1069,73 @@ def save_report(report_text: str, target_date: date) -> Path:
 
 
 # ── 진입점 ────────────────────────────────────────────────────────────────
+def run_dividend_pipeline(end_date: date) -> dict:
+    """
+    DART 배당결정 공시 신규 수집 + LENS JSON export.
+    daily_update 마지막 단계로 호출.
+
+    수집 범위:
+      start_date = DB의 마지막 announced_at + 1일 (자동 산출, 갭 자동 backfill)
+      end_date   = 인자로 받은 날짜 + 1일 (당일 새벽 공시 포함)
+    """
+    from scripts.backfill_dividends import run_backfill, refresh_future_ex_dates
+    from scripts.export_dividends import build_payload, write_atomic
+
+    print("\n" + "=" * 70)
+    print("  💰 배당 데이터 (DART 신규 공시 + LENS export)")
+    print("=" * 70)
+
+    # 1) start_date 자동 산출 — DB에서 가장 최근 공시 접수일 + 1일
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT COALESCE(MAX(announced_at)::date + 1, %s::date)
+                  FROM dividends WHERE source = 'DART'
+            """, (date(2022, 1, 1),))
+            bgn = cur.fetchone()[0]
+    finally:
+        conn.close()
+
+    end = end_date + timedelta(days=1)
+
+    # 갭이 음수면 (DB가 미래 데이터) skip
+    if bgn > end:
+        print(f"\n[배당-1] 신규 공시 없음 (DB last={bgn-timedelta(days=1)} ≥ end={end_date})")
+        bf = {"found": 0, "new": 0, "parsed": 0, "inserted": 0}
+    else:
+        gap_days = (end - bgn).days
+        print(f"\n[배당-1] 신규 공시 수집 ({bgn} ~ {end_date}, 자동 산출 갭={gap_days}일)...")
+        bf = run_backfill(bgn, end, workers=2)
+        print(f"  → 검색 {bf['found']}건 / 신규 {bf['new']}건 / 적재 {bf['inserted']}건")
+
+    # 2) 미래 ex_date 자동 보정 (ohlcv가 채워질 때마다 한국 공휴일 자연 반영)
+    conn = get_conn()
+    try:
+        refreshed = refresh_future_ex_dates(conn)
+        print(f"\n[배당-2] 미래 ex_date 보정: {refreshed}건 UPDATE")
+    finally:
+        conn.close()
+
+    # 3) LENS export
+    print(f"\n[배당-3] LENS JSON export...")
+    conn = get_conn()
+    try:
+        payload = build_payload(conn)
+    finally:
+        conn.close()
+
+    output_path = Path(settings.LENS_EXPORT_PATH)
+    write_atomic(payload, output_path)
+    print(f"  → {payload['count']:,}건 → {output_path}")
+
+    return {
+        "backfill": bf,
+        "exported_count": payload["count"],
+        "exported_path": str(output_path),
+    }
+
+
 def main(target_date: date = None, missing_only: bool = False):
     try:
         result = run_update(target_date, missing_only)
@@ -1087,6 +1154,12 @@ def main(target_date: date = None, missing_only: bool = False):
             run_quality_checks(end_date)
         except Exception as qc_err:
             print(f"\n⚠️  품질 체크 중 오류 (업데이트 결과에는 영향 없음): {qc_err}")
+
+        # 배당 공시 수집 + LENS export (실패해도 본 업데이트에는 영향 없음)
+        try:
+            run_dividend_pipeline(end_date)
+        except Exception as div_err:
+            print(f"\n⚠️  배당 단계 오류 (업데이트 결과에는 영향 없음): {div_err}")
 
     except Exception as e:
         err_msg = traceback.format_exc()

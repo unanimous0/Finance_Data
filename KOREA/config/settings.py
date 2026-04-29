@@ -30,6 +30,19 @@ class Settings(BaseSettings):
     HTS_API_KEY: str = Field(default="", description="HTS API 키")
     HTS_API_SECRET: str = Field(default="", description="HTS API 시크릿")
 
+    # DART (금융감독원 전자공시) Open API
+    DART_API_KEY: str = Field(default="", description="DART Open API 키 (https://opendart.fss.or.kr)")
+    DART_BASE_URL: str = Field(default="https://opendart.fss.or.kr/api", description="DART Open API URL")
+
+    # 공공데이터포털 (예탁원 SEIBro / 한국거래소 KRX)
+    PUBLIC_DATA_API_KEY: str = Field(default="", description="공공데이터포털 API 키 (예탁원/거래소)")
+
+    # LENS export 경로 (배당 데이터 내보내기 대상)
+    LENS_EXPORT_PATH: str = Field(
+        default="/home/una0/projects/LENS/data/dividends.json",
+        description="LENS 배당 JSON export 경로"
+    )
+
     # Application Settings
     APP_ENV: str = Field(default="development", description="환경 (development/staging/production)")
     LOG_LEVEL: str = Field(default="INFO", description="로그 레벨")

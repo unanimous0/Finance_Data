@@ -98,3 +98,9 @@ Thumbs.db
 temp/
 tmp/
 *.temp
+
+# DART cache (대용량 외부 데이터, 1GB+)
+cache/
+
+# Claude Code 작업 파일
+.claude/

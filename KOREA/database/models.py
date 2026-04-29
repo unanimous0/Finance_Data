@@ -6,7 +6,7 @@ SQLAlchemy ORM 모델 정의
 """
 
 from datetime import datetime
-from sqlalchemy import Column, String, Integer, Date, Boolean, TIMESTAMP, BigInteger, Numeric, Text, ForeignKey
+from sqlalchemy import Column, String, Integer, Date, Boolean, TIMESTAMP, BigInteger, Numeric, Text, ForeignKey, CHAR, BIGINT, UniqueConstraint, CheckConstraint, Index
 from sqlalchemy.orm import declarative_base, relationship
 
 # Base 클래스 생성 (모든 모델의 부모 클래스)
@@ -741,6 +741,82 @@ class DataQualityChecks(Base):
 
     def __repr__(self):
         return f"<DataQualityChecks({self.table_name}, {self.check_date}, {self.check_type}, 이슈={self.issue_count}건)>"
+
+
+# ==========================================
+# 11. 배당 테이블: Dividend (이벤트 기반, 정정공시 이력 보존)
+# ==========================================
+
+class Dividend(Base):
+    """
+    배당 이벤트 테이블 모델
+
+    설계 포인트:
+    - surrogate PK (id) + UNIQUE (code, fiscal_year, period, version)
+    - 정정공시 이력 보존: 같은 (code, fiscal_year, period)에 version 1, 2, 3...
+    - is_latest=TRUE 인 row가 그룹의 최신 (조회 디폴트)
+    - 추정값(confirmed=FALSE)도 같은 테이블에 저장 (source='ESTIMATE')
+    - 정관변경 분류: charter_group A(변경)/B(미변경) → 배당기준일 예측 신뢰도
+    """
+
+    __tablename__ = "dividends"
+
+    # ── 식별자 ──
+    id = Column(BigInteger, primary_key=True, autoincrement=True, comment="ID")
+    code = Column(String(10), nullable=False, comment="종목코드")
+    fiscal_year = Column(Integer, nullable=False, comment="회계연도")
+    period = Column(String(8), nullable=False, comment="배당 주기 (Q1/Q2/Q3/Q4/H1/ANNUAL)")
+    version = Column(Integer, nullable=False, default=1, comment="공시 버전 (1=원공시, 2+=정정공시)")
+    is_latest = Column(Boolean, nullable=False, default=True, comment="그룹 내 최신 여부")
+
+    # ── 일정 ──
+    board_resolution_date = Column(Date, nullable=True, comment="이사회 결의일")
+    announced_at = Column(TIMESTAMP, nullable=True, comment="공시일시")
+    record_date = Column(Date, nullable=True, comment="배당기준일 (NULL=공시 전 추정)")
+    ex_date = Column(Date, nullable=True, comment="배당락일 (record_date 직전 영업일)")
+    pay_date = Column(Date, nullable=True, comment="지급예정일")
+
+    # ── 금액 ──
+    amount = Column(Numeric(18, 4), nullable=False, comment="1주당 배당금 (원)")
+    yield_pct = Column(Numeric(7, 3), nullable=True, comment="시가배당률 (%)")
+    dividend_type = Column(String(10), nullable=False, default='CASH',
+                           comment="배당 종류 (CASH/STOCK/SPECIAL)")
+
+    # ── 메타 ──
+    confirmed = Column(Boolean, nullable=False, default=False,
+                       comment="TRUE=공시 확정값 / FALSE=추정값")
+    estimation_basis = Column(String(200), nullable=True, comment="추정 근거 (UI 툴팁)")
+    charter_group = Column(CHAR(1), nullable=True, comment="A=정관변경 / B=미변경")
+    source = Column(String(10), nullable=False,
+                    comment="DART/SEIBro/KRX/ESTIMATE")
+    dart_rcp_no = Column(String(20), nullable=True, comment="DART 접수번호")
+    raw_text_url = Column(Text, nullable=True, comment="공시 원문 URL")
+    raw_text = Column(Text, nullable=True, comment="공시 원문 (파싱 검증용)")
+
+    # ── 타임스탬프 ──
+    created_at = Column(TIMESTAMP, nullable=False, default=datetime.now, comment="생성일시")
+    updated_at = Column(TIMESTAMP, nullable=False, default=datetime.now,
+                        onupdate=datetime.now, comment="수정일시")
+
+    __table_args__ = (
+        UniqueConstraint('code', 'fiscal_year', 'period', 'version',
+                         name='uq_dividends_version'),
+        CheckConstraint("period IN ('Q1','Q2','Q3','Q4','H1','ANNUAL')",
+                        name='chk_dividends_period'),
+        CheckConstraint("dividend_type IN ('CASH','STOCK','SPECIAL')",
+                        name='chk_dividends_dividend_type'),
+        CheckConstraint("source IN ('DART','SEIBro','KRX','ESTIMATE')",
+                        name='chk_dividends_source'),
+        CheckConstraint("charter_group IS NULL OR charter_group IN ('A','B')",
+                        name='chk_dividends_charter_group'),
+        CheckConstraint("version >= 1", name='chk_dividends_version_positive'),
+    )
+
+    def __repr__(self):
+        status = "확정" if self.confirmed else "추정"
+        amt = f"{float(self.amount):,.2f}원" if self.amount else "—"
+        return (f"<Dividend({self.code}, {self.fiscal_year}{self.period}, "
+                f"v{self.version}, {amt}, {status})>")
 
 
 # 모델이 제대로 만들어졌는지 확인하는 테스트 코드

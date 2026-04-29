@@ -1,7 +1,40 @@
 # 📝 TODO - 작업 목록
 
-> **마지막 업데이트**: 2026-03-24
-> **현재 Phase**: Phase 4 완료 + foreign_ownership 추가 / 최신 데이터 2026-03-23 / 스케줄러 재가동 필요
+> **마지막 업데이트**: 2026-04-30
+> **현재 Phase**: Phase 4 완료 + foreign_ownership + **Phase 5 배당 시스템 + LENS 연동 완료** / 주식 2026-04-28 / 배당 2026-04-29
+
+---
+
+## 🆕 2026-04 신규/완료 (배당 시스템)
+
+- [x] **배당(Dividends) DB 스키마 + ORM** ✅ (2026-04-25)
+  - `database/schema/dividends_schema.sql` (정관변경 시대 대응 — A/B 그룹, version, 5종 날짜)
+  - `database/models.py`: `Dividend` 클래스 추가
+- [x] **DART API 수집기** ✅ (2026-04-26~28)
+  - `collectors/dart.py`: rate 60/min, 페이지네이션, 인코딩 자동 감지(UTF-8/CP949), 자회사 공시 차단
+- [x] **배당 백필 (2022~현재)** ✅ (2026-04-28~29)
+  - `scripts/backfill_dividends.py`: 일별 chunks (DART 5,000건 한도 회피)
+  - 디스크 캐시 1.3GB (cache/dart/, gitignore)
+  - 6,922건 / 1,465종목 적재
+- [x] **정관변경 분류** ✅ (2026-04-28)
+  - `scripts/classify_charter_groups.py` + `verify_charter_groups.py`
+  - A 266 / B 289 / NULL 28 (record_date 휴리스틱과 cross-check)
+- [x] **자회사 misattribution 정리** ✅ (2026-04-29~30)
+  - 콜마홀딩스→연우 같은 케이스 발견
+  - report_nm + 본문 키워드 이중 필터로 954건 retroactive 제거
+- [x] **LENS export** ✅ (2026-04-26)
+  - `scripts/export_dividends.py`: 14필드 + revisions 임베드, 원자적 tmp→rename
+  - 합의된 contract: `/home/una0/projects/LENS/data/dividends.json`
+- [x] **daily_update.py 통합** ✅ (2026-04-27)
+  - `run_dividend_pipeline()` — 자동 갭 backfill + ex_date 자동 정확화 + LENS export
+- [x] **한국 시장 영업일 정확도** ✅ (2026-04-29)
+  - `holidays.KR` + 근로자의 날 5/1 (거래소 휴장)
+  - `refresh_future_ex_dates()` — ohlcv 채워지면 미래 ex_date 자동 정확화
+- [x] **yield_pct NULL 보정** ✅ (2026-04-30)
+  - DART 미공시 케이스 (378건) → ohlcv 종가 기반 recompute → 366건 채움 (12건 상폐 잔여)
+- [x] **종목명(corp_name) fallback** ✅ (2026-04-29)
+  - dividends.corp_name 컬럼 추가 + cache backfill
+  - export 시 COALESCE(stocks.stock_name, corp_name) → name NULL 0건
 
 ---
 

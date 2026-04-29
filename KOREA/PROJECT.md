@@ -1,7 +1,7 @@
 # 🏢 한국 주식시장 데이터 중앙 관리 시스템
 
-> **마지막 업데이트**: 2026-03-24
-> **프로젝트 상태**: Phase 4 완료 + foreign_ownership 추가 / 최신 데이터 2026-03-23 / 스케줄러 재가동 필요
+> **마지막 업데이트**: 2026-04-30
+> **프로젝트 상태**: Phase 4 완료 + foreign_ownership + **Phase 5: 배당(Dividends) 시스템 + LENS 연동 완료** / 최신 주식 2026-04-28 / 최신 배당 2026-04-29
 > **Repository**: https://github.com/unanimous0/Finance_Data/tree/main/KOREA
 
 ---
@@ -44,24 +44,36 @@
 - 3/17~3/23 데이터 수집 완료 ✅
 - `sync_stock_master()` 개선 ✅ (2026-03-17): API 미등록 종목 자동 비활성화 추가
 - 인포맥스 데이터 제공 시간 실험 완료 ✅ (2026-03-17): 19시 이후 수집 정책 결정
-- 미완료: 스케줄러 재가동 (수집 시간 19:00 이후로 변경)
+- **Phase 5: 배당(Dividends) 데이터 시스템 ✅ (2026-04-25 ~ 04-30)**
+  - `dividends` 테이블 신규 (정관변경 시대 대응 — A/B 그룹, 정정공시 version, 5종 날짜)
+  - `collectors/dart.py`: DART Open API 클라이언트 (rate 60/min, 인코딩 자동 감지, 자회사 공시 차단 이중 필터)
+  - `scripts/backfill_dividends.py`: 2022~현재 일별 백필 (DART 5,000건 한도 회피, 캐시 1.3GB)
+  - `scripts/classify_charter_groups.py`: 정관변경 분류 (A 266 / B 289 / NULL 28)
+  - `scripts/export_dividends.py`: LENS JSON 형식 export (`/home/una0/projects/LENS/data/dividends.json`)
+  - `daily_update.py`: `run_dividend_pipeline()` 통합 (자동 갭 backfill + ex_date 자동 정확화 + LENS export)
+  - `holidays` 라이브러리 + 근로자의 날 적용 (한국 시장 영업일 정확 추정)
+  - 자회사 misattribution 954건 retroactive 정리 (콜마홀딩스→연우 등)
+  - LENS 데이터: **6,492건 / 1,465종목** / yield_pct NULL 12건(상폐)만
+- 4/27~4/28 데이터 수집 완료 ✅, 4/29 진행 중
+- 미완료: 스케줄러 재가동 (수집 시간 19:00 이후로 변경), 추정 엔진 자동 활성화
 
 ---
 
-## 📊 현재 데이터 현황 (2026-03-24 기준)
+## 📊 현재 데이터 현황 (2026-04-30 기준)
 
 ### 적재 완료 데이터
 
 | 테이블 | 레코드 수 | 기간 | 종목 수 |
 |--------|----------|------|---------|
-| stocks | ~3,800건 | - | 활성 ~3,800개 |
-| ohlcv_daily | ~3,600,000건 | 2022-01-03 ~ 2026-03-23 | ~3,800개 |
-| market_cap_daily | ~3,600,000건 | 2022-01-03 ~ 2026-03-23 | ~3,800개 |
-| investor_trading | ~11,200,000건 | 2022-01-03 ~ 2026-03-23 | 2,719개 (KOSPI+KOSDAQ) |
-| foreign_ownership | ~1,260,000건 | 2022-01-03 ~ 2026-03-23 | 2,642개 (ETF/SPAC 제외) |
+| stocks | ~3,820건 | - | 활성 ~3,820개 |
+| ohlcv_daily | ~3,800,000건 | 2022-01-03 ~ 2026-04-28 | ~3,820개 |
+| market_cap_daily | ~3,800,000건 | 2022-01-03 ~ 2026-04-28 | ~3,820개 |
+| investor_trading | ~11,800,000건 | 2022-01-03 ~ 2026-04-28 | 2,720개 (KOSPI+KOSDAQ) |
+| foreign_ownership | ~1,360,000건 | 2022-01-03 ~ 2026-04-28 | 2,645개 (ETF/SPAC 제외) |
+| **dividends** | **6,922건** (latest 6,492) | **2021 ~ 2026** | **1,465개** |
 | floating_shares | 1,034,865건 | 2022-01-03 ~ 2026-02-19 | 2,546개 |
 | stock_sectors | 2,720건 | - | 2,607개 섹터 확인 / 113개 NULL |
-| **합계** | **~20M건** | **4년치** | - |
+| **합계** | **~22M건** | **5년치** | - |
 
 ### 투자자 타입별 데이터
 
