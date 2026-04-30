@@ -2,13 +2,18 @@
 데이터 수집 + 백업 스케줄러
 
 잡 목록:
-    daily_update      — 매일 16:30 KST (월~금)           OHLCV/시가총액/수급/외국인지분율 수집
+    daily_update      — 매일 05:30 KST (월~일)           OHLCV/시가총액/수급/외국인지분율 + 배당 + LENS export
     weekly_backup     — 매주 일요일 03:00 KST             DB 백업 + 7일 보관
     quarterly_sector  — 분기 첫 번째 일요일 03:30 KST     FICS 업종 크롤링 (1/4/7/10월)
 
+새벽 5시 30분 선택 이유:
+    - 인포맥스 외인지분율 API 익일 패턴 (새벽~오전 제공) 안전 마진
+    - daily_update.py의 갭 backfill 로직이 평일/주말/공휴일 자동 처리 → 매일 돌려도 무해
+    - 백업 잡(일 03:00) 및 섹터 잡(03:30)과 충돌 없음
+
 실행법:
     python schedulers/daily_scheduler.py          # 포그라운드 실행 (Ctrl+C로 종료)
-    nohup python schedulers/daily_scheduler.py &  # 백그라운드 실행
+    tmux new-session -d -s scheduler "cd /home/una0/projects/Finance_Data/KOREA && source venv/bin/activate && python schedulers/daily_scheduler.py"
 """
 
 import sys
@@ -45,7 +50,7 @@ logger = logging.getLogger(__name__)
 
 
 def job_daily_update():
-    """매일 16:30 실행되는 업데이트 작업"""
+    """매일 05:30 KST 실행 — daily_update.main()이 dividend pipeline + LENS export까지 자동 호출"""
     from scripts.daily_update import main as run_daily
     logger.info("="*60)
     logger.info(f"[스케줄러] 일별 업데이트 시작: {datetime.now(KST)}")
@@ -96,17 +101,16 @@ def main():
     scheduler.add_listener(on_job_executed, EVENT_JOB_EXECUTED)
     scheduler.add_listener(on_job_error,    EVENT_JOB_ERROR)
 
-    # 잡 1: 매일 16:30 KST (월~금) — 데이터 수집
+    # 잡 1: 매일 05:30 KST — 데이터 수집 + 배당 + LENS export
     scheduler.add_job(
         job_daily_update,
         trigger=CronTrigger(
-            day_of_week="mon-fri",
-            hour=16,
+            hour=5,
             minute=30,
             timezone=KST,
         ),
         id="daily_update",
-        name="일별 OHLCV/시가총액/수급 업데이트",
+        name="일별 데이터 수집 (OHLCV/수급/외인 + 배당 + LENS export)",
         misfire_grace_time=3600,   # 1시간 내 놓쳐도 재실행
         coalesce=True,             # 누적 실행 방지
         max_instances=1,
@@ -148,7 +152,7 @@ def main():
 
     now = datetime.now(KST)
 
-    trigger_daily   = CronTrigger(day_of_week="mon-fri", hour=16, minute=30, timezone=KST)
+    trigger_daily   = CronTrigger(hour=5, minute=30, timezone=KST)
     trigger_backup  = CronTrigger(day_of_week="sun", hour=3, minute=0, timezone=KST)
     trigger_sector  = CronTrigger(month="1,4,7,10", day="1-7", day_of_week="sun", hour=3, minute=30, timezone=KST)
     next_daily  = trigger_daily.get_next_fire_time(None, now)
@@ -162,7 +166,7 @@ def main():
     logger.info(f"  다음 수집    : {next_daily.strftime('%Y-%m-%d %H:%M KST') if next_daily else '미정'}")
     logger.info(f"  다음 백업    : {next_backup.strftime('%Y-%m-%d %H:%M KST') if next_backup else '미정'}")
     logger.info(f"  다음 섹터    : {next_sector.strftime('%Y-%m-%d %H:%M KST') if next_sector else '미정'}")
-    logger.info(f"  수집 주기    : 매일 16:30 (월~금) — OHLCV/시가총액/수급/외국인지분율")
+    logger.info(f"  수집 주기    : 매일 05:30 — OHLCV/수급/외인 + 배당 + LENS export")
     logger.info(f"  백업 주기    : 매주 일요일 03:00  (7일 보관)")
     logger.info(f"  섹터 주기    : 분기 첫 번째 일요일 03:30 (1/4/7/10월)")
     logger.info(f"  보고서 저장  : reports/daily_update_YYYYMMDD.txt")
