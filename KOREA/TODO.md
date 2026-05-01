@@ -5,6 +5,17 @@
 
 ---
 
+## 🆕 2026-05-01 신규/완료
+
+- [x] **스케줄러 매일 05:30 자동 실행 가동** ✅ (2026-05-01)
+  - tmux 세션 `scheduler`, daily_update.main() 호출 (dividend pipeline + LENS export 자동 통합)
+  - 첫 자동 실행 정상 완료 (외인지분율 5:30 안전 시간 검증)
+- [x] **KRX 휴장일 LENS export** ✅ (2026-05-01)
+  - `scripts/export_krx_holidays.py` (2022~2027, 97건)
+  - 한국어 reason, 임시휴장 자동 포착, 제헌절 함정 필터링
+
+---
+
 ## 🆕 2026-04 신규/완료 (배당 시스템)
 
 - [x] **배당(Dividends) DB 스키마 + ORM** ✅ (2026-04-25)
