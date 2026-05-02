@@ -1,7 +1,7 @@
 # 🏢 한국 주식시장 데이터 중앙 관리 시스템
 
-> **마지막 업데이트**: 2026-04-30
-> **프로젝트 상태**: Phase 4 완료 + foreign_ownership + **Phase 5: 배당(Dividends) 시스템 + LENS 연동 완료** / 최신 주식 2026-04-28 / 최신 배당 2026-04-29
+> **마지막 업데이트**: 2026-05-02
+> **프로젝트 상태**: Phase 4 완료 + foreign_ownership + **Phase 5: 배당(Dividends) 시스템 + LENS 연동 완료** + **KRX 휴장일 DB SSoT** / 최신 주식 2026-04-30 / 최신 배당 2026-05-01
 > **Repository**: https://github.com/unanimous0/Finance_Data/tree/main/KOREA
 
 ---
@@ -56,7 +56,8 @@
   - LENS 데이터: **6,492건 / 1,465종목** / yield_pct NULL 12건(상폐)만
 - 4/27~5/1 데이터 수집 완료 ✅
 - **스케줄러 가동 ✅ (2026-05-01)**: 매일 05:30 자동 실행 (tmux 세션 `scheduler`), 첫 자동 실행 정상 완료
-- **KRX 휴장일 LENS export ✅ (2026-05-01)**: `scripts/export_krx_holidays.py` (1년 1회 수동 갱신)
+- **KRX 휴장일 LENS export ✅ (2026-05-01)**: `scripts/export_krx_holidays.py`
+- **KRX 휴장일 DB SSoT ✅ (2026-05-02)**: `krx_holidays` 테이블 신설, daily_update에 통합, `backfill_dividends`도 동일 출처 사용. LENS JSON 계약 그대로 (LENS 코드 변경 0). 휴장일에 daily_update가 주식 수집 skip + 배당/휴일 파이프라인은 진행.
 - 미완료: 추정 엔진 자동 활성화
 
 ---

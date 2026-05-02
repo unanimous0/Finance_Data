@@ -1,7 +1,24 @@
 # 📝 TODO - 작업 목록
 
-> **마지막 업데이트**: 2026-04-30
-> **현재 Phase**: Phase 4 완료 + foreign_ownership + **Phase 5 배당 시스템 + LENS 연동 완료** / 주식 2026-04-28 / 배당 2026-04-29
+> **마지막 업데이트**: 2026-05-02
+> **현재 Phase**: Phase 4 완료 + foreign_ownership + **Phase 5 배당 시스템 + LENS 연동 완료** + **KRX 휴장일 DB SSoT** / 주식 2026-04-30 / 배당 2026-05-01
+
+---
+
+## 🆕 2026-05-02 신규/완료
+
+- [x] **KRX 휴장일 DB SSoT 전환** ✅ (2026-05-02)
+  - `database/schema/krx_holidays_schema.sql`: date PK / reason / source(CHECK) / updated_at
+  - `scripts/export_krx_holidays.py` 개편: 산출 → DB UPSERT → JSON write (manual 행 보호)
+  - 2022~2027 백필 96건 (ohlcv_gap 71 / holidays_kr 22 / rule_0501 1 / rule_1231 2)
+  - LENS JSON 계약 그대로 (LENS 코드 변경 0)
+- [x] **daily_update.py 휴장일 skip + KRX 휴일 파이프라인** ✅ (2026-05-02)
+  - `is_market_closed()` / `last_business_day_on_or_before()` 헬퍼 (DB 조회)
+  - `get_update_range()` end → 어제 기준 마지막 영업일
+  - 단일 휴장일 타겟 시 미니 보고서(`*_skip.txt`) + 배당/휴일 파이프라인은 그대로 진행
+  - `run_krx_holidays_pipeline()` 매일 호출
+- [x] **`backfill_dividends.py` 휴일 출처 통일** ✅ (2026-05-02)
+  - `holidays.KR` 직접 호출 제거 → DB 조회 (모듈 캐시)
 
 ---
 

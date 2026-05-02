@@ -5,6 +5,63 @@
 
 ---
 
+## 2026-05-02 - KRX 휴장일 DB SSoT 전환 + 스케줄러 휴장일 skip
+
+### 배경
+- 5/2 새벽 스케줄러가 5/1(근로자의 날) 데이터 수집을 시도해서 모든 종목 "실패"로 보고됨 → 노이즈
+- 휴장일 정보가 3군데 분산 (`holidays.KR` 라이브러리 / `backfill_dividends.py` 인라인 / `export_krx_holidays.py` 산출 로직) → SSoT 위반
+- LENS도 휴장일 JSON을 소비 중이라 결국 같은 데이터를 두 시스템이 각자 들고 있음
+
+### ✅ 완료 작업
+
+1. **`krx_holidays` 테이블 신설** (`database/schema/krx_holidays_schema.sql`)
+   - `date PK / reason TEXT / source TEXT (CHECK 제약) / updated_at TIMESTAMPTZ`
+   - source enum: `ohlcv_gap | manual | holidays_kr | rule_0501 | rule_1231`
+   - 토/일 미저장 (LENS export 정책과 일치)
+   - 별도 인덱스 없음 — PK가 자동 인덱스
+
+2. **`scripts/export_krx_holidays.py` 개편**
+   - 기존 산출 로직(과거 ohlcv 갭 + 미래 holidays.KR/rule)에 source 추적 추가
+   - 트랜잭션 내 UPSERT (`ON CONFLICT (date) DO UPDATE`) 후 동일 결과로 LENS JSON write
+   - 사후 정정 삭제 정책: 산출 [year_start, year_end] 범위 내 산출에 없는 행 DELETE
+     - **단 `source = 'manual'` 행은 보호** (수동 임시공휴일 보존)
+   - JSON은 DB에서 다시 읽어 적음 (manual 행 포함, source 컬럼 제외)
+   - `run_export()` 진입점 추가 — daily_update에서 import해 호출
+
+3. **백필 첫 실행** — 2022~2027 96건 적재 (`ohlcv_gap` 71 / `holidays_kr` 22 / `rule_0501` 1 / `rule_1231` 2)
+
+4. **`scripts/daily_update.py` 휴장일 처리**
+   - `is_market_closed(conn, d)` / `last_business_day_on_or_before(conn, d)` 헬퍼 추가 (DB 조회)
+   - `get_update_range()`가 어제 기준 마지막 영업일을 end로 반환 → 자동모드는 휴장일 자체를 타겟팅 안 함
+   - `run_update()` 진입 직후 단일 휴장일 가드 → `{"skipped_holiday": True}` 반환
+   - `main()`이 skip 케이스에서 미니 보고서(`_skip.txt`) 작성 후 배당/휴일 파이프라인은 그대로 진행
+   - 신규 함수 `run_krx_holidays_pipeline()` 추가, `main()`에서 배당 다음에 호출
+
+5. **`scripts/backfill_dividends.py` 휴일 출처 통일**
+   - `holidays.KR` 라이브러리 직접 호출 제거
+   - `_load_krx_holidays()` — 모듈 레벨 캐시로 DB 1회 조회 (daily_update 1회 실행 동안 불변)
+   - `_is_market_closed(d)` → DB-backed 셋 조회
+
+### 📐 설계 결정
+
+- **DB가 SSoT, JSON은 파생물** — LENS realtime은 JSON 계약(경로/포맷/reason) 그대로 유지 → LENS 코드 변경 0
+- **삭제 정책에서 manual 보호** — 사람이 수동 INSERT 한 임시공휴일을 라이브러리 갱신 한 번에 날려버리는 사고 방지
+- **`source` enum 우선순위** — `ohlcv_gap` 위에 `manual` 두지 않음. 과거는 ohlcv가 진실. 단 미발생 미래 날짜에 대한 manual INSERT는 holidays_kr보다 위.
+- **daily_update 매일 호출** — 산출 자체가 가벼우니 idempotent UPSERT로 매일 돌려도 부담 없음. 임시공휴일 발표 시 자동 반영.
+
+### 🐛 운영 시 주의
+
+- **DART 공시는 휴장일에도 등록 가능** — 이사회결의/정정공시는 평일/휴일 무관. 휴장일에도 배당 파이프라인은 그대로 돌려야 함 (실제로 main이 그렇게 동작).
+- 임시공휴일 사전 INSERT 방법: `INSERT INTO krx_holidays (date, reason, source) VALUES ('2026-XX-XX', '임시공휴일', 'manual');`
+
+### 🤝 LENS 협업
+
+- LENS Claude 가 테이블 설계안 사전 제안 → Finance_Data 측에서 미세조정 후 반영
+  - 미세조정: 별도 INDEX 줄 제거 / source CHECK 제약 추가 / 삭제 정책에 manual 보호 추가
+- 작업 완료 통보 별도 메시지 송부
+
+---
+
 ## 2026-05-01 - 스케줄러 첫 자동 실행 + KRX 휴장일 LENS export
 
 ### ✅ 완료 작업

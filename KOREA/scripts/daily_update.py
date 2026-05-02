@@ -54,12 +54,29 @@ def get_conn():
     )
 
 
+# ── 휴장일 판정 (krx_holidays 테이블 SSoT) ──────────────────────────────
+def is_market_closed(conn, d: date) -> bool:
+    """주말 또는 krx_holidays 테이블에 등록된 날짜이면 True."""
+    if d.weekday() >= 5:
+        return True
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM krx_holidays WHERE date = %s", (d,))
+        return cur.fetchone() is not None
+
+
+def last_business_day_on_or_before(conn, d: date) -> date:
+    """d에서 거꾸로 가며 첫 영업일 반환."""
+    while is_market_closed(conn, d):
+        d -= timedelta(days=1)
+    return d
+
+
 # ── 날짜 결정 ─────────────────────────────────────────────────────────────
 def get_update_range(conn) -> tuple[date, date]:
     """
     업데이트 범위 결정
     start: DB의 마지막 날짜 + 1일
-    end:   어제 (당일 데이터는 장 마감 확인 후 다음날 수집)
+    end:   어제 기준 마지막 영업일 (휴장일은 자동 skip)
     """
     with conn.cursor() as cur:
         cur.execute("SELECT MAX(time) FROM ohlcv_daily")
@@ -69,7 +86,8 @@ def get_update_range(conn) -> tuple[date, date]:
         raise ValueError("ohlcv_daily에 데이터가 없습니다.")
 
     start = last_date + timedelta(days=1)
-    end   = datetime.now(KST).date() - timedelta(days=1)  # 어제까지 (당일 장 마감 전 실행 방지)
+    yesterday = datetime.now(KST).date() - timedelta(days=1)
+    end = last_business_day_on_or_before(conn, yesterday)
     return start, end
 
 
@@ -540,7 +558,13 @@ def run_update(target_date: date = None, missing_only: bool = False) -> dict:
         if start_date > end_date:
             print(f"  업데이트할 데이터 없음 (DB 최신: {end_date}, 어제: {end_date})")
             conn.close()
-            return {}
+            return {"skipped_no_data": True, "start_date": start_date, "end_date": end_date}
+
+    # 단일 휴장일 타겟이면 주식 수집 skip (배당/휴일 파이프라인은 main에서 별도 진행)
+    if start_date == end_date and is_market_closed(conn, start_date):
+        print(f"  ℹ️ {start_date} 휴장일 — 주식 데이터 수집 skip")
+        conn.close()
+        return {"skipped_holiday": True, "start_date": start_date, "end_date": end_date}
 
     # ─────────────────────────────────────────────────────────
     # STEP 0: 종목 마스터 갱신 (신규 상장 / 상장폐지 자동 반영)
@@ -1136,30 +1160,61 @@ def run_dividend_pipeline(end_date: date) -> dict:
     }
 
 
+def run_krx_holidays_pipeline() -> dict:
+    """
+    KRX 휴장일 산출 → DB UPSERT → LENS JSON write.
+    daily_update에서 매일 호출 — 임시공휴일 발표 / ohlcv 갱신 자동 반영.
+    """
+    from scripts.export_krx_holidays import run_export
+
+    print("\n" + "=" * 70)
+    print("  📅 KRX 휴장일 (DB SSoT + LENS export)")
+    print("=" * 70)
+    result = run_export()
+    print(f"  ohlcv_max: {result['ohlcv_max']} / 산출 {result['computed']}건 "
+          f"→ UPSERT {result['upserted']} / DELETE {result['deleted']}")
+    print(f"  LENS JSON: {result['json_rows']}건 → {result['json_path']}")
+    return result
+
+
 def main(target_date: date = None, missing_only: bool = False):
     try:
         result = run_update(target_date, missing_only)
-        report = generate_report(result)
 
-        # 콘솔 출력
-        print("\n" + report)
+        # 휴장일/데이터 없음: 미니 보고서만 남기고 후속 파이프라인은 진행
+        if result.get("skipped_holiday") or result.get("skipped_no_data"):
+            end_date = result["end_date"]
+            tag = "휴장일" if result.get("skipped_holiday") else "신규 영업일 없음"
+            mini = (f"[{datetime.now(KST):%Y-%m-%d %H:%M:%S KST}] "
+                    f"{end_date} {tag} — 주식 수집 skip\n")
+            print("\n" + mini)
+            fpath = REPORTS_DIR / f"daily_update_{end_date.strftime('%Y%m%d')}_skip.txt"
+            fpath.write_text(mini, encoding="utf-8")
+            print(f"📁 보고서 저장: {fpath}")
+        else:
+            report = generate_report(result)
+            print("\n" + report)
+            end_date = result["end_date"]
+            fpath = save_report(report, end_date)
+            print(f"\n📁 보고서 저장: {fpath}")
 
-        # 파일 저장
-        end_date = result["end_date"]
-        fpath = save_report(report, end_date)
-        print(f"\n📁 보고서 저장: {fpath}")
+            # 품질 체크 (수집한 경우만)
+            try:
+                run_quality_checks(end_date)
+            except Exception as qc_err:
+                print(f"\n⚠️  품질 체크 중 오류 (업데이트 결과에는 영향 없음): {qc_err}")
 
-        # 품질 체크 (수집 완료 후 자동 실행)
+        # 배당 공시 수집 + LENS export (휴장일에도 진행 — DART는 휴일에도 공시 등록 가능)
         try:
-            run_quality_checks(end_date)
-        except Exception as qc_err:
-            print(f"\n⚠️  품질 체크 중 오류 (업데이트 결과에는 영향 없음): {qc_err}")
-
-        # 배당 공시 수집 + LENS export (실패해도 본 업데이트에는 영향 없음)
-        try:
-            run_dividend_pipeline(end_date)
+            run_dividend_pipeline(result["end_date"])
         except Exception as div_err:
             print(f"\n⚠️  배당 단계 오류 (업데이트 결과에는 영향 없음): {div_err}")
+
+        # KRX 휴장일 SSoT 갱신 + LENS export
+        try:
+            run_krx_holidays_pipeline()
+        except Exception as hol_err:
+            print(f"\n⚠️  KRX 휴장일 단계 오류 (업데이트 결과에는 영향 없음): {hol_err}")
 
     except Exception as e:
         err_msg = traceback.format_exc()

@@ -29,28 +29,35 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-import holidays as _holidays_lib
 import psycopg2
 import psycopg2.extras
 
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-# 한국 시장 휴장일: 공공 공휴일(holidays.KR) + 거래소 휴장일(근로자의 날)
-_KR_HOLIDAYS = _holidays_lib.KR(years=range(2020, 2031))
+from config.settings import settings
+from collectors.dart import DartClient
+
+
+# ── 휴장일 (krx_holidays 테이블 SSoT) ──────────────────────────────
+# 모듈 로드 시 DB에서 한 번만 읽어 메모리 캐시. daily_update 1회 실행 동안의 휴일은 불변.
+_KRX_HOLIDAYS_CACHE: Optional[set[date]] = None
+
+
+def _load_krx_holidays() -> set[date]:
+    global _KRX_HOLIDAYS_CACHE
+    if _KRX_HOLIDAYS_CACHE is None:
+        with _conn() as c:
+            with c.cursor() as cur:
+                cur.execute("SELECT date FROM krx_holidays")
+                _KRX_HOLIDAYS_CACHE = {r[0] for r in cur.fetchall()}
+    return _KRX_HOLIDAYS_CACHE
 
 
 def _is_market_closed(d: date) -> bool:
     if d.weekday() >= 5:        # 토(5)·일(6)
         return True
-    if d in _KR_HOLIDAYS:       # 어린이날, 광복절, 추석, 설 등
-        return True
-    if d.month == 5 and d.day == 1:  # 근로자의 날 (거래소 휴장, 공공 공휴일 X)
-        return True
-    return False
-
-from config.settings import settings
-from collectors.dart import DartClient
+    return d in _load_krx_holidays()
 
 
 # ── 디스크 캐시 ───────────────────────────────
