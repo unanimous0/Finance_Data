@@ -5,6 +5,42 @@
 
 ---
 
+## 2026-05-06 - dividends ex_date 산출 버그 fix (record_date 휴장 케이스)
+
+### 배경
+- LENS 측에서 `ex_date` 데이터 검증 중 12-31 류 record_date 케이스에서 잘못된 값 발견
+- KRX 룰: record_date가 휴장이면 **직전 영업일이 실질 권리 확정일**, 그 직전 영업일이 ex_date (즉 두 단계 backstep)
+- 기존 코드는 `business_day_before()` 한 번만 호출 → 한 단계만 backstep → record_date 휴장 케이스 전부 오답
+
+### 잘못된 케이스 예 (수정 전 → 수정 후)
+| record_date | 폐장일 (실질 record) | 잘못된 ex | 정정 ex |
+|---|---|---|---|
+| 2025-12-31 (수, 휴장) | 12/30 (화) | 12/30 ❌ | 12/29 (월) ✅ |
+| 2024-12-31 (화, 휴장) | 12/30 (월) | 12/30 ❌ | 12/27 (금) ✅ |
+| 2023-12-31 (일, 휴장) | 12/28 (목, 폐장) | 12/28 ❌ | 12/27 (수) ✅ |
+| 2022-12-31 (토, 휴장) | 12/29 (목, 폐장) | 12/29 ❌ | 12/28 (수) ✅ |
+
+### ✅ 완료 작업
+
+1. **`scripts/backfill_dividends.py`** (LENS Claude 측 fix 적용분)
+   - 신규 헬퍼 `_is_business_day(biz_days, d)` — ohlcv 범위 안: 거래일 list 멤버십 / 범위 밖: weekday + krx_holidays
+   - 신규 함수 `compute_ex_date(biz_days, record_date)` — record_date 휴장 시 두 단계 backstep
+   - `refresh_future_ex_dates` (L225) + INSERT 경로 (L496) 모두 `compute_ex_date` 사용으로 교체
+2. **단위 테스트** — 4개 휴장 케이스 + 1개 영업일 케이스 모두 정답 확인
+3. **기존 dividends 전수 재계산** — `refresh_future_ex_dates()` 1회 호출로 **4,352건 UPDATE**
+4. **LENS dividends.json 재export** — 6,493건 전부 정정된 ex_date로 갱신
+
+### 자동 보정
+- `refresh_future_ex_dates()` 는 `daily_update.run_dividend_pipeline()` 안에서 매일 호출됨
+- 즉 향후 ohlcv가 채워지거나 새 공시 들어와도 자동으로 정확한 ex_date 산출
+
+### 🤝 LENS 협업
+- LENS Claude가 데이터 검증 중 발견 → 코드 fix까지 첨부해 전달
+- Finance_Data 측에서 fix 검증 + 전수 재계산 + 재export 실행
+- LENS는 새 mtime 감지하면 자동 reload
+
+---
+
 ## 2026-05-02 - KRX 휴장일 DB SSoT 전환 + 스케줄러 휴장일 skip
 
 ### 배경

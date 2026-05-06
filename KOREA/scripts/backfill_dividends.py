@@ -167,6 +167,36 @@ def _weekday_based_prev(target: date) -> Optional[date]:
     return d
 
 
+def _is_business_day(business_days: list[date], d: date) -> bool:
+    """d가 KRX 영업일인지. ohlcv 범위 안이면 거래일 list 멤버십,
+       범위 밖이면 weekday + 휴장일 캘린더로 판단."""
+    import bisect
+    if business_days and d <= business_days[-1]:
+        idx = bisect.bisect_left(business_days, d)
+        return idx < len(business_days) and business_days[idx] == d
+    return not _is_market_closed(d)
+
+
+def compute_ex_date(business_days: list[date], record_date: date) -> Optional[date]:
+    """
+    배당락일 산출. KRX 룰:
+      - record_date가 영업일: ex = record_date - 1 영업일
+      - record_date가 휴장일: 직전 영업일이 실질 권리 확정일,
+                              그 직전 영업일이 ex_date
+        (예: record=2025-12-31(수, 휴장), 폐장일=12/30(화),
+              실질 record=12/30 → ex=12/29(월))
+    """
+    if record_date is None:
+        return None
+    if _is_business_day(business_days, record_date):
+        effective = record_date
+    else:
+        effective = business_day_before(business_days, record_date)
+        if effective is None:
+            return None
+    return business_day_before(business_days, effective)
+
+
 def refresh_future_ex_dates(conn) -> int:
     """
     모든 dividends row의 ex_date를 재계산.
@@ -192,7 +222,7 @@ def refresh_future_ex_dates(conn) -> int:
     updated = 0
     with conn.cursor() as cur:
         for did, rd, old_ex in rows:
-            new_ex = business_day_before(biz_days, rd)
+            new_ex = compute_ex_date(biz_days, rd)
             if new_ex and new_ex != old_ex:
                 cur.execute("UPDATE dividends SET ex_date = %s WHERE id = %s",
                             (new_ex, did))
@@ -461,9 +491,9 @@ def _assign_version_and_ex(records: list[dict], biz_days: list[date]) -> list[di
             r["confirmed"] = True
             r["dividend_type"] = "CASH"
             r["source"] = "DART"
-            # ex_date = record_date 직전 영업일 (record_date 없으면 NULL)
+            # ex_date 산출 — record_date 휴장이면 두 단계 shift (compute_ex_date 참조)
             r["ex_date"] = (
-                business_day_before(biz_days, r["record_date"])
+                compute_ex_date(biz_days, r["record_date"])
                 if biz_days and r.get("record_date") else None
             )
             # pay_date 문자열 → date
