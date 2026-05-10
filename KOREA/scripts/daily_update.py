@@ -1160,6 +1160,84 @@ def run_dividend_pipeline(end_date: date) -> dict:
     }
 
 
+INDEX_TRACKING_ETFS = [
+    ("069500", "KOSPI200"),
+    ("229200", "KOSDAQ150"),
+]
+
+
+def run_index_components_pipeline(target_date: date) -> dict:
+    """
+    KOSPI200/KOSDAQ150 구성종목 변동 감지 + SCD2 적재.
+    매일 추적 ETF (KODEX 200/코스닥150) 의 PDF를 받아서 active 멤버십과 diff:
+      - 신규 편입: INSERT effective_date=target_date, end_date=NULL
+      - 편출: UPDATE end_date=target_date
+    PDF 빈 응답(휴장/오류)이면 변경 적용 안 함.
+    """
+    print("\n" + "=" * 70)
+    print("  📊 KOSPI200/KOSDAQ150 구성종목 SCD2 갱신")
+    print("=" * 70)
+
+    client = InfomaxClient()
+    conn = get_conn()
+    summary = {}
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT stock_code FROM stocks")
+            known = {r[0] for r in cur.fetchall()}
+
+        for etf_code, idx_name in INDEX_TRACKING_ETFS:
+            rows = client.get_etf_portfolio(etf_code, target_date)
+            if not rows:
+                print(f"  [{idx_name}] {target_date} PDF 빈 응답 — skip (no-op)")
+                summary[idx_name] = {"skipped": True}
+                continue
+
+            # stocks 매칭으로 의사코드(010010 원화현금) + 알파벳 종목 모두 처리
+            new_set = {r["port_code"] for r in rows if r["port_code"]} & known
+
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT stock_code FROM index_components
+                     WHERE index_name = %s AND end_date IS NULL
+                """, (idx_name,))
+                cur_set = {r[0] for r in cur.fetchall()}
+
+            added   = new_set - cur_set
+            removed = cur_set - new_set
+            unchanged = len(new_set & cur_set)
+
+            with conn:
+                with conn.cursor() as cur:
+                    for code in removed:
+                        cur.execute("""
+                            UPDATE index_components SET end_date = %s
+                             WHERE index_name = %s AND stock_code = %s AND end_date IS NULL
+                        """, (target_date, idx_name, code))
+                    for code in added:
+                        cur.execute("""
+                            INSERT INTO index_components (index_name, stock_code, effective_date)
+                            VALUES (%s, %s, %s)
+                            ON CONFLICT (index_name, stock_code, effective_date) DO NOTHING
+                        """, (idx_name, code, target_date))
+
+            print(f"  [{idx_name}] PDF {len(new_set)}종목 / 기존 {len(cur_set)}종목"
+                  f" → 편입 {len(added)} / 편출 {len(removed)} / 유지 {unchanged}")
+            if added:
+                print(f"    + {sorted(added)}")
+            if removed:
+                print(f"    - {sorted(removed)}")
+            summary[idx_name] = {
+                "pdf_count": len(new_set), "before": len(cur_set),
+                "added": len(added), "removed": len(removed),
+                "added_codes": sorted(added), "removed_codes": sorted(removed),
+            }
+    finally:
+        conn.close()
+
+    return summary
+
+
 def run_krx_holidays_pipeline() -> dict:
     """
     KRX 휴장일 산출 → DB UPSERT → LENS JSON write.
@@ -1215,6 +1293,12 @@ def main(target_date: date = None, missing_only: bool = False):
             run_krx_holidays_pipeline()
         except Exception as hol_err:
             print(f"\n⚠️  KRX 휴장일 단계 오류 (업데이트 결과에는 영향 없음): {hol_err}")
+
+        # KOSPI200/KOSDAQ150 구성종목 SCD2 갱신 (휴장일이면 자체 skip)
+        try:
+            run_index_components_pipeline(result["end_date"])
+        except Exception as idx_err:
+            print(f"\n⚠️  지수 구성종목 단계 오류 (업데이트 결과에는 영향 없음): {idx_err}")
 
     except Exception as e:
         err_msg = traceback.format_exc()

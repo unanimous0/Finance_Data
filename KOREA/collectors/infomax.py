@@ -323,6 +323,37 @@ class InfomaxClient:
             })
         return rows
 
+    # ── ETF 구성종목 PDF (/api/etf/port) ──────────────────────────────────
+    def get_etf_portfolio(self, code: str, target_date: date) -> list[dict]:
+        """
+        ETF 구성종목 PDF 조회 (KOSPI200/KOSDAQ150 추적 ETF용).
+        target_date 미공시일/휴장일이면 빈 list 반환.
+
+        반환: [{"date", "etf_code", "constituents", "port_code", "port_name",
+                "port_volume", "port_value"}, ...]
+        - port_code 가 6자리 숫자가 아닌 행(원화현금 등)도 함께 반환 — 호출자가 필터.
+        """
+        params = {
+            "code": code,
+            "date": target_date.strftime("%Y%m%d"),
+        }
+        data = self._get("/api/etf/port", params)
+        if not data:
+            return []
+
+        rows = []
+        for r in data.get("results", []):
+            rows.append({
+                "date":         self._parse_date(r.get("date")),
+                "etf_code":     r.get("code", code),
+                "constituents": r.get("constituents"),
+                "port_code":    r.get("port_code"),
+                "port_name":    r.get("port_name"),
+                "port_volume":  r.get("port_volume"),
+                "port_value":   r.get("port_value"),
+            })
+        return rows
+
     @staticmethod
     def _parse_date(val) -> Optional[date]:
         if val is None:

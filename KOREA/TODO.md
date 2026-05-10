@@ -1,7 +1,21 @@
 # 📝 TODO - 작업 목록
 
-> **마지막 업데이트**: 2026-05-02
-> **현재 Phase**: Phase 4 완료 + foreign_ownership + **Phase 5 배당 시스템 + LENS 연동 완료** + **KRX 휴장일 DB SSoT** / 주식 2026-04-30 / 배당 2026-05-01
+> **마지막 업데이트**: 2026-05-10
+> **현재 Phase**: Phase 4 완료 + foreign_ownership + **Phase 5 배당 시스템 + LENS 연동 완료** + **KRX 휴장일 DB SSoT** + **KOSPI200/KOSDAQ150 SCD2** / 주식 2026-05-04 / 배당 2026-05-01
+
+---
+
+## 🆕 2026-05-10 신규/완료
+
+- [x] **KOSPI200/KOSDAQ150 구성종목 SCD2 적재** ✅ (2026-05-10)
+  - 데이터 소스: 인포맥스 `/api/etf/port` — KODEX 200(069500) / KODEX 코스닥150(229200) PDF
+  - `collectors/infomax.py` `get_etf_portfolio()` 신규
+  - `index_components` 테이블에 5/8 baseline 적재 (200/150)
+  - `scripts/daily_update.py` `run_index_components_pipeline()` — 매일 diff → SCD2 (편입 INSERT / 편출 end_date close)
+  - PDF 빈 응답(휴장/오류) 시 변경 적용 안 함 (가드)
+  - 적재 버그 수정: `isdigit()` 필터로 알파벳 종목(`0126Z0` 삼성에피스, `0009K0` 에임드바이오) 누락 → `stocks` 매칭으로 변경
+- [ ] **분봉 수집(LENS Phase 6)** — 다음 작업 (LS API spec 확인 후 진행)
+- [ ] **과거 백필(2022~)** — 선택. 정기변경 이력 재구성 필요시
 
 ---
 

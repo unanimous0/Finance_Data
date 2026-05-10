@@ -5,6 +5,55 @@
 
 ---
 
+## 2026-05-10 - KOSPI200/KOSDAQ150 구성종목 SCD2 적재 + daily_update 통합
+
+### 배경
+- LENS Phase 6(분봉 수집) spec 진행 전 "분봉 수집 종목 스코프"를 결정해야 함
+- 그 전제로 KOSPI200/KOSDAQ150 구성종목을 정기적으로 추적할 수단 필요
+- `index_components` 테이블은 진작 만들어 뒀지만 데이터 0건 / 수집 코드도 없었음
+
+### 결정한 데이터 소스 — Infomax `/api/etf/port` (ETF PDF)
+- 인포맥스 백서(32페이지) 전수 조사 결과 **지수 구성종목 list API 자체는 없음**
+- `/api/index/code|info|hist` 모두 메타/시계열만, `constituents` 컬럼은 "개수"만
+- 우회: KOSPI200 추적 ETF (KODEX 200 069500) + KOSDAQ150 추적 ETF (KODEX 코스닥150 229200) PDF
+- 둘 다 **physical full replication** 방식 → 종목 list 99%+ 정확
+  - 정기변경(6/12월) 시점에 ETF 리밸런싱과 KRX 공식 변경일 사이 ±수일 lag 가능 (실용적 trade-off)
+
+### ✅ 완료 작업
+
+1. **`collectors/infomax.py`** — `get_etf_portfolio(code, target_date)` 메서드 추가
+   - `/api/etf/port` 호출 → `{date, etf_code, constituents, port_code, port_name, port_volume, port_value}` list 반환
+   - 의사코드(010010 원화현금) / 알파벳 종목코드 모두 raw 반환, 호출자가 필터
+
+2. **5/8 baseline 적재** — `index_components` 테이블에 SCD2 시작점
+   - KOSPI200 200종목 / KOSDAQ150 150종목 / `effective_date=2026-05-08, end_date=NULL`
+
+3. **`scripts/daily_update.py`** — `run_index_components_pipeline(target_date)` 신규 함수
+   - 매일 두 ETF PDF 받아서 active 멤버십(`end_date IS NULL`) 과 diff
+   - 편입: `INSERT effective_date=target_date, end_date=NULL`
+   - 편출: `UPDATE end_date=target_date`
+   - PDF 빈 응답(휴장일/오류) 시 변경 적용 안 함 (보호 가드)
+   - `main()`의 KRX 휴일 파이프라인 다음에 호출 추가
+
+### 🐛 적재 버그 (해결)
+- 첫 baseline 시 `port_code.isdigit()` 필터로 6자리 숫자만 통과 → **알파벳 포함 종목 누락**
+  - KOSPI200: `0126Z0` 삼성에피스홀딩스 누락 (199만 적재)
+  - KOSDAQ150: `0009K0` 에임드바이오 누락 (149만 적재)
+- 우연한 카운트 일치로 발견 어려웠음 — `010010` 의사코드 +1, 알파벳 종목 -1 로 균형이 맞아 일견 정상으로 보임
+- **수정**: `stocks` 테이블 매칭(set & known)으로 변경 — 의사코드/알파벳 종목 모두 정확히 처리
+- 누락분 INSERT 추가 → 최종 200/150 정확
+
+### 검증
+- 동일 날짜(5/8) 재실행 → 변경 0 (idempotent ✅)
+- 일요일(5/10) 빈 PDF → skip, DB 무변동 (가드 작동 ✅)
+- 시장 분류 100% 일치 (KOSPI200 → 전부 KOSPI / KOSDAQ150 → 전부 KOSDAQ)
+
+### 향후
+- 과거 백필(2022~) 선택사항 — 4년 × 250일 × 2 ETF ≈ 2,000회 호출 (~33분). 정기변경 이력 재구성 가치 있을 때
+- 분봉 수집 종목 스코프에 즉시 활용 가능
+
+---
+
 ## 2026-05-06 - dividends ex_date 산출 버그 fix (record_date 휴장 케이스)
 
 ### 배경
