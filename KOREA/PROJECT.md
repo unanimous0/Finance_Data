@@ -1,7 +1,7 @@
 # 🏢 한국 주식시장 데이터 중앙 관리 시스템
 
-> **마지막 업데이트**: 2026-05-10
-> **프로젝트 상태**: Phase 4 완료 + foreign_ownership + **Phase 5: 배당 시스템 + LENS 연동** + **KRX 휴장일 DB SSoT** + **KOSPI200/KOSDAQ150 SCD2** / 최신 주식 2026-05-04 / 최신 배당 2026-05-01
+> **마지막 업데이트**: 2026-05-12
+> **프로젝트 상태**: Phase 4 완료 + Phase 5(배당) + KRX 휴장일 SSoT + KOSPI200/KOSDAQ150 SCD2 + **ETF 일별 스냅샷(PDF+마스터)** + **지수/지수선물/주식선물 일별 OHLCV** + **Phase 6 분봉 진행 중**(30초봉 ✅ / 1분봉 백필 중)
 > **Repository**: https://github.com/unanimous0/Finance_Data/tree/main/KOREA
 
 ---
@@ -59,7 +59,11 @@
 - **KRX 휴장일 LENS export ✅ (2026-05-01)**: `scripts/export_krx_holidays.py`
 - **KRX 휴장일 DB SSoT ✅ (2026-05-02)**: `krx_holidays` 테이블 신설, daily_update에 통합, `backfill_dividends`도 동일 출처 사용. LENS JSON 계약 그대로 (LENS 코드 변경 0). 휴장일에 daily_update가 주식 수집 skip + 배당/휴일 파이프라인은 진행.
 - **KOSPI200/KOSDAQ150 SCD2 추적 ✅ (2026-05-10)**: KODEX 200(069500)/KODEX 코스닥150(229200) ETF PDF 기반. `index_components` 테이블에 SCD2(편입은 INSERT, 편출은 end_date close). daily_update에 매일 호출. 분봉 수집 종목 스코프 결정에 활용.
-- 미완료: 추정 엔진 자동 활성화, 분봉 수집(LENS Phase 6)
+- **ETF 일별 스냅샷 ✅ (2026-05-11)**: `etf_portfolio_daily` (PDF) + `etf_master_daily` (creation_unit/listed_shares 등) 5일 FIFO. 기존 `etf_portfolios` (SCD2) 폐기. LENS fNav 계산 데이터.
+- **정정공시 [기재정정] 처리 ✅ (2026-05-11)**: dividends `_assign_version_and_ex(conn)` — DB max(version)+1 부여, is_latest 자동 토글. 4년 재실행 502건 추가 INSERT. cache 14일 무효화로 DART 지연 등록도 자동 회수.
+- **Phase 6 분봉 시스템 (LS t8452) 🚧 (2026-05-11~)**: `ohlcv_intraday` 통합 테이블 (interval_seconds 30/60). 30초봉 4/27~5/8 완료(12.24M row). 1분봉 1/16~4/26 백필 중. token 5000회 자동 refresh로 stuck 회피.
+- **지수/지수선물/주식선물 일별 OHLCV ✅ (2026-05-12)**: `indices`(273개) + `index_ohlcv_daily`(245k row) + `futures_underlyings`(200개) + `futures_ohlcv_daily`(NEAR/NEXT 연결시계열, 45 underlying / 59k row). daily_update STEP 통합.
+- 미완료: 추정 엔진 자동 활성화 / 1분봉 백필 완료(5/14 06시 경 예상) / Phase 7 선물 분봉(LS) / CD91·RP 등 무위험금리 4년 백필
 
 ---
 

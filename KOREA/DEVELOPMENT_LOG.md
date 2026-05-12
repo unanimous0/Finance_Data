@@ -5,6 +5,171 @@
 
 ---
 
+## 2026-05-12 - 지수/섹터/지수선물/주식선물 일별 OHLCV (인포맥스)
+
+### 배경
+- 분봉 백필 진행 중 사용자가 발견 — 지수 자체 (코스피200, 코스닥150 등) 일별 OHLCV 없음
+- 지수선물·주식선물 근월/원월 일별 OHLCV도 없음 — 차익거래 분석 필수
+- Phase 7(선물 분봉) 와 별개로, 일별은 즉시 받기 가능
+
+### ✅ 완료 작업
+
+1. **신규 테이블 4개** (`database/schema/indices_futures_schema.sql`)
+   - `indices` 마스터 — code/kr_name/index_type(K/Q/X/T/N)/return_type/is_sector
+   - `index_ohlcv_daily` — 지수 일별 OHLCV + marketcap + constituents
+   - `futures_underlyings` — 선물 기초자산 마스터 (01=코스피200, 06=코스닥150, GN=금양, …)
+   - `futures_ohlcv_daily` — 선물 일별 OHLCV (NEAR/NEXT 연결) + 미결제약정 + 이론가 + 베이시스(시장/이론)
+
+2. **`collectors/infomax.py`** 메서드 4개 추가
+   - `get_index_codes(type_)` — `/api/index/code`
+   - `get_index_hist(code, start, end)` — `/api/index/hist` (1000행 한도)
+   - `get_future_codes(underlying_type)` — `/api/future/code`
+   - `get_future_active(code, start, end, contract_class)` — `/api/future/active`(NEAR) / `/api/future/2active`(NEXT)
+
+3. **`scripts/backfill_indices_futures.py`** — 4년 백필 실행
+   - 지수: 273개 → 245,832 row (코스피 113 + 코스닥 66 + KRX 90 + 일반상품 3 + 코넥스 1)
+   - 선물 active/2active: 45 underlying / 58,975 row (200개 중 거래량 있는 것만)
+   - 700일 chunks 호출 (1000행 한도 회피)
+   - 선물 dedup 안전망 (롤오버 시점 같은 일자 중복 행 제거)
+   - 총 34.6분
+
+4. **`scripts/daily_update.py`** — `run_indices_futures_daily_pipeline(target_date)` 신규
+   - 매일 어제 ~ 어제+7일 마진 호출 (지연 등록 케이스 회수)
+   - 멱등 UPSERT
+   - scheduler 재시작 → 5/13 05:30 부터 자동 누적
+
+### 발견한 한계 (미해결)
+
+- **인포맥스 CD91/RP 등 무위험금리** — `/api/bond/rate/ir_yield` 에 `cd91d_yld`/`call_yld`/`msb1y_yld` 포함됨이 확인됐으나 **최근 7일치만 조회 권한** → 4년 백필 불가
+  - daily_update에 매일 누적은 가능 (놓치면 영구 손실이지만 우선순위 보류)
+  - 과거 데이터는 한국은행 ECOS API 또는 LS API로 추후 시도
+
+### 🐛 발견·해결
+
+- **indices.return_type VARCHAR(5) 부족** — PR/TR/NTR 외에 더 긴 값 존재 → VARCHAR(20) 으로 확장
+- **선물 active 응답 같은 일자 중복** — 롤오버 시점에 NEAR↔NEXT 만기물이 동시 응답되는 경우 → INSERT 전 dedup
+
+---
+
+## 2026-05-11 - Phase 6 분봉 백필 (LS t8452) + 정정공시 처리 + ETF 일별 스냅샷
+
+### 배경
+- LENS Phase 6(분봉 수집) 본격 시작 — 트레이딩 데스크 백테스팅 데이터
+- LENS Claude와 협업으로 spec 확정 후 인프라 구축
+
+### Phase 6 분봉 시스템 (LS증권 OpenAPI)
+
+1. **TR 결정 — t8412 → t8452** (실측 검증 후)
+   - t8412 (`/stock/market-data`): 30초봉 가능하지만 **과거 ~10거래일치만** (롤링 윈도우)
+   - **t8452** (`/stock/chart`, 통합 N분 차트): 1분봉(ncnt=1)은 **2026-01-02 전구간 OK**, 30초봉(ncnt=0)은 t8412와 동일 10거래일 한도
+   - t8412는 deprecate 클래스 (`_DeprecatedT8412`)로 보존, 운영은 t8452 단일
+
+2. **봉 단위 혼합 정책** (LENS 결정)
+   - 2026-01-02 ~ 2026-04-26: **1분봉** (ncnt=1, interval_seconds=60) — t8452 가용 깊이 안에서
+   - 2026-04-27 ~: **30초봉** (ncnt=0, interval_seconds=30) — 미세 흐름 보존, 매일 점진 누적
+   - 30초봉 시작점 `START_30SEC = 2026-04-27` (실측 확정)
+   - `select_ncnt(target_date)` 헬퍼로 자동 분기
+
+3. **스키마 — `ohlcv_intraday`** (단일 통합)
+   - PK: (stock_code, time, exchange, interval_seconds)
+   - `exchange CHAR(1) DEFAULT 'K'` (향후 NXT 확장 대비)
+   - `interval_seconds SMALLINT` (30 / 60)
+   - `volume` = t8452 `jdiff_vol` (봉 단위)
+   - `trading_value` = t8452 `value × 1,000,000` (백만원 → 원)
+   - 기존 `ohlcv_30sec` DROP 후 마이그레이션
+
+4. **collector — `collectors/ls_api.py`**
+   - OAuth2 토큰 23h 캐시 + **5000 호출마다 자동 refresh** (`TOKEN_CALL_LIMIT`) ← LS token-level 호출 한도 회피
+   - `hard_timeout(25)` (signal.alarm) — `requests timeout`이 CLOSE-WAIT에서 안 먹는 케이스 방어
+   - 매 호출 새 `requests.Session()` (`_refresh_session`) — CLOSE_WAIT 누적 방지
+   - `Connection: close` 헤더
+   - `get_intraday_bars(code, target_date)` — ncnt 자동 분기 + 페이징
+
+5. **스코프 — `scripts/_minute_scope.py`**
+   - KOSPI200 + KOSDAQ150 active (`index_components` SCD2) ∪ 한국 ETF (해외 키워드 제외) ∪ ETF PDF underlying union
+   - **stocks 매칭 필터** (외국주식/채권/의사코드 제외) — 약 2,011 종목
+
+6. **백필 — `scripts/backfill_30sec_bars.py`**
+   - 30초봉 (4/27~5/8): 12.24M row, 0 에러, 9.8시간
+   - 1분봉 (1/16~4/26): 진행 중 (1분봉당 ~381봉 × 종목 × 거래일)
+
+### ETF 일별 스냅샷 (LENS 요청 — etf_portfolios SCD2 폐기)
+
+- **이유**: ETF PDF의 현금(KRD010010001) 항목이 매일 변동 → SCD2 변화 감지 무의미
+- **변경**: `etf_portfolios` (SCD2) **DROP** → `etf_portfolio_daily` (5일 FIFO) + `etf_master_daily` (5일 FIFO)
+- `collectors/infomax.py` `get_etf_master()` 추가 (`/api/etp` — creation_unit, listed_shares 등)
+- `daily_update.py` `run_etf_daily_snapshot_pipeline()` — 매일 631 ETF × 2 endpoint
+- 첫 적재: PDF 38,922 row + Master 631 row (22분)
+- 분봉 스코프 SQL → `etf_portfolio_daily` 가장 최근 snapshot 참조 + stocks 매칭
+
+### 정정공시 처리 ([기재정정]) + DART cache 지연 등록 대응
+
+- **버그**: BNK금융지주(138930) 4/30 배당 공시 누락 — 4/30 시점 cache에 1건만 (실제 7건), 늦게 등록된 6건 영구 누락
+- **원인**: `cache_get_list`가 cache 영구 유효 → DART D+N 늦게 등록되는 공시 못 받음
+- **수정**: `CACHE_FRESH_DAYS = 14` — 최근 14일 cache 자동 무효화
+- 4/30~5/11 cache 강제 갱신 → 누락 10건 추가 INSERT (BNK 포함)
+
+- **정정공시 [기재정정]**: 같은 (code, fiscal_year, period) 의 정정공시도 INSERT 시도하는데 batch 내 version=1 부여 → ON CONFLICT (기존 v1) 무시
+- **수정**: `_assign_version_and_ex(conn)` — DB max(version) 조회 후 +1 부여
+- 001390 KG케미칼 검증: v1(2/13 원본 is_latest=FALSE) / v2(4/30 정정 is_latest=TRUE) 자동 토글
+- 과거 4년치 전수 재실행: 502건 추가 INSERT
+
+### 🐛 (대량) 발견·해결한 백필 운영 이슈
+
+- **stuck 진단 헛발질** (5/10~11): "5xx 31초 timeout" 패턴 → 원인 추정 다수
+  - tee pipe buffer? (X) — 실제 영향 X
+  - CLOSE_WAIT 누적? (부분 영향) — 매 호출 새 session으로 해결
+  - LS 새벽 점검 시간대? (X) — 일시 부하였을 뿐
+  - **진짜 원인**: **LS token-level 호출 한도** (추정 ~10k 호출). 단일 호출(새 token)은 정상, 백필(같은 token 누적)만 차단
+  - **해결**: 5000 호출마다 자동 token refresh (`TOKEN_CALL_LIMIT`)
+- **t8412 vs t8452**: t8412는 과거 깊이 한계 → 백필 불가 발견 후 t8452로 전환
+- **`isdigit()` 필터로 알파벳 종목 누락** (KOSPI200 SCD2 시드 시): 0126Z0/0009K0 등. stocks 매칭으로 정정
+- **DB row count 기반 stuck monitor false alarm** — 멱등 UPDATE 구간엔 row 안 늘어남 → **로그 mtime 기반**으로 변경
+
+### 운영 메모
+
+- tmux 백그라운드 실행 시 `tee` 대신 **파일 직접 redirect** (`> log 2>&1`) — `tee` + pseudo-tty 조합에서 block 사례 있음
+- 큰 백필은 자동 self-heal monitor 가동 (10분 stuck/dead/complete 감지 + 알림)
+- LENS realtime 과 같은 LS 계정 사용 — 시간대 분리 (LENS 장중 + 08:30/15:50 / Finance_Data 05:30 + 백필 야간)
+
+---
+
+## 2026-05-06 - dividends ex_date 산출 버그 fix (record_date 휴장 케이스)
+
+### 배경
+- LENS 측에서 `ex_date` 데이터 검증 중 12-31 류 record_date 케이스에서 잘못된 값 발견
+- KRX 룰: record_date가 휴장이면 **직전 영업일이 실질 권리 확정일**, 그 직전 영업일이 ex_date (즉 두 단계 backstep)
+- 기존 코드는 `business_day_before()` 한 번만 호출 → 한 단계만 backstep → record_date 휴장 케이스 전부 오답
+
+### 잘못된 케이스 예 (수정 전 → 수정 후)
+| record_date | 폐장일 (실질 record) | 잘못된 ex | 정정 ex |
+|---|---|---|---|
+| 2025-12-31 (수, 휴장) | 12/30 (화) | 12/30 ❌ | 12/29 (월) ✅ |
+| 2024-12-31 (화, 휴장) | 12/30 (월) | 12/30 ❌ | 12/27 (금) ✅ |
+| 2023-12-31 (일, 휴장) | 12/28 (목, 폐장) | 12/28 ❌ | 12/27 (수) ✅ |
+| 2022-12-31 (토, 휴장) | 12/29 (목, 폐장) | 12/29 ❌ | 12/28 (수) ✅ |
+
+### ✅ 완료 작업
+
+1. **`scripts/backfill_dividends.py`** (LENS Claude 측 fix 적용분)
+   - 신규 헬퍼 `_is_business_day(biz_days, d)` — ohlcv 범위 안: 거래일 list 멤버십 / 범위 밖: weekday + krx_holidays
+   - 신규 함수 `compute_ex_date(biz_days, record_date)` — record_date 휴장 시 두 단계 backstep
+   - `refresh_future_ex_dates` (L225) + INSERT 경로 (L496) 모두 `compute_ex_date` 사용으로 교체
+2. **단위 테스트** — 4개 휴장 케이스 + 1개 영업일 케이스 모두 정답 확인
+3. **기존 dividends 전수 재계산** — `refresh_future_ex_dates()` 1회 호출로 **4,352건 UPDATE**
+4. **LENS dividends.json 재export** — 6,493건 전부 정정된 ex_date로 갱신
+
+### 자동 보정
+- `refresh_future_ex_dates()` 는 `daily_update.run_dividend_pipeline()` 안에서 매일 호출됨
+- 즉 향후 ohlcv가 채워지거나 새 공시 들어와도 자동으로 정확한 ex_date 산출
+
+### 🤝 LENS 협업
+- LENS Claude가 데이터 검증 중 발견 → 코드 fix까지 첨부해 전달
+- Finance_Data 측에서 fix 검증 + 전수 재계산 + 재export 실행
+- LENS는 새 mtime 감지하면 자동 reload
+
+---
+
 ## 2026-05-10 - KOSPI200/KOSDAQ150 구성종목 SCD2 적재 + daily_update 통합
 
 ### 배경

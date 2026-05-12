@@ -1,7 +1,42 @@
 # 📝 TODO - 작업 목록
 
-> **마지막 업데이트**: 2026-05-10
-> **현재 Phase**: Phase 4 완료 + foreign_ownership + **Phase 5 배당 시스템 + LENS 연동 완료** + **KRX 휴장일 DB SSoT** + **KOSPI200/KOSDAQ150 SCD2** / 주식 2026-05-04 / 배당 2026-05-01
+> **마지막 업데이트**: 2026-05-12
+> **현재 Phase**: Phase 4 + Phase 5(배당) + KRX 휴장일 + KOSPI200/KOSDAQ150 SCD2 + ETF 일별 스냅샷 + **지수/지수선물/주식선물 일별** + **Phase 6 분봉 진행 중** / 분봉 시스템: 30초봉 ✅ / 1분봉 백필 중 (ETA 5/14 06시)
+
+---
+
+## 🆕 2026-05-12 신규/완료
+
+- [x] **지수/지수선물/주식선물 일별 OHLCV** ✅ (2026-05-12)
+  - 신규 테이블 4개: indices / index_ohlcv_daily / futures_underlyings / futures_ohlcv_daily
+  - 인포맥스 API: /api/index/code, /api/index/hist, /api/future/code, /api/future/active|2active
+  - 4년 백필: 지수 273개 245k row + 선물 45 underlying 59k row (34.6분)
+  - 섹터지수 포함 (코스피200 헬스케어/금융/에너지 등 + 코스닥/KRX 섹터 다수)
+  - 선물 ohlcv 에 이론가 / 시장 베이시스 / 이론 베이시스 / 미결제약정까지 포함
+  - daily_update에 `run_indices_futures_daily_pipeline` STEP 통합 (5/13 05:30부터 자동 누적)
+- [-] **CD91/RP 등 무위험금리** — 인포맥스 `/api/bond/rate/ir_yield` 발견. 단 최근 7일치만 권한. 4년 백필 보류. 향후 ECOS API 또는 LS 시도.
+
+---
+
+## 🆕 2026-05-11 신규/완료
+
+- [x] **Phase 6 분봉 시스템 (LS t8452)** ✅ 부분 완료 (2026-05-11)
+  - `ohlcv_intraday` 통합 테이블 (PK: stock_code, time, exchange, interval_seconds)
+  - 봉 단위 자동 분기: 4/27 이후=30초봉(ncnt=0), 그 이전=1분봉(ncnt=1)
+  - LS t8452 collector 강화: 5000호출 자동 token refresh / hard_timeout 25s / 매 호출 새 session
+  - 30초봉 4/27~5/8 완료: 12.24M row, 0 에러
+  - 1분봉 1/16~4/26 백필 중 (ETA 5/14 06시 KST)
+- [x] **ETF 일별 스냅샷 (5일 FIFO)** ✅ (2026-05-11)
+  - 기존 `etf_portfolios` (SCD2) DROP, 신규 `etf_portfolio_daily` + `etf_master_daily`
+  - `collectors/infomax.py` `get_etf_master()` 추가 (/api/etp — creation_unit 등)
+  - daily_update `run_etf_daily_snapshot_pipeline` STEP 통합
+  - 첫 적재: PDF 38,922 row, Master 631 row
+- [x] **정정공시 [기재정정] 처리** ✅ (2026-05-11)
+  - dividends `_assign_version_and_ex(conn)` — DB max(version)+1 부여
+  - 4년치 재실행: 502건 추가 INSERT, 001390/138930 등 검증
+  - cache 14일 무효화 (`CACHE_FRESH_DAYS=14`) — DART 지연 등록 자동 회수
+- [ ] **Phase 7 (선물 분봉, LS API)** — 별도 진행 예정 (지수선물/주식선물 + 지수 자체 분봉)
+- [ ] **CD91/RP 4년치 무위험금리** — ECOS API 또는 LS 추후
 
 ---
 
