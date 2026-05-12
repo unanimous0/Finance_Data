@@ -30,6 +30,11 @@ class Settings(BaseSettings):
     HTS_API_KEY: str = Field(default="", description="HTS API 키")
     HTS_API_SECRET: str = Field(default="", description="HTS API 시크릿")
 
+    # LS증권 OpenAPI (분봉 t1302 등) — LENS realtime과 같은 계정 공유
+    LS_APP_KEY: str    = Field(default="", description="LS증권 OpenAPI App Key (LENS .env와 동일)")
+    LS_APP_SECRET: str = Field(default="", description="LS증권 OpenAPI App Secret (LENS .env와 동일)")
+    LS_BASE_URL: str   = Field(default="https://openapi.ls-sec.co.kr:8080", description="LS증권 OpenAPI base URL")
+
     # DART (금융감독원 전자공시) Open API
     DART_API_KEY: str = Field(default="", description="DART Open API 키 (https://opendart.fss.or.kr)")
     DART_BASE_URL: str = Field(default="https://opendart.fss.or.kr/api", description="DART Open API URL")

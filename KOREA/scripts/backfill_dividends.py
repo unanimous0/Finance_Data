@@ -75,10 +75,21 @@ def _doc_cache_path(rcp_no: str) -> Path:
     return DOC_CACHE / f"{rcp_no}.xml"
 
 
+# DART는 D+N에 늦게 등록되는 공시 있음 → 최근 N일 이내 cache는 무효 처리
+CACHE_FRESH_DAYS = 14
+
+
 def cache_get_list(bgn_de: str, end_de: str) -> Optional[list[dict]]:
     p = _list_cache_path(bgn_de, end_de)
     if not p.exists():
         return None
+    # end_de가 최근 14일 이내면 cache 무시 (DART 지연 등록 대응)
+    try:
+        end_date = datetime.strptime(end_de, "%Y%m%d").date()
+        if (date.today() - end_date).days <= CACHE_FRESH_DAYS:
+            return None
+    except ValueError:
+        pass
     try:
         return json.loads(p.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
@@ -371,7 +382,7 @@ def run_backfill(start_date: date, end_date: date, workers: int = 4,
         else:
             biz_days = []
 
-        rows = _assign_version_and_ex(parsed_records, biz_days)
+        rows = _assign_version_and_ex(parsed_records, biz_days, conn)
         inserted = _insert_rows(conn, rows)
         print(f"  → INSERT {inserted:,}건")
 
@@ -474,8 +485,12 @@ def _download_and_parse(client: DartClient, decisions: list[dict],
     return parsed
 
 
-def _assign_version_and_ex(records: list[dict], biz_days: list[date]) -> list[dict]:
-    """(code, fiscal_year, period) 그룹별로 announced_at ASC 정렬 → version + is_latest."""
+def _assign_version_and_ex(records: list[dict], biz_days: list[date],
+                           conn=None) -> list[dict]:
+    """
+    (code, fiscal_year, period) 그룹별로 announced_at ASC 정렬 → version + is_latest.
+    conn 주어지면 DB 기존 max(version) 위에 이어서 부여 (정정공시 처리 — version 충돌 회피).
+    """
     groups: dict[tuple, list[dict]] = defaultdict(list)
     for r in records:
         key = (r["code"], r["fiscal_year"], r["period"])
@@ -483,10 +498,20 @@ def _assign_version_and_ex(records: list[dict], biz_days: list[date]) -> list[di
 
     out: list[dict] = []
     for key, group in groups.items():
+        # DB 기존 max version 조회 (재실행/정정공시 안전)
+        db_max_v = 0
+        if conn is not None:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT COALESCE(MAX(version), 0) FROM dividends
+                     WHERE code = %s AND fiscal_year = %s AND period = %s
+                """, key)
+                db_max_v = cur.fetchone()[0]
+
         # announced_at None은 맨 앞으로 (드물 것)
         group.sort(key=lambda x: (x["announced_at"] or datetime.min))
         for i, r in enumerate(group, 1):
-            r["version"] = i
+            r["version"] = db_max_v + i
             r["is_latest"] = (i == len(group))
             r["confirmed"] = True
             r["dividend_type"] = "CASH"

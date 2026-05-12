@@ -520,6 +520,39 @@ class OHLCVDaily(Base):
 
 
 # ==========================================
+# 7-2. Hypertable 모델: OHLCVIntraday (분봉)
+# ==========================================
+
+class OHLCVIntraday(Base):
+    """
+    분봉 OHLCV (LS t8452 - 통합 주식차트 N분)
+
+    Phase 6 종목 스코프: KOSPI200 + KOSDAQ150 + 한국 ETF + ETF PDF union ≈ 2,000종목
+    봉 단위 분기:
+      - 2026-01-02 ~ 2026-04-26: 1분봉 (ncnt=1, interval_seconds=60)
+      - 2026-04-27 ~:            30초봉 (ncnt=0, interval_seconds=30)
+    """
+
+    __tablename__ = "ohlcv_intraday"
+
+    stock_code       = Column(String(10), primary_key=True, nullable=False, comment="종목코드")
+    time             = Column(TIMESTAMP(timezone=True), primary_key=True, nullable=False, comment="봉 boundary")
+    exchange         = Column(CHAR(1), primary_key=True, nullable=False, default='K', comment="K=KRX | N=NXT")
+    interval_seconds = Column(Integer, primary_key=True, nullable=False, comment="30 | 60")
+
+    open  = Column(Numeric(12, 2), nullable=False, comment="시가")
+    high  = Column(Numeric(12, 2), nullable=False, comment="고가")
+    low   = Column(Numeric(12, 2), nullable=False, comment="저가")
+    close = Column(Numeric(12, 2), nullable=False, comment="종가")
+
+    volume         = Column(BigInteger, nullable=False, comment="봉 단위 거래량 (t8452 jdiff_vol)")
+    trading_value  = Column(BigInteger, nullable=True,  comment="거래대금 원 단위 (t8452 value × 백만원)")
+
+    def __repr__(self):
+        return f"<OHLCVIntraday({self.stock_code}, {self.time}, {self.interval_seconds}s, 종가={self.close})>"
+
+
+# ==========================================
 # 8. Hypertable 모델: InvestorTrading (투자자별 수급)
 # ==========================================
 

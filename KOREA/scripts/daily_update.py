@@ -1238,6 +1238,285 @@ def run_index_components_pipeline(target_date: date) -> dict:
     return summary
 
 
+def run_etf_daily_snapshot_pipeline(target_date: date) -> dict:
+    """
+    한국 ETF 590개의 PDF + 마스터를 매일 스냅샷으로 적재.
+    - etf_portfolio_daily: PDF 종목 + 현금 (snapshot_date=target_date)
+    - etf_master_daily: creation_unit, listed_shares 등
+    - 5일 FIFO: 6일 초과 데이터 DELETE
+    LENS fNav 계산용 (creation_unit, cash, shares).
+    """
+    print("\n" + "=" * 70)
+    print("  📦 ETF 일별 스냅샷 (PDF + 마스터, 5일 FIFO)")
+    print("=" * 70)
+
+    from scripts.seed_etf_portfolios import KOREA_ETF_SQL
+    client = InfomaxClient()
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(KOREA_ETF_SQL)
+            etfs = cur.fetchall()
+
+        pdf_rows = master_rows = 0
+        empty_pdf = empty_master = 0
+        errors = []
+
+        for i, (etf_code, etf_name) in enumerate(etfs, 1):
+            # 1) PDF (/api/etf/port)
+            try:
+                rows = client.get_etf_portfolio(etf_code, target_date)
+                if rows:
+                    seen = set()
+                    pdf_values = []
+                    for r in rows:
+                        pc = r.get("port_code")
+                        if not pc or pc in seen:
+                            continue
+                        seen.add(pc)
+                        # 현금 항목 (KRD... 또는 port_name이 원화현금) 식별
+                        is_cash = (pc.startswith("KRD") or
+                                   "원화현금" in (r.get("port_name") or "") or
+                                   "현금" in (r.get("port_name") or ""))
+                        # shares: 일반 종목은 port_volume, 현금은 port_value (음수 가능)
+                        shares = r.get("port_value") if is_cash else r.get("port_volume")
+                        pdf_values.append((etf_code, target_date, pc,
+                                           r.get("port_name"), shares, is_cash))
+                    if pdf_values:
+                        with conn:
+                            with conn.cursor() as cur:
+                                psycopg2.extras.execute_values(cur, """
+                                    INSERT INTO etf_portfolio_daily
+                                      (etf_code, snapshot_date, component_code, component_name, shares, is_cash)
+                                    VALUES %s
+                                    ON CONFLICT (etf_code, snapshot_date, component_code) DO UPDATE SET
+                                      component_name = EXCLUDED.component_name,
+                                      shares = EXCLUDED.shares,
+                                      is_cash = EXCLUDED.is_cash
+                                """, pdf_values, page_size=200)
+                        pdf_rows += len(pdf_values)
+                else:
+                    empty_pdf += 1
+            except Exception as e:
+                errors.append((etf_code, "pdf", str(e)[:80]))
+
+            # 2) 마스터 (/api/etp)
+            try:
+                m = client.get_etf_master(etf_code, target_date)
+                if m:
+                    with conn:
+                        with conn.cursor() as cur:
+                            cur.execute("""
+                                INSERT INTO etf_master_daily
+                                  (etf_code, snapshot_date, kr_name, kr_company,
+                                   creation_unit, listed_shares, net_asset,
+                                   underlying_index, tracking_multiple, replication, total_fee)
+                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                                ON CONFLICT (etf_code, snapshot_date) DO UPDATE SET
+                                  kr_name = EXCLUDED.kr_name,
+                                  kr_company = EXCLUDED.kr_company,
+                                  creation_unit = EXCLUDED.creation_unit,
+                                  listed_shares = EXCLUDED.listed_shares,
+                                  net_asset = EXCLUDED.net_asset,
+                                  underlying_index = EXCLUDED.underlying_index,
+                                  tracking_multiple = EXCLUDED.tracking_multiple,
+                                  replication = EXCLUDED.replication,
+                                  total_fee = EXCLUDED.total_fee
+                            """, (etf_code, target_date, m.get("kr_name"), m.get("kr_company"),
+                                  m.get("creationunit"), m.get("listed_shares"), m.get("net_asset"),
+                                  m.get("underlying_index"), m.get("tracking_multiple"),
+                                  m.get("replication"), m.get("total_fee")))
+                    master_rows += 1
+                else:
+                    empty_master += 1
+            except Exception as e:
+                errors.append((etf_code, "master", str(e)[:80]))
+
+        # 5일 FIFO DELETE
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM etf_portfolio_daily WHERE snapshot_date < %s - INTERVAL '5 days'",
+                            (target_date,))
+                pdf_deleted = cur.rowcount
+                cur.execute("DELETE FROM etf_master_daily WHERE snapshot_date < %s - INTERVAL '5 days'",
+                            (target_date,))
+                master_deleted = cur.rowcount
+
+        print(f"  [완료] ETF {len(etfs)}개")
+        print(f"    PDF 적재 {pdf_rows} / 빈응답 {empty_pdf} / 마스터 적재 {master_rows} / 빈응답 {empty_master}")
+        print(f"    5일 FIFO DELETE: PDF {pdf_deleted} / 마스터 {master_deleted}")
+        print(f"    에러 {len(errors)}")
+        return {"etfs": len(etfs), "pdf_rows": pdf_rows, "master_rows": master_rows,
+                "empty_pdf": empty_pdf, "empty_master": empty_master,
+                "pdf_deleted": pdf_deleted, "master_deleted": master_deleted,
+                "errors": len(errors)}
+    finally:
+        conn.close()
+
+
+def run_indices_futures_daily_pipeline(target_date: date) -> dict:
+    """
+    지수 + 선물(NEAR/NEXT) 일별 OHLCV 누적 (인포맥스).
+    target_date ~ 어제 (보통 1일치) 호출. 1000행 한도라 매일이면 무관.
+    """
+    print("\n" + "=" * 70)
+    print("  📊 지수 + 선물 일별 OHLCV (인포맥스)")
+    print("=" * 70)
+
+    from datetime import timedelta as _td
+    client = InfomaxClient()
+    conn = get_conn()
+    try:
+        # 지수: indices 마스터 전체
+        with conn.cursor() as cur:
+            cur.execute("SELECT code FROM indices ORDER BY code")
+            idx_codes = [r[0] for r in cur.fetchall()]
+            cur.execute("SELECT underlying_code FROM futures_underlyings WHERE underlying_type IN ('F','L') ORDER BY underlying_code")
+            fut_codes = [r[0] for r in cur.fetchall()]
+
+        # 7일 마진 (최근 누락분 회수)
+        start = target_date - _td(days=7)
+        end = target_date
+
+        # 지수 OHLCV
+        idx_rows = 0
+        for code in idx_codes:
+            try:
+                data = client.get_index_hist(code, start, end)
+            except Exception:
+                continue
+            rows = [(
+                code, _parse_ymd_daily(r.get('date')),
+                r.get('open_price'), r.get('high_price'), r.get('low_price'), r.get('close_price'),
+                r.get('change_rate'), r.get('trading_volume'), r.get('trading_value'),
+                r.get('marketcap'), r.get('constituents'),
+            ) for r in data]
+            if rows:
+                with conn:
+                    with conn.cursor() as cur:
+                        psycopg2.extras.execute_values(cur, """
+                            INSERT INTO index_ohlcv_daily
+                              (code, time, open, high, low, close, change_pct, volume, trading_value, marketcap, constituents)
+                            VALUES %s
+                            ON CONFLICT (code, time) DO UPDATE SET
+                              open=EXCLUDED.open, high=EXCLUDED.high, low=EXCLUDED.low,
+                              close=EXCLUDED.close, change_pct=EXCLUDED.change_pct,
+                              volume=EXCLUDED.volume, trading_value=EXCLUDED.trading_value,
+                              marketcap=EXCLUDED.marketcap, constituents=EXCLUDED.constituents
+                        """, rows, page_size=500)
+                idx_rows += len(rows)
+
+        # 선물 OHLCV (NEAR/NEXT)
+        fut_rows = 0
+        for uc in fut_codes:
+            for klass in ['NEAR', 'NEXT']:
+                try:
+                    data = client.get_future_active(uc, start, end, contract_class=klass)
+                except Exception:
+                    continue
+                rows = [(
+                    uc, klass, _parse_ymd_daily(r.get('date')), r.get('code'),
+                    r.get('open_price'), r.get('high_price'), r.get('low_price'), r.get('close_price'),
+                    r.get('settle_price'), r.get('trading_volume'), r.get('trading_value'),
+                    r.get('openInterest_volume'), r.get('theoretical_price'),
+                    r.get('underlying_basis'), r.get('theoretical_basis'),
+                ) for r in data]
+                if rows:
+                    dedup: dict = {}
+                    for x in rows:
+                        dedup[(x[0], x[1], x[2])] = x
+                    rows = list(dedup.values())
+                    with conn:
+                        with conn.cursor() as cur:
+                            psycopg2.extras.execute_values(cur, """
+                                INSERT INTO futures_ohlcv_daily
+                                  (underlying_code, contract_class, time, contract_code,
+                                   open, high, low, close, settle_price,
+                                   volume, trading_value, open_interest,
+                                   theoretical_price, underlying_basis, theoretical_basis)
+                                VALUES %s
+                                ON CONFLICT (underlying_code, contract_class, time) DO UPDATE SET
+                                  contract_code=EXCLUDED.contract_code,
+                                  open=EXCLUDED.open, high=EXCLUDED.high, low=EXCLUDED.low,
+                                  close=EXCLUDED.close, settle_price=EXCLUDED.settle_price,
+                                  volume=EXCLUDED.volume, trading_value=EXCLUDED.trading_value,
+                                  open_interest=EXCLUDED.open_interest,
+                                  theoretical_price=EXCLUDED.theoretical_price,
+                                  underlying_basis=EXCLUDED.underlying_basis,
+                                  theoretical_basis=EXCLUDED.theoretical_basis
+                            """, rows, page_size=500)
+                    fut_rows += len(rows)
+
+        print(f"  [완료] 지수 {len(idx_codes)}종목 / 선물 {len(fut_codes)}underlying")
+        print(f"    INSERT/UPDATE: 지수 {idx_rows} row / 선물 {fut_rows} row")
+        return {"indices": len(idx_codes), "futures": len(fut_codes),
+                "idx_rows": idx_rows, "fut_rows": fut_rows}
+    finally:
+        conn.close()
+
+
+def _parse_ymd_daily(v) -> date:
+    s = str(v)
+    return date(int(s[0:4]), int(s[4:6]), int(s[6:8]))
+
+
+def run_minute_bars_pipeline(target_date: date) -> dict:
+    """
+    분봉 일배치 — target_date 1일치 sweep (LS t8452).
+    target_date >= 2026-04-27: 30초봉 (ncnt=0)
+    그 이전: 1분봉 (ncnt=1)
+    스코프: ≈ 2,000 종목 / 종목당 ~1.5초 (페이징 평균) → 약 50분
+    """
+    from collectors.ls_api import LsApiClient, LsApiError
+    from scripts._minute_scope import fetch_minute_scope
+    from scripts.backfill_30sec_bars import insert_bars
+
+    print("\n" + "=" * 70)
+    print("  ⏱️  분봉 일배치 (LS t8452)")
+    print("=" * 70)
+
+    conn = get_conn()
+    try:
+        codes = fetch_minute_scope(conn)
+        print(f"  [스코프] {len(codes)} 종목 / target_date={target_date}")
+    finally:
+        conn.close()
+
+    client = LsApiClient()
+    conn = get_conn()
+    try:
+        total_rows = 0
+        empty = 0
+        errors = []
+        from time import time as now
+        t0 = now()
+        for i, code in enumerate(codes, 1):
+            try:
+                bars, interval = client.get_intraday_bars(code, target_date)
+                if not bars:
+                    empty += 1
+                    continue
+                n = insert_bars(conn, code, bars, interval)
+                total_rows += n
+            except LsApiError as e:
+                errors.append((code, e.category))
+            except Exception as e:
+                errors.append((code, f"unexpected:{type(e).__name__}"))
+            if i % 500 == 0:
+                elapsed = now() - t0
+                eta = (len(codes) - i) / (i / elapsed) if elapsed else 0
+                print(f"    [{i}/{len(codes)}] 적재 {total_rows:,}row / 빈 {empty} / 에러 {len(errors)} / ETA {eta:.0f}s")
+
+        elapsed = now() - t0
+        print(f"\n  [완료] 소요 {elapsed/60:.1f}분 / 적재 {total_rows:,}row / 빈응답 {empty} / 에러 {len(errors)}")
+        if errors:
+            from collections import Counter
+            print(f"    에러 카테고리: {dict(Counter(e[1] for e in errors))}")
+        return {"stocks": len(codes), "rows": total_rows, "empty": empty, "errors": len(errors)}
+    finally:
+        conn.close()
+
+
 def run_krx_holidays_pipeline() -> dict:
     """
     KRX 휴장일 산출 → DB UPSERT → LENS JSON write.
@@ -1299,6 +1578,24 @@ def main(target_date: date = None, missing_only: bool = False):
             run_index_components_pipeline(result["end_date"])
         except Exception as idx_err:
             print(f"\n⚠️  지수 구성종목 단계 오류 (업데이트 결과에는 영향 없음): {idx_err}")
+
+        # ETF 일별 스냅샷 (PDF + 마스터, 5일 FIFO)
+        try:
+            run_etf_daily_snapshot_pipeline(result["end_date"])
+        except Exception as etf_err:
+            print(f"\n⚠️  ETF 스냅샷 단계 오류 (업데이트 결과에는 영향 없음): {etf_err}")
+
+        # 지수 + 선물 일별 OHLCV (인포맥스)
+        try:
+            run_indices_futures_daily_pipeline(result["end_date"])
+        except Exception as idx_err:
+            print(f"\n⚠️  지수+선물 단계 오류 (업데이트 결과에는 영향 없음): {idx_err}")
+
+        # 30초봉 일배치 (분봉 스코프 ≈ 2,500~2,700 종목)
+        try:
+            run_minute_bars_pipeline(result["end_date"])
+        except Exception as min_err:
+            print(f"\n⚠️  30초봉 일배치 오류 (업데이트 결과에는 영향 없음): {min_err}")
 
     except Exception as e:
         err_msg = traceback.format_exc()

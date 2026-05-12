@@ -323,6 +323,83 @@ class InfomaxClient:
             })
         return rows
 
+    # ── 지수 코드 list (/api/index/code) ──────────────────────────────────
+    def get_index_codes(self, type_: str = "") -> list[dict]:
+        """지수 코드 list. type='' 전체 / K/Q/X/T/N 별."""
+        data = self._get("/api/index/code", {"type": type_})
+        if not data:
+            return []
+        return data.get("results", []) or []
+
+    # ── 지수 일별 OHLCV (/api/index/hist) ─────────────────────────────────
+    def get_index_hist(self, code: str, start: date, end: date) -> list[dict]:
+        """지수 일별 OHLCV. 1000행 한도이므로 호출자가 chunks 분할 권장."""
+        params = {"code": code,
+                  "startDate": start.strftime("%Y%m%d"),
+                  "endDate": end.strftime("%Y%m%d")}
+        data = self._get("/api/index/hist", params)
+        if not data:
+            return []
+        return data.get("results", []) or []
+
+    # ── 선물 종목 list (/api/future/code) ─────────────────────────────────
+    def get_future_codes(self, underlying_type: str = "") -> list[dict]:
+        """선물 종목 list. underlying_type='' 전체 / F/C/G/L 별."""
+        data = self._get("/api/future/code", {"underlying_type": underlying_type})
+        if not data:
+            return []
+        return data.get("results", []) or []
+
+    # ── 선물 연결 시계열 (/api/future/active|2active) ─────────────────────
+    def get_future_active(self, underlying_code: str, start: date, end: date,
+                          contract_class: str = "NEAR") -> list[dict]:
+        """
+        선물 근월/원월 연결 시계열.
+        contract_class: NEAR (근월, /api/future/active) | NEXT (차근월, /api/future/2active)
+        1000행 한도 (chunks 분할 권장).
+        """
+        endpoint = "/api/future/active" if contract_class == "NEAR" else "/api/future/2active"
+        params = {"underlying": underlying_code,
+                  "startDate": start.strftime("%Y%m%d"),
+                  "endDate":   end.strftime("%Y%m%d")}
+        data = self._get(endpoint, params)
+        if not data:
+            return []
+        return data.get("results", []) or []
+
+    # ── ETF 마스터 (/api/etp) ─────────────────────────────────────────────
+    def get_etf_master(self, code: str, target_date: Optional[date] = None) -> Optional[dict]:
+        """
+        ETF 추가정보 (creation_unit, listed_shares, kr_company, underlying_index 등).
+        target_date 미입력 시 today.
+        반환: 단일 dict 또는 None
+        """
+        params = {"code": code}
+        if target_date:
+            params["date"] = target_date.strftime("%Y%m%d")
+        data = self._get("/api/etp", params)
+        if not data:
+            return None
+        rows = data.get("results", []) or []
+        if not rows:
+            return None
+        r = rows[0]
+        return {
+            "date":              self._parse_date(r.get("date")),
+            "etf_code":          r.get("code", code),
+            "kr_name":           r.get("kr_name"),
+            "kr_company":        r.get("kr_company"),
+            "company_code":      r.get("company_code"),
+            "net_asset":         r.get("net_asset"),
+            "listed_shares":     r.get("listed_shares"),
+            "creationunit":      r.get("creationunit"),
+            "tracking_multiple": r.get("tracking_multiple"),
+            "replication":       r.get("replication"),
+            "underlying_index":  r.get("underlying_index"),
+            "index_agency":      r.get("index_agency"),
+            "total_fee":         r.get("total_fee"),
+        }
+
     # ── ETF 구성종목 PDF (/api/etf/port) ──────────────────────────────────
     def get_etf_portfolio(self, code: str, target_date: date) -> list[dict]:
         """
