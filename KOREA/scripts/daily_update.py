@@ -408,19 +408,36 @@ def sync_stock_master(conn, client) -> dict:
     try:
         api_stocks = client.get_stock_codes()
         api_active_codes = {s["code"] for s in api_stocks if s["code"]}
+        renamed: list[tuple[str, str]] = []
         for s in api_stocks:
             code = s["code"]
-            if not code or code in db_stocks:
+            if not code:
                 continue
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO stocks
-                        (stock_code, stock_name, market, standard_code, listing_date, is_active)
-                    VALUES (%s, %s, %s, %s, %s, TRUE)
-                    ON CONFLICT (stock_code) DO NOTHING
-                """, (code, s["name"], s["market"], s["standard_code"], s["listing_date"]))
-            conn.commit()
-            result["new_listed"].append(code)
+            if code in db_stocks:
+                # 기존 — stock_name 변경 시만 UPDATE (사명 변경 반영)
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE stocks
+                        SET stock_name = %s, updated_at = NOW()
+                        WHERE stock_code = %s
+                          AND stock_name IS DISTINCT FROM %s
+                    """, (s["name"], code, s["name"]))
+                    if cur.rowcount > 0:
+                        renamed.append((code, s["name"]))
+                conn.commit()
+            else:
+                # 신규
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO stocks
+                            (stock_code, stock_name, market, standard_code, listing_date, is_active)
+                        VALUES (%s, %s, %s, %s, %s, TRUE)
+                        ON CONFLICT (stock_code) DO NOTHING
+                    """, (code, s["name"], s["market"], s["standard_code"], s["listing_date"]))
+                conn.commit()
+                result["new_listed"].append(code)
+        if renamed:
+            result["renamed"] = renamed
     except Exception as e:
         result["errors"].append(f"신규 상장 조회 실패: {e}")
 
@@ -1791,6 +1808,144 @@ def run_stockfut_minute_today_pipeline(target_date: date) -> dict:
         conn.close()
 
 
+def export_futures_master_json() -> dict:
+    """주식선물 master JSON export → LENS futures_master.json (LENS realtime 공유 SSoT).
+    LS t8401 master + 종목별 근월/차월 식별 + DB join (futures_underlyings + stocks).
+    매일 daily_update 끝에서 호출 — LENS는 이 파일만 읽으면 자체 LS 호출 불필요."""
+    import json as _json
+    from collections import defaultdict, Counter
+    from collectors.ls_api import LsApiClient, _parse_expiry_yyyymm, select_near_next_two
+
+    OUT_PATH = Path("/home/una0/projects/LENS/data/futures_master.json")
+
+    print("\n" + "=" * 70)
+    print("  📤 LENS futures_master.json export (LS t8401 master)")
+    print("=" * 70)
+
+    today = datetime.now(KST).date()
+
+    # 1) LS t8401 master
+    client = LsApiClient()
+    master = client.get_stockfut_master()
+    print(f"  t8401 master: {len(master)} rows")
+
+    # 2) 단일선물 (basecode별 근월+차월)
+    actives = select_near_next_two(master, today,
+                                   group_key=lambda m: m.get("basecode", ""))
+
+    # 3) 스프레드 — basecode별 그룹
+    spreads_by_base: dict[str, list] = defaultdict(list)
+    for m in master:
+        if "SP" in m.get("hname", ""):
+            spreads_by_base[m.get("basecode", "")].append(m)
+
+    # 4) DB join — futures_underlyings + stocks
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT fu.stock_code, s.stock_name, s.market
+                FROM futures_underlyings fu
+                JOIN stocks s ON s.stock_code = fu.stock_code
+                WHERE fu.underlying_type = 'L'
+            """)
+            stock_info = {row[0]: (row[1], row[2]) for row in cur.fetchall()}
+    finally:
+        conn.close()
+
+    # 5) basecode별 contract list
+    by_base: dict[str, list] = defaultdict(list)
+    for m in actives:
+        by_base[m.get("basecode", "")].append(m)
+
+    items: list[dict] = []
+    front_months: list[str] = []
+    back_months: list[str] = []
+
+    def _build_leg(m: dict):
+        exp = _parse_expiry_yyyymm(m.get("hname", ""))
+        if not exp:
+            return None
+        return {
+            "code": m["shcode"],
+            "name": m["hname"].strip(),
+            "expiry": exp.strftime("%Y%m%d"),
+            "days_left": (exp - today).days,
+            "multiplier": 10.0,
+        }
+
+    for basecode_full, contracts in by_base.items():
+        # basecode "A069260" → "069260"
+        if not basecode_full.startswith("A"):
+            continue
+        base_code = basecode_full[1:]
+        info = stock_info.get(base_code)
+        if not info:
+            continue
+        base_name, market = info
+
+        # 만기 ascending
+        contracts.sort(key=lambda m: _parse_expiry_yyyymm(m.get("hname", "")) or date.max)
+        if not contracts:
+            continue
+
+        front = _build_leg(contracts[0])
+        back = _build_leg(contracts[1]) if len(contracts) > 1 else None
+        if not front:
+            continue
+
+        front_months.append(front["expiry"][:6])
+        if back:
+            back_months.append(back["expiry"][:6])
+
+        # 스프레드 매칭 — front+back 만기 페어
+        spread_code = None
+        if back and basecode_full in spreads_by_base:
+            f_ym = front["expiry"][:6]   # 예 "202605"
+            b_ym = back["expiry"][:6]
+            for sp in spreads_by_base[basecode_full]:
+                hn = sp.get("hname", "")
+                # SP hname: "TKG휴켐스 SP 2605-2607" 형식 또는 변형
+                # 간단히 두 만기 모두 hname에 포함되는지 (YYMM 형식)
+                f_yymm = f_ym[2:]
+                b_yymm = b_ym[2:]
+                if f_yymm in hn and b_yymm in hn:
+                    spread_code = sp["shcode"]
+                    break
+
+        item = {
+            "base_code": base_code,
+            "base_name": base_name,
+            "market": market,
+            "front": front,
+        }
+        if back:
+            item["back"] = back
+        if spread_code:
+            item["spread_code"] = spread_code
+        items.append(item)
+
+    fm = Counter(front_months).most_common(1)[0][0] if front_months else ""
+    bm = Counter(back_months).most_common(1)[0][0] if back_months else ""
+
+    payload = {
+        "updated": today.isoformat(),
+        "front_month": fm,
+        "back_month": bm,
+        "count": len(items),
+        "items": sorted(items, key=lambda x: x["base_code"]),
+    }
+
+    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = OUT_PATH.with_suffix(".json.tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        _json.dump(payload, f, ensure_ascii=False, indent=2)
+    tmp_path.replace(OUT_PATH)  # atomic write
+
+    print(f"  [export] {len(items)} 종목 / front={fm} back={bm} → {OUT_PATH}")
+    return {"items": len(items), "front_month": fm, "back_month": bm}
+
+
 def run_krx_holidays_pipeline() -> dict:
     """
     KRX 휴장일 산출 → DB UPSERT → LENS JSON write.
@@ -1865,8 +2020,19 @@ def main(target_date: date = None, missing_only: bool = False):
         except Exception as idx_err:
             print(f"\n⚠️  지수+선물 단계 오류 (업데이트 결과에는 영향 없음): {idx_err}")
 
-        # 분봉 일배치는 03:00 KST 별도 cron (job_minute_bars_daily)으로 분리됨
-        # — 5:30 daily_update 시간 단축 + 백필과 LS 충돌 시간대 분리
+        # 주식선물 master JSON export (LENS futures_master.json)
+        # — LS t8401 호출 (백필과 충돌 가능 → STOP/CONT 가드)
+        try:
+            paused = _ls_backfill_pause()
+            try:
+                export_futures_master_json()
+            finally:
+                _ls_backfill_resume(paused)
+        except Exception as fm_err:
+            print(f"\n⚠️  futures_master.json export 실패 (업데이트 결과에는 영향 없음): {fm_err}")
+
+        # 분봉 일배치는 04:00 KST 별도 cron (job_minute_bars_daily)으로 분리됨
+        # 주식선물 30초봉은 22:00 KST 별도 cron (job_stockfut_today, t8406 당일만)으로 분리됨
 
     except Exception as e:
         err_msg = traceback.format_exc()
