@@ -72,6 +72,63 @@ def job_weekly_backup():
         logger.error(f"[스케줄러] 백업 실패: {e}")
 
 
+def job_minute_bars_daily():
+    """매일 04:00 KST — 분봉 일배치 (종목/ETF + 지수 + 지수선물).
+    LS 백필 진행 중이면 SIGSTOP → 일배치 → SIGCONT (사용자 정책).
+    주식선물(t8406)은 historical 불가 → 별도 cron(job_stockfut_today) 15:35 KST."""
+    from datetime import timedelta as _td
+    from scripts.daily_update import (
+        run_minute_bars_pipeline,
+        run_index_minute_bars_pipeline,
+        run_futures_minute_bars_pipeline,
+        _ls_backfill_pause, _ls_backfill_resume,
+        get_conn, last_business_day_on_or_before)
+    yesterday = datetime.now(KST).date() - _td(days=1)
+    conn = get_conn()
+    try:
+        target = last_business_day_on_or_before(conn, yesterday)
+    finally:
+        conn.close()
+    logger.info("="*60)
+    logger.info(f"[스케줄러] 분봉 일배치 시작: {datetime.now(KST)} target_date={target}")
+    logger.info("="*60)
+
+    # outer pause: 모든 파이프라인 동안 백필 STOP
+    paused = _ls_backfill_pause()
+    try:
+        for fn, label in [
+            (run_minute_bars_pipeline,         "종목/ETF"),
+            (run_index_minute_bars_pipeline,   "지수"),
+            (run_futures_minute_bars_pipeline, "지수선물"),
+        ]:
+            try:
+                result = fn(target)
+                logger.info(f"[스케줄러] {label} 분봉 일배치 완료: {result}")
+            except Exception as e:
+                logger.error(f"[스케줄러] {label} 분봉 일배치 실패: {e}")
+    finally:
+        _ls_backfill_resume(paused)
+
+
+def job_stockfut_today():
+    """매일 15:35 KST (장 마감 직후) — 주식선물 30초봉 당일 적재 (LS t8406).
+    historical 불가능 → 매일 받지 않으면 영구 손실."""
+    from scripts.daily_update import (run_stockfut_minute_today_pipeline,
+                                       _ls_backfill_pause, _ls_backfill_resume)
+    today = datetime.now(KST).date()
+    logger.info("="*60)
+    logger.info(f"[스케줄러] 주식선물 당일 30초봉 시작: {datetime.now(KST)}")
+    logger.info("="*60)
+    paused = _ls_backfill_pause()
+    try:
+        result = run_stockfut_minute_today_pipeline(today)
+        logger.info(f"[스케줄러] 주식선물 당일 30초봉 완료: {result}")
+    except Exception as e:
+        logger.error(f"[스케줄러] 주식선물 당일 30초봉 실패: {e}")
+    finally:
+        _ls_backfill_resume(paused)
+
+
 def job_quarterly_sector():
     """분기 첫 번째 일요일 03:30 실행되는 FICS 업종 크롤링"""
     from scripts.crawl_sector import main as run_crawl
@@ -128,6 +185,29 @@ def main():
         id="weekly_backup",
         name="주간 DB 백업",
         misfire_grace_time=7200,   # 2시간 내 놓쳐도 재실행
+        coalesce=True,
+        max_instances=1,
+    )
+
+    # 잡 3: 매일 04:00 KST — 분봉 일배치 (종목/ETF + 지수 + 지수선물)
+    scheduler.add_job(
+        job_minute_bars_daily,
+        trigger=CronTrigger(hour=4, minute=0, timezone=KST),
+        id="minute_bars_daily",
+        name="분봉 일배치 (종목/ETF + 지수 + 지수선물)",
+        misfire_grace_time=3600,
+        coalesce=True,
+        max_instances=1,
+    )
+
+    # 잡 5: 매일 22:00 KST (월~금) — 주식선물 30초봉 당일 적재
+    # 22시는 장 마감(15:30) + 사후호가/정산 충분히 끝난 시점 — 데이터 안정
+    scheduler.add_job(
+        job_stockfut_today,
+        trigger=CronTrigger(day_of_week="mon-fri", hour=22, minute=0, timezone=KST),
+        id="stockfut_today",
+        name="주식선물 30초봉 당일 (LS t8406, historical 불가)",
+        misfire_grace_time=3600,
         coalesce=True,
         max_instances=1,
     )

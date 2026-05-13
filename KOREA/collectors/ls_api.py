@@ -136,6 +136,13 @@ class LsApiClient:
             raise LsApiError(f"토큰 발급 실패: {data}", category="other")
         return data["access_token"]
 
+    def _invalidate_token(self):
+        """401 받았을 때 호출 — 다음 _get_token이 새로 발급."""
+        with LsApiClient._token_lock:
+            LsApiClient._token_value    = None
+            LsApiClient._token_expires  = 0.0
+            LsApiClient._token_call_cnt = 0
+
     def _get_token(self) -> str:
         with LsApiClient._token_lock:
             now = time.time()
@@ -267,6 +274,14 @@ class LsApiClient:
             try:
                 with hard_timeout(25):
                     r = self.session.post(url, json=body, headers=headers, timeout=(10, 30))
+                if r.status_code == 401:
+                    # 다른 프로세스가 토큰 발급해서 무효화된 케이스 — 재발급 후 retry
+                    self._invalidate_token()
+                    if attempt < MAX_RETRY:
+                        token = self._get_token()
+                        headers["authorization"] = f"Bearer {token}"
+                        continue
+                    raise LsApiError("HTTP 401 (token refresh attempts exhausted)", category="other")
                 if r.status_code >= 500:
                     if attempt < MAX_RETRY:
                         time.sleep(RETRY_WAIT * attempt)
@@ -296,6 +311,282 @@ class LsApiClient:
                     continue
                 raise LsApiError(str(e), category="other")
         raise LsApiError("max retries exceeded", category="other")
+
+    # ── 공통 helper: TR 호출 (401 자동 refresh + retry) ────────────────────
+    def _post_generic(self, tr_cd: str, url: str, in_block_name: str,
+                      in_block: dict) -> dict:
+        """t8418/t8465/t8406/t8401 등 새 TR용 일반화 POST.
+        401 시 자동 token refresh + retry. 5xx/429/timeout 동일 정책."""
+        token = self._get_token()
+        headers = {
+            "content-type":  "application/json; charset=utf-8",
+            "authorization": f"Bearer {token}",
+            "tr_cd":         tr_cd,
+            "tr_cont":       "N",
+            "tr_cont_key":   "",
+            "mac_address":   "",
+            "Connection":    "close",
+        }
+        body = {in_block_name: in_block}
+        for attempt in range(1, MAX_RETRY + 1):
+            self._throttle()
+            self._refresh_session()
+            try:
+                with hard_timeout(25):
+                    r = self.session.post(url, json=body, headers=headers, timeout=(10, 30))
+                if r.status_code == 401:
+                    self._invalidate_token()
+                    if attempt < MAX_RETRY:
+                        token = self._get_token()
+                        headers["authorization"] = f"Bearer {token}"
+                        continue
+                    raise LsApiError("HTTP 401 (token refresh exhausted)", category="other")
+                if r.status_code >= 500:
+                    if attempt < MAX_RETRY:
+                        time.sleep(RETRY_WAIT * attempt)
+                        continue
+                    raise LsApiError(f"HTTP {r.status_code}", category="http_5xx")
+                if r.status_code == 429:
+                    time.sleep(RETRY_WAIT * attempt)
+                    continue
+                r.raise_for_status()
+                data = r.json()
+                rsp_cd  = data.get("rsp_cd", "")
+                rsp_msg = data.get("rsp_msg", "")
+                if rsp_cd != "00000":
+                    cat = _classify_error(rsp_msg, r.status_code)
+                    if cat == "no_data":
+                        return {"_no_data": True, "rsp_msg": rsp_msg}
+                    raise LsApiError(f"rsp_cd={rsp_cd} msg={rsp_msg}", category=cat)
+                return data
+            except _HardTimeout:
+                if attempt < MAX_RETRY:
+                    time.sleep(RETRY_WAIT)
+                    continue
+                raise LsApiError("hard timeout 25s", category="other")
+            except requests.RequestException as e:
+                if attempt < MAX_RETRY:
+                    time.sleep(RETRY_WAIT)
+                    continue
+                raise LsApiError(str(e), category="other")
+        raise LsApiError("max retries exceeded", category="other")
+
+    # ── t8418: 업종/지수 N분차트 ─────────────────────────────────────────
+    def get_index_intraday_bars(self, shcode: str, target_date: date,
+                                ncnt: int = 0) -> list[dict]:
+        """target_date 1일치 지수 N분봉. ncnt=0(30초) | 1(1분).
+        반환: [{"date","time","open","high","low","close","jdiff_vol","value"}, ...]
+        지수는 종목과 달리 페이징 거의 불필요 — 단일 호출 + 응답 cts_date 페이징 fallback."""
+        url = f"{BASE_URL}/indtp/chart"
+        ymd = target_date.strftime("%Y%m%d")
+        all_bars: list[dict] = []
+        cts_date, cts_time = "", ""
+        seen_keys: set[tuple] = set()
+
+        while True:
+            in_block = {
+                "shcode": shcode, "ncnt": ncnt, "qrycnt": 500, "nday": "0",
+                "sdate": "", "stime": "", "edate": ymd, "etime": "",
+                "cts_date": cts_date, "cts_time": cts_time, "comp_yn": "N"
+            }
+            data = self._post_generic("t8418", url, "t8418InBlock", in_block)
+            if data.get("_no_data"):
+                break
+            bars = data.get("t8418OutBlock1", []) or []
+            if not bars:
+                break
+            all_bars.extend(bars)
+            out = data.get("t8418OutBlock", {}) or {}
+            nd = (out.get("cts_date", "") or "").strip()
+            nt = (out.get("cts_time", "") or "").strip()
+            dates_in = {b.get("date") for b in bars}
+            if ymd not in dates_in:
+                break
+            if not nd or nd < ymd:
+                break
+            key = (nd, nt)
+            if key in seen_keys:
+                break
+            seen_keys.add(key)
+            cts_date, cts_time = nd, nt
+
+        target_bars = [b for b in all_bars if b.get("date") == ymd and b.get("time")]
+        dedup = {b["time"]: b for b in target_bars}
+        return sorted(dedup.values(), key=lambda r: r["time"])
+
+    # ── t8465: 선물옵션 N분차트 (t8415 신 TR, 5/28 deprecate 대비) ─────
+    def get_futures_intraday_bars(self, shcode: str, target_date: date,
+                                  ncnt: int = 0) -> list[dict]:
+        """target_date 1일치 선물 N분봉. ncnt=0(30초) | 1(1분).
+        반환: [{"date","time","open","high","low","close","jdiff_vol","value","openyak"}, ...]"""
+        url = f"{BASE_URL}/futureoption/chart"
+        ymd = target_date.strftime("%Y%m%d")
+        all_bars: list[dict] = []
+        cts_date, cts_time = "", ""
+        seen_keys: set[tuple] = set()
+
+        while True:
+            in_block = {
+                "shcode": shcode, "ncnt": ncnt, "qrycnt": 500, "nday": "0",
+                "sdate": "", "stime": "", "edate": ymd, "etime": "",
+                "cts_date": cts_date, "cts_time": cts_time, "comp_yn": "N"
+            }
+            data = self._post_generic("t8465", url, "t8465InBlock", in_block)
+            if data.get("_no_data"):
+                break
+            bars = data.get("t8465OutBlock1", []) or []
+            if not bars:
+                break
+            all_bars.extend(bars)
+            out = data.get("t8465OutBlock", {}) or {}
+            nd = (out.get("cts_date", "") or "").strip()
+            nt = (out.get("cts_time", "") or "").strip()
+            dates_in = {b.get("date") for b in bars}
+            if ymd not in dates_in:
+                break
+            if not nd or nd < ymd:
+                break
+            key = (nd, nt)
+            if key in seen_keys:
+                break
+            seen_keys.add(key)
+            cts_date, cts_time = nd, nt
+
+        target_bars = [b for b in all_bars if b.get("date") == ymd and b.get("time")]
+        dedup = {b["time"]: b for b in target_bars}
+        return sorted(dedup.values(), key=lambda r: r["time"])
+
+    # ── t8406: 주식선물 분차트 (당일만 — historical 불가) ───────────────
+    def get_stockfut_today_bars(self, focode: str, bgubun: int = 0) -> list[dict]:
+        """주식선물 분봉 (오늘 1일치만). bgubun=0(30초) | 1(1분) | 2/30/60(N분).
+        반환: [{"chetime","price","open","high","low","close","cvolume","volume","value","openyak"}, ...]
+        chetime = HHMMSS, OHLC는 분 봉 단위 (cgubun='M').
+        cnt=900로 1일 전체 충분히 수신 (장 9:00~15:30 = 780개)."""
+        url = f"{BASE_URL}/futureoption/market-data"
+        in_block = {"focode": focode, "cgubun": "M", "bgubun": bgubun, "cnt": 900}
+        data = self._post_generic("t8406", url, "t8406InBlock", in_block)
+        if data.get("_no_data"):
+            return []
+        rows = data.get("t8406OutBlock1", []) or []
+        # 시간순 정렬 (응답은 최신→과거 순)
+        return sorted(rows, key=lambda r: r.get("chetime", ""))
+
+    # ── t8401: 주식선물 마스터 ───────────────────────────────────────────
+    def get_stockfut_master(self) -> list[dict]:
+        """t8401 — 주식선물 전체 마스터.
+        반환: [{"hname","shcode","expcode","basecode"}, ...]
+        shcode = LS 주식선물 코드 (8자), basecode = 기초자산 종목코드 (A + 6자)."""
+        url = f"{BASE_URL}/futureoption/market-data"
+        data = self._post_generic("t8401", url, "t8401InBlock", {"dummy": ""})
+        if data.get("_no_data"):
+            return []
+        return data.get("t8401OutBlock", []) or []
+
+    # ── 변환 helper ────────────────────────────────────────────────────────
+    @staticmethod
+    def index_bar_to_db_row(index_code: str, bar: dict, interval_seconds: int) -> Optional[dict]:
+        """t8418 응답 bar → index_ohlcv_intraday INSERT row."""
+        ymd = bar.get("date", "")
+        hms = bar.get("time", "")
+        if len(ymd) != 8 or not ymd.isdigit() or len(hms) < 6 or not hms[:6].isdigit():
+            return None
+        h, m, s = int(hms[0:2]), int(hms[2:4]), int(hms[4:6])
+        ts = datetime(int(ymd[0:4]), int(ymd[4:6]), int(ymd[6:8]), h, m, s, tzinfo=KST)
+        close = bar.get("close")
+        vol   = bar.get("jdiff_vol")
+        val   = bar.get("value")
+        if close is None or vol is None:
+            return None
+        try:
+            tv = int(val) * 1_000_000 if val is not None else None
+        except (TypeError, ValueError):
+            tv = None
+        return {
+            "index_code":       index_code,
+            "time":             ts,
+            "interval_seconds": interval_seconds,
+            "open":             bar.get("open"),
+            "high":             bar.get("high"),
+            "low":              bar.get("low"),
+            "close":            close,
+            "volume":           vol,
+            "trading_value":    tv,
+        }
+
+    @staticmethod
+    def futures_bar_to_db_row(futures_code: str, bar: dict, interval_seconds: int) -> Optional[dict]:
+        """t8465/t8406 응답 bar → futures_ohlcv_intraday INSERT row.
+        t8465 입력: date+time/OHLC/jdiff_vol/value/openyak
+        t8406 입력: chetime + price/open/high/low + cvolume/volume/value/openyak — 변환 처리"""
+        # 1) t8465 형식 (date + time)
+        if "date" in bar and "time" in bar:
+            ymd = bar.get("date", "")
+            hms = bar.get("time", "")
+            if len(ymd) != 8 or not ymd.isdigit() or len(hms) < 6 or not hms[:6].isdigit():
+                return None
+            h, m, s = int(hms[0:2]), int(hms[2:4]), int(hms[4:6])
+            ts = datetime(int(ymd[0:4]), int(ymd[4:6]), int(ymd[6:8]), h, m, s, tzinfo=KST)
+            close = bar.get("close")
+            vol   = bar.get("jdiff_vol")
+            val   = bar.get("value")
+            openyak = bar.get("openyak")
+            if close is None or vol is None:
+                return None
+        else:
+            # 2) t8406 형식 (chetime, target date 호출자가 지정)
+            return None  # 별도 helper로 변환
+
+        try:
+            tv = int(val) * 1_000_000 if val is not None else None
+        except (TypeError, ValueError):
+            tv = None
+        return {
+            "futures_code":     futures_code,
+            "time":             ts,
+            "interval_seconds": interval_seconds,
+            "open":             bar.get("open"),
+            "high":             bar.get("high"),
+            "low":              bar.get("low"),
+            "close":            close,
+            "volume":           vol,
+            "trading_value":    tv,
+            "open_interest":    openyak,
+        }
+
+    @staticmethod
+    def stockfut_t8406_to_db_row(focode: str, bar: dict, target_date: date,
+                                 interval_seconds: int) -> Optional[dict]:
+        """t8406 응답 bar → futures_ohlcv_intraday INSERT row.
+        bar의 chetime은 HHMMSS (날짜 정보 없음) → target_date와 결합.
+        OHLC는 cgubun='M' bgubun=0 일 때 봉 단위 OHLC 제공."""
+        chetime = bar.get("chetime", "")
+        if len(chetime) < 6 or not chetime[:6].isdigit():
+            return None
+        h, m, s = int(chetime[0:2]), int(chetime[2:4]), int(chetime[4:6])
+        ts = datetime(target_date.year, target_date.month, target_date.day, h, m, s, tzinfo=KST)
+        # t8406은 첫 봉이 하루 누적 vol/value 보임 (현재가 봉) → 봉 내 vol = cvolume
+        cvol = bar.get("cvolume", 0)
+        # t8406은 OHLC가 이미 봉 단위
+        close = bar.get("close")
+        if close in (None, 0):
+            close = bar.get("price")
+        try:
+            cvol_int = int(cvol) if cvol is not None else 0
+        except (TypeError, ValueError):
+            cvol_int = 0
+        # trading_value: t8406 value는 누적 — 우선 None (LP 봉 단위 검증 어려움)
+        return {
+            "futures_code":     focode,
+            "time":             ts,
+            "interval_seconds": interval_seconds,
+            "open":             bar.get("open"),
+            "high":             bar.get("high"),
+            "low":              bar.get("low"),
+            "close":            close,
+            "volume":           cvol_int,
+            "trading_value":    None,  # t8406은 누적이라 봉 단위 변환 불가
+            "open_interest":    bar.get("openyak"),
+        }
 
     def get_intraday_bars(self, code: str, target_date: date) -> tuple[list[dict], int]:
         """
@@ -385,6 +676,69 @@ START_30SEC = date(2026, 4, 27)
 def select_ncnt(target_date: date) -> int:
     """target_date에 따른 ncnt 분기. 30초봉 가용 이후 = 0, 그 이전 = 1."""
     return 0 if target_date >= START_30SEC else 1
+
+
+# ── 만기 식별: 근월 + 다음월물 ────────────────────────────────────────
+def _parse_expiry_yyyymm(hname: str) -> Optional[date]:
+    """hname의 마지막 숫자 토큰 (YYMM 또는 YYYYMM) → 만기일 (해당 월 두번째 목요일).
+    예: 'TKG휴켐스 F 202605' → 2026-05-14 (5월 둘째 목)
+        'F 2606' → 2026-06-11 (6월 둘째 목)"""
+    from calendar import monthcalendar
+    tokens = [t for t in hname.split() if t.isdigit()]
+    if not tokens:
+        return None
+    exp = tokens[-1]
+    if len(exp) == 6:
+        try:
+            yyyy, mm = int(exp[:4]), int(exp[4:])
+        except ValueError:
+            return None
+    elif len(exp) == 4:
+        try:
+            yyyy, mm = 2000 + int(exp[:2]), int(exp[2:])
+        except ValueError:
+            return None
+    else:
+        return None
+    try:
+        # monthcalendar: 각 주가 [Mon..Sun] 7개. 목요일 idx=3
+        thu_days = [w[3] for w in monthcalendar(yyyy, mm) if w[3] != 0]
+        if len(thu_days) < 2:
+            return None
+        return date(yyyy, mm, thu_days[1])
+    except Exception:
+        return None
+
+
+def select_near_next_two(master: list[dict], today: date,
+                         group_key=None) -> list[dict]:
+    """master에서 'F'(단일선물)만 + 만기 ≥ today, group별 근월+다음월물 2개씩.
+    - group_key=None: 전체 1개 그룹
+    - group_key=callable(m: dict)->str: 그룹별 분리 (예: 종목별)"""
+    from collections import defaultdict
+    parsed: list[tuple[str, date, dict]] = []
+    for m in master:
+        hname = m.get("hname", "")
+        if "SP" in hname:        # 스프레드 제외
+            continue
+        # 옵션(콜/풋)은 hname이 'C 2605 ...', 'P 2605 ...' (가격 포함) — 첫 토큰 정확히 'C'/'P'
+        first_tok = hname.strip().split()[0] if hname.strip() else ""
+        if first_tok in ("C", "P"):
+            continue
+        exp = _parse_expiry_yyyymm(hname)
+        if not exp or exp < today:
+            continue
+        key = group_key(m) if group_key else "_"
+        parsed.append((key, exp, m))
+
+    grouped: dict[str, list] = defaultdict(list)
+    for k, exp, m in parsed:
+        grouped[k].append((exp, m))
+    out: list[dict] = []
+    for k in grouped:
+        grouped[k].sort(key=lambda x: x[0])
+        out.extend(m for _, m in grouped[k][:2])
+    return out
 
 
 # ── (보존) t8412: 주식차트(N분) — 검증 자료, 운영 미사용 ──────────────

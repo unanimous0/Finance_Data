@@ -5,6 +5,113 @@
 
 ---
 
+## 2026-05-13 — 지수/지수선물/주식선물 30초봉 통합 (LS API)
+
+### 배경
+- 1분봉 백필 진행 중, 사용자가 발견 — 지수/지수선물/주식선물 30초봉 미수집
+- 기존 `ohlcv_intraday`는 종목/ETF만. `_minute_scope.py`에 지수/선물 코드 미포함
+- LS rolling window 특성상 30초봉은 시간 흐를수록 lookback 못 받게 됨 → 즉시 시작 필요
+
+### 🔬 LS API TR 검증 (`ls_api_full.md` + 8회 STOP/CONT 사이클)
+
+| TR | 그룹 | 용도 | endpoint |
+|----|------|------|----------|
+| **t8418** | [업종] 차트 | 지수 N분차트 (30초/1분) | `/indtp/chart` |
+| **t8424** | [업종] 시세 | 전체업종 마스터 (252개) | `/indtp/market-data` |
+| **t8465** | [선물/옵션] 차트 | 선물 N분차트 (t8415 신 TR — 5/28 deprecate 대비) | `/futureoption/chart` |
+| **t8467** | [선물/옵션] 시세 | 지수선물 마스터 (t8432 신 TR) — KOSPI200 F | `/futureoption/market-data` |
+| **t8435** | [선물/옵션] 시세 | 파생종목 마스터 (gubun=SF → KOSDAQ150 F) | `/futureoption/market-data` |
+| **t8401** | [선물/옵션] 시세 | 주식선물 마스터 (3,080건, 273 종목) | `/futureoption/market-data` |
+| **t8406** | [선물/옵션] 시세 | 주식선물 분차트 (cgubun='M' bgubun=0=30초) — **당일만** | `/futureoption/market-data` |
+
+### Lookback 한계 (실측)
+
+| 데이터 | 30초봉 | 1분봉 |
+|--------|--------|-------|
+| 종목/ETF (t8465) | 16일 한도 | 그 이전 자동 fallback |
+| 지수 (t8418) | **2026-01-02부터** | 2026-01-02부터 (동일) |
+| 지수선물 (t8465) | 2025-10 이전부터 | 2025-07부터 |
+| **주식선물 (t8406)** | **❌ historical 불가 — 당일만** | 동일 |
+
+→ 주식선물은 매일 받지 않으면 영구 손실. 별도 22:00 KST cron 필요.
+
+### ✅ 완료 작업
+
+#### 1. DB 스키마 분리 (`database/schema/index_futures_intraday_schema.sql`)
+- `index_ohlcv_intraday` (PK: index_code, time, interval_seconds) — TimescaleDB hypertable
+- `futures_ohlcv_intraday` (PK: futures_code, time, interval_seconds) + `open_interest` (미결제약정) — TimescaleDB hypertable
+- 종목/ETF는 기존 `ohlcv_intraday` 그대로 (3 테이블 분리 — 일별과 같은 패턴: `ohlcv_daily` / `index_ohlcv_daily` / `futures_ohlcv_daily`)
+
+#### 2. `collectors/ls_api.py` 확장
+- **401 자동 token refresh + retry** — 다중 백필 프로세스 충돌 보호 (`_invalidate_token`)
+- `_post_generic` — 신규 TR 일반화 POST helper (401/5xx/429/timeout 일관 처리)
+- `get_index_intraday_bars(shcode, target_date, ncnt)` — t8418 페이징
+- `get_futures_intraday_bars(shcode, target_date, ncnt)` — t8465 페이징
+- `get_stockfut_today_bars(focode, bgubun)` — t8406 단일 호출 (cnt=900으로 1일 전체)
+- `get_stockfut_master()` — t8401 마스터
+- **만기 식별**: `_parse_expiry_yyyymm` (hname의 YYMM/YYYYMM → 해당 월 두번째 목요일) + `select_near_next_two` (group별 근월+다음월물 자동 식별)
+
+#### 3. `scripts/daily_update.py` — 새 파이프라인 4개
+- `run_index_minute_bars_pipeline(target_date)` — KOSPI200(101) + KOSDAQ150(301) 만 (사용자 정책)
+- `run_futures_minute_bars_pipeline(target_date)` — KOSPI200 F + KOSDAQ150 F **각 근월+다음월물** (총 4개)
+- `run_stockfut_minute_today_pipeline(target_date)` — t8406, **당일만**, basecode별 근월+다음 (273 × 2 ≈ 546)
+- **갭 backfill**: `_gap_business_days(table, code_col, target)` — max(time)+1 ~ target 거래일 sweep (일별 OHLCV와 동일 패턴 — 며칠 누락도 자동 회복)
+- **STOP/CONT 정책**: `_ls_backfill_pause/resume` — 백필 진행 중에도 일배치 우선. 백필 PID 자동 발견 (`pgrep -f backfill_*.py`), SIGSTOP → 일배치 → SIGCONT
+
+#### 4. 백필 스크립트 신설
+- `scripts/backfill_index_minute_bars.py` (지수, 2026-01-02부터)
+- `scripts/backfill_futures_minute_bars.py` (지수선물, 2026-01-02부터)
+- 주식선물은 historical 불가 → 백필 스크립트 없음
+
+#### 5. `schedulers/daily_scheduler.py` 변경
+- `job_minute_bars_daily` (04:00 KST) — 4 파이프라인 호출 (종목/ETF + 지수 + 지수선물). outer pause/resume.
+- `job_stockfut_today` (**22:00 KST 평일**) 신규 — 주식선물 t8406 당일 적재 (장 마감 후 사후호가/정산 끝난 시점)
+
+### 🔑 핵심 결정 — 근월+다음월물만
+
+거래량 분석 결과 **근월물 99.9% 집중**. 원월물 5개는 거래 거의 0:
+
+| futures_code | 만기 | row | 누적 거래량 |
+|---|---|---|---|
+| A0166000 | F 2606 (근월) | 31,500 | **1,597,836** |
+| A0169000 | F 2609 (다음) | 31,500 | 1,585 |
+| A016C000 | F 2612 | 31,500 | 57 |
+| 나머지 4개 | — | — | 0~10 |
+
+→ **근월+다음월물만** 유지 정책. 매일 master 호출 시 만기 임박하면 자동 다음으로 이동 (`select_near_next_two`).
+
+### 5/28 LS deprecate 공지 대비
+
+기존 `t8415`/`t8432` 등 신 TR로 마이그 (가이드 라인 14-36 참조):
+- t8415 → **t8465** (선물/옵션 N분차트)
+- t8432 → **t8467** (지수선물 마스터)
+- t8414 → t8464 (틱)
+- t8416 → t8466 (일주월)
+
+신 TR은 가격 필드 자릿수 확대 (다른 InBlock/필드 동일).
+
+### 운영 정책
+
+```
+04:00 KST  daily_minute_bars  종목/ETF + 지수 + 지수선물 (갭 backfill, STOP/CONT)
+22:00 KST  stockfut_today     주식선물 t8406 (당일만, historical 불가)
+05:30 KST  daily_update       OHLCV/수급/외인 + 배당 + LENS export (인포맥스 + DART)
+일03:00    weekly_backup      DB 백업
+```
+
+### 알려진 한계
+- **주식선물 historical 불가** — 매일 22:00 cron 미실행 시 그날 영구 손실
+- 1/2~3월 시점의 진짜 근월(F 2603)은 만기 지나서 t8467 master에서 안 잡힘 → 그 시점 데이터는 받을 수 없음 (현재 master active만 받히는 LS 한계)
+- t8418 (지수)는 종목과 달리 **2026-01-02 이전 lookback 불가** — 그 이전 데이터 영구 없음
+
+### 백필 진행
+- KOSPI200 F (7개 만기, 87일) — 2026-05-13 14:22 완료. 이후 5개 (근월/다음 외) DB DELETE — 195k row 정리
+- KOSDAQ150 F + 신코드(4개) 호출 — 진행 중 (chain 자동)
+- 지수 (101, 301, 87일) — 대기
+- 1분봉 백필 (3/6~4/26, 19.85% STOPPED) — chain 끝나면 SIGCONT (5/15 10시 경 최종 완료 예상)
+
+---
+
 ## 2026-05-12 - 지수/섹터/지수선물/주식선물 일별 OHLCV (인포맥스)
 
 ### 배경

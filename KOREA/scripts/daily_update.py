@@ -1460,29 +1460,175 @@ def _parse_ymd_daily(v) -> date:
     return date(int(s[0:4]), int(s[4:6]), int(s[6:8]))
 
 
+def _backfill_pids() -> list[int]:
+    """LS 백필 프로세스 PID list. (backfill_30sec_bars / backfill_index / backfill_futures)"""
+    import subprocess
+    pids: list[int] = []
+    for pat in ("backfill_30sec_bars.py", "backfill_index_minute_bars.py",
+                "backfill_futures_minute_bars.py"):
+        try:
+            r = subprocess.run(["pgrep", "-f", pat], capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                pids.extend(int(p) for p in r.stdout.strip().splitlines() if p.strip().isdigit())
+        except Exception:
+            pass
+    return pids
+
+
+def _ls_backfill_pause():
+    """진행 중인 모든 LS 백필 프로세스 SIGSTOP. CONT는 수동 호출."""
+    import os, signal
+    paused = []
+    for pid in _backfill_pids():
+        try:
+            os.kill(pid, signal.SIGSTOP)
+            paused.append(pid)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            print(f"  [WARN] PID {pid} STOP 권한 없음")
+    if paused:
+        print(f"  [LS pause] STOPPED PIDs: {paused}")
+    return paused
+
+
+def _ls_backfill_resume(pids: list[int]):
+    import os, signal
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGCONT)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            pass
+    if pids:
+        print(f"  [LS resume] CONT'd PIDs: {pids}")
+
+
+def _last_loaded_date(table: str, code_col: str, code: str = None) -> date | None:
+    """주어진 테이블/코드의 마지막 적재일 (KST) 반환. 없으면 None."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            if code:
+                cur.execute(
+                    f"SELECT MAX((time AT TIME ZONE 'Asia/Seoul')::date) "
+                    f"FROM {table} WHERE {code_col} = %s",
+                    (code,))
+            else:
+                cur.execute(f"SELECT MAX((time AT TIME ZONE 'Asia/Seoul')::date) FROM {table}")
+            row = cur.fetchone()
+            return row[0] if row and row[0] else None
+    finally:
+        conn.close()
+
+
+def _gap_business_days(table: str, code_col: str, target_date: date) -> list[date]:
+    """table 마지막 적재일+1 ~ target_date 거래일 list (휴장일 제외)."""
+    last = _last_loaded_date(table, code_col)
+    start = (last + timedelta(days=1)) if last else date(2026, 1, 2)
+    if start > target_date:
+        return []
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT time FROM ohlcv_daily WHERE time BETWEEN %s AND %s ORDER BY time",
+                (start, target_date),
+            )
+            return [r[0] for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
 def run_minute_bars_pipeline(target_date: date) -> dict:
     """
-    분봉 일배치 — target_date 1일치 sweep (LS t8452).
-    target_date >= 2026-04-27: 30초봉 (ncnt=0)
-    그 이전: 1분봉 (ncnt=1)
-    스코프: ≈ 2,000 종목 / 종목당 ~1.5초 (페이징 평균) → 약 50분
+    분봉 일배치 (종목/ETF, LS t8452).
+    갭 backfill: ohlcv_intraday max(time)+1 ~ target_date 거래일 sweep.
+    백필 동시 진행 시 SIGSTOP → 일배치 → SIGCONT (사용자 정책).
     """
     from collectors.ls_api import LsApiClient, LsApiError
     from scripts._minute_scope import fetch_minute_scope
     from scripts.backfill_30sec_bars import insert_bars
 
     print("\n" + "=" * 70)
-    print("  ⏱️  분봉 일배치 (LS t8452)")
+    print("  ⏱️  분봉 일배치 — 종목/ETF (LS t8452)")
     print("=" * 70)
 
-    conn = get_conn()
+    paused_pids = _ls_backfill_pause()
     try:
-        codes = fetch_minute_scope(conn)
-        print(f"  [스코프] {len(codes)} 종목 / target_date={target_date}")
+        biz_days = _gap_business_days("ohlcv_intraday", "stock_code", target_date)
+        if not biz_days:
+            print(f"  [skip] 갭 0일 (target_date={target_date})")
+            return {"days": 0, "rows": 0}
+
+        conn = get_conn()
+        try:
+            codes = fetch_minute_scope(conn)
+            print(f"  [스코프] {len(codes)} 종목 × {len(biz_days)} 일")
+        finally:
+            conn.close()
+
+        client = LsApiClient()
+        conn = get_conn()
+        try:
+            total_rows = 0
+            empty = 0
+            errors = []
+            from time import time as now
+            t0 = now()
+            for di, day in enumerate(biz_days, 1):
+                print(f"  ▶ day {di}/{len(biz_days)} = {day}", flush=True)
+                for i, code in enumerate(codes, 1):
+                    try:
+                        bars, interval = client.get_intraday_bars(code, day)
+                        if not bars:
+                            empty += 1
+                            continue
+                        n = insert_bars(conn, code, bars, interval)
+                        total_rows += n
+                    except LsApiError as e:
+                        errors.append((code, day, e.category))
+                    except Exception as e:
+                        errors.append((code, day, f"unexpected:{type(e).__name__}"))
+                    if i % 500 == 0:
+                        elapsed = now() - t0
+                        print(f"    [{i}/{len(codes)}] 적재 {total_rows:,}row / 빈 {empty} / 에러 {len(errors)}", flush=True)
+
+            elapsed = now() - t0
+            print(f"\n  [완료] {len(biz_days)}일 / 소요 {elapsed/60:.1f}분 / 적재 {total_rows:,}row / 빈 {empty} / 에러 {len(errors)}")
+            if errors:
+                from collections import Counter
+                print(f"    에러 카테고리: {dict(Counter(e[2] for e in errors))}")
+            return {"days": len(biz_days), "stocks": len(codes), "rows": total_rows, "empty": empty, "errors": len(errors)}
+        finally:
+            conn.close()
     finally:
-        conn.close()
+        _ls_backfill_resume(paused_pids)
+
+
+def run_index_minute_bars_pipeline(target_date: date) -> dict:
+    """
+    지수 30초봉 일배치 (LS t8418, /indtp/chart).
+    갭 backfill: index_ohlcv_intraday max(time)+1 ~ target_date.
+    스코프: KOSPI200(101) + KOSDAQ150(301) 만 (사용자 정책).
+    """
+    from collectors.ls_api import LsApiClient, LsApiError
+    from scripts.backfill_index_minute_bars import insert_bars
+
+    print("\n" + "=" * 70)
+    print("  ⏱️  지수 분봉 일배치 (LS t8418)")
+    print("=" * 70)
+
+    biz_days = _gap_business_days("index_ohlcv_intraday", "index_code", target_date)
+    if not biz_days:
+        print(f"  [skip] 갭 0일")
+        return {"days": 0, "rows": 0}
 
     client = LsApiClient()
+    codes = ["101", "301"]  # KOSPI200, KOSDAQ150
+    print(f"  [스코프] {len(codes)} 지수 (KOSPI200, KOSDAQ150) × {len(biz_days)} 일")
+
     conn = get_conn()
     try:
         total_rows = 0
@@ -1490,29 +1636,157 @@ def run_minute_bars_pipeline(target_date: date) -> dict:
         errors = []
         from time import time as now
         t0 = now()
-        for i, code in enumerate(codes, 1):
+        for di, day in enumerate(biz_days, 1):
+            print(f"  ▶ day {di}/{len(biz_days)} = {day}", flush=True)
+            for i, code in enumerate(codes, 1):
+                try:
+                    bars = client.get_index_intraday_bars(code, day, ncnt=0)
+                    if not bars:
+                        empty += 1
+                        continue
+                    n = insert_bars(conn, code, bars, 30)
+                    total_rows += n
+                except LsApiError as e:
+                    errors.append((code, day, e.category))
+                except Exception as e:
+                    errors.append((code, day, f"unexpected:{type(e).__name__}"))
+                if i % 100 == 0:
+                    print(f"    [{i}/{len(codes)}] 적재 {total_rows:,}row", flush=True)
+
+        elapsed = now() - t0
+        print(f"\n  [완료] {len(biz_days)}일 / 소요 {elapsed/60:.1f}분 / 적재 {total_rows:,}row / 빈 {empty} / 에러 {len(errors)}")
+        return {"days": len(biz_days), "indices": len(codes), "rows": total_rows, "empty": empty, "errors": len(errors)}
+    finally:
+        conn.close()
+
+
+def run_futures_minute_bars_pipeline(target_date: date) -> dict:
+    """
+    지수선물 30초봉 일배치 (LS t8465).
+    갭 backfill: futures_ohlcv_intraday max(time)+1 ~ target_date.
+    스코프: KOSPI200 F + KOSDAQ150 F 중 근월+다음월물만 (4개, 매일 자동 갱신).
+    주식선물(t8406)은 별도 함수 (당일만, run_stockfut_minute_today_pipeline).
+    """
+    from collectors.ls_api import LsApiClient, LsApiError
+    from scripts.backfill_futures_minute_bars import fetch_index_futures_master, insert_bars
+
+    print("\n" + "=" * 70)
+    print("  ⏱️  지수선물 분봉 일배치 (LS t8465, 근월+다음월물만)")
+    print("=" * 70)
+
+    biz_days = _gap_business_days("futures_ohlcv_intraday", "futures_code", target_date)
+    if not biz_days:
+        print(f"  [skip] 갭 0일")
+        return {"days": 0, "rows": 0}
+
+    client = LsApiClient()
+    pairs = fetch_index_futures_master(client)
+    codes = [c for c, _ in pairs]
+    print(f"  [스코프] {len(codes)} 선물 × {len(biz_days)} 일")
+    for sh, hn in pairs:
+        print(f"     {sh:10s} {hn}")
+
+    conn = get_conn()
+    try:
+        total_rows = 0
+        empty = 0
+        errors = []
+        from time import time as now
+        t0 = now()
+        for di, day in enumerate(biz_days, 1):
+            print(f"  ▶ day {di}/{len(biz_days)} = {day}", flush=True)
+            for i, code in enumerate(codes, 1):
+                try:
+                    bars = client.get_futures_intraday_bars(code, day, ncnt=0)
+                    if not bars:
+                        empty += 1
+                        continue
+                    n = insert_bars(conn, code, bars, 30)
+                    total_rows += n
+                except LsApiError as e:
+                    errors.append((code, day, e.category))
+                except Exception as e:
+                    errors.append((code, day, f"unexpected:{type(e).__name__}"))
+
+        elapsed = now() - t0
+        print(f"\n  [완료] {len(biz_days)}일 / 소요 {elapsed/60:.1f}분 / 적재 {total_rows:,}row / 빈 {empty} / 에러 {len(errors)}")
+        return {"days": len(biz_days), "futures": len(codes), "rows": total_rows, "empty": empty, "errors": len(errors)}
+    finally:
+        conn.close()
+
+
+def run_stockfut_minute_today_pipeline(target_date: date) -> dict:
+    """
+    주식선물 30초봉 일배치 — **당일만** (LS t8406, historical 불가).
+    target_date가 오늘 아니면 skip (어제 데이터 받기 불가능).
+    스코프: t8401 master, 'F'(단일선물)만, 만기 미경과만.
+    """
+    from collectors.ls_api import LsApiClient, LsApiError
+    import psycopg2.extras
+
+    print("\n" + "=" * 70)
+    print("  ⏱️  주식선물 분봉 일배치 (LS t8406, 당일만)")
+    print("=" * 70)
+
+    today_kst = datetime.now(KST).date()
+    if target_date != today_kst:
+        print(f"  [skip] target_date={target_date} ≠ 오늘({today_kst}) — t8406 historical 불가")
+        return {"skipped": True, "reason": "not_today"}
+
+    from collectors.ls_api import select_near_next_two
+    client = LsApiClient()
+    master = client.get_stockfut_master()
+    # 종목별(basecode) 근월+다음월물만
+    actives = select_near_next_two(master, target_date,
+                                   group_key=lambda m: m.get("basecode", ""))
+    print(f"  [스코프] master {len(master)} → 활성 {len(actives)} 주식선물 (종목당 최대 2 만기)")
+
+    INSERT_SQL = """
+    INSERT INTO futures_ohlcv_intraday
+        (futures_code, time, interval_seconds, open, high, low, close, volume, trading_value, open_interest)
+    VALUES %s
+    ON CONFLICT (futures_code, time, interval_seconds) DO UPDATE SET
+        open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low,
+        close = EXCLUDED.close, volume = EXCLUDED.volume,
+        trading_value = EXCLUDED.trading_value,
+        open_interest = EXCLUDED.open_interest
+    """
+
+    conn = get_conn()
+    try:
+        total_rows = 0
+        empty = 0
+        errors = []
+        from time import time as now
+        t0 = now()
+        for i, m in enumerate(actives, 1):
+            sh = m.get("shcode", "")
             try:
-                bars, interval = client.get_intraday_bars(code, target_date)
+                bars = client.get_stockfut_today_bars(sh, bgubun=0)  # 30초봉
                 if not bars:
                     empty += 1
                     continue
-                n = insert_bars(conn, code, bars, interval)
-                total_rows += n
+                rows = [LsApiClient.stockfut_t8406_to_db_row(sh, b, target_date, 30) for b in bars]
+                rows = [r for r in rows if r and r["close"] not in (None, 0)]
+                if not rows:
+                    continue
+                values = [(r["futures_code"], r["time"], r["interval_seconds"],
+                           r["open"], r["high"], r["low"], r["close"],
+                           r["volume"], r["trading_value"], r["open_interest"]) for r in rows]
+                with conn:
+                    with conn.cursor() as cur:
+                        psycopg2.extras.execute_values(cur, INSERT_SQL, values, page_size=500)
+                total_rows += len(rows)
             except LsApiError as e:
-                errors.append((code, e.category))
+                errors.append((sh, e.category))
             except Exception as e:
-                errors.append((code, f"unexpected:{type(e).__name__}"))
-            if i % 500 == 0:
-                elapsed = now() - t0
-                eta = (len(codes) - i) / (i / elapsed) if elapsed else 0
-                print(f"    [{i}/{len(codes)}] 적재 {total_rows:,}row / 빈 {empty} / 에러 {len(errors)} / ETA {eta:.0f}s")
+                errors.append((sh, f"unexpected:{type(e).__name__}"))
+            if i % 50 == 0:
+                print(f"    [{i}/{len(actives)}] 적재 {total_rows:,}row", flush=True)
 
         elapsed = now() - t0
-        print(f"\n  [완료] 소요 {elapsed/60:.1f}분 / 적재 {total_rows:,}row / 빈응답 {empty} / 에러 {len(errors)}")
-        if errors:
-            from collections import Counter
-            print(f"    에러 카테고리: {dict(Counter(e[1] for e in errors))}")
-        return {"stocks": len(codes), "rows": total_rows, "empty": empty, "errors": len(errors)}
+        print(f"\n  [완료] 소요 {elapsed/60:.1f}분 / 적재 {total_rows:,}row / 빈 {empty} / 에러 {len(errors)}")
+        return {"actives": len(actives), "rows": total_rows, "empty": empty, "errors": len(errors)}
     finally:
         conn.close()
 
@@ -1591,11 +1865,8 @@ def main(target_date: date = None, missing_only: bool = False):
         except Exception as idx_err:
             print(f"\n⚠️  지수+선물 단계 오류 (업데이트 결과에는 영향 없음): {idx_err}")
 
-        # 30초봉 일배치 (분봉 스코프 ≈ 2,500~2,700 종목)
-        try:
-            run_minute_bars_pipeline(result["end_date"])
-        except Exception as min_err:
-            print(f"\n⚠️  30초봉 일배치 오류 (업데이트 결과에는 영향 없음): {min_err}")
+        # 분봉 일배치는 03:00 KST 별도 cron (job_minute_bars_daily)으로 분리됨
+        # — 5:30 daily_update 시간 단축 + 백필과 LS 충돌 시간대 분리
 
     except Exception as e:
         err_msg = traceback.format_exc()

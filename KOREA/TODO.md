@@ -1,7 +1,67 @@
 # 📝 TODO - 작업 목록
 
-> **마지막 업데이트**: 2026-05-12
-> **현재 Phase**: Phase 4 + Phase 5(배당) + KRX 휴장일 + KOSPI200/KOSDAQ150 SCD2 + ETF 일별 스냅샷 + **지수/지수선물/주식선물 일별** + **Phase 6 분봉 진행 중** / 분봉 시스템: 30초봉 ✅ / 1분봉 백필 중 (ETA 5/14 06시)
+> **마지막 업데이트**: 2026-05-13
+> **현재 Phase**: Phase 4 + Phase 5(배당) + KRX 휴장일 + KOSPI200/KOSDAQ150 SCD2 + ETF 일별 스냅샷 + 지수/지수선물/주식선물 일별 + **Phase 6 분봉**: 종목/ETF 30초봉 ✅ / 1분봉 백필 중 + **지수/지수선물/주식선물 30초봉 통합 (5/13)**
+
+---
+
+## 🛠️ 백필 완료 후 진행 (1분봉 백필 ETA 2026-05-15 10시 경 예상 — chain 끝나면 SIGCONT)
+
+- [ ] **LS API token fetch 실패 retry** (`collectors/ls_api.py`)
+  - 다음날 06:55~07:00 KST 만료 시점에 _fetch_token 실패하면 _token_value=None 보존 → 이후 호출 모두 실패
+  - 수정: fetch 실패 시 raise + 다음 호출에서 재시도 가능하게 (현재 코드도 부분적으로 OK이지만 명시적 retry 권장)
+- [ ] **run_update 외부 except 보호** (`scripts/daily_update.py` run_update 543~)
+  - DB 연결 끊기면 main()에서 후속 STEP 모두 skip. main()에 try/except 한 겹 더
+- [ ] **신규 주식선물 자동 매핑 로직** (현재 수동)
+  - 매주/월 신규 주식선물 추가 시 LENS json sync 또는 LS t8401 호출 → futures_underlyings 자동 보강
+  - daily_update의 적절한 STEP에 추가
+- [ ] **5/28 LS deprecate 마이그 검증**
+  - 신 TR 적용: t8415→t8465 ✅ / t8432→t8467 ✅ (코드 변경 완료, 5/28 이후 실제 동작 검증)
+  - 미마이그: 종목 t8452는 아직 구 TR — t8451/t8453/t8454로 검토 필요
+
+## 🆕 2026-05-13 — 지수/지수선물/주식선물 30초봉 통합
+
+- [x] **DB 백업 권한 fix** ✅ (TimescaleDB chunks SELECT to una0)
+- [x] **분봉 STEP 분리** — daily_update에서 빠짐, 04:00 KST 별도 cron으로 분리, 백필 진행 중 자동 skip 가드
+- [x] **LS API TR 검증 — 8회 STOP/CONT 사이클** ✅
+  - t8418 (업종/지수 N분), t8465 (선물 N분, t8415 신 TR), t8406 (주식선물 분, 당일만), t8401 (주식선물 마스터), t8424 (전체업종), t8467 (지수선물 마스터), t8435 (파생 마스터)
+  - lookback 한계 측정: 지수=2026-01-02부터, 지수선물=2025-10 이전부터, 주식선물=당일만
+- [x] **DB 스키마 분리** ✅ (`index_ohlcv_intraday`, `futures_ohlcv_intraday` 신설)
+- [x] **collectors/ls_api.py 확장** ✅
+  - 401 자동 token refresh + retry (`_invalidate_token`)
+  - 새 TR 메서드 5개 (t8418/t8465/t8406/t8401/_post_generic)
+  - 만기 식별 (`_parse_expiry_yyyymm`, `select_near_next_two`) — group별 근월+다음월물 자동 식별
+- [x] **새 파이프라인 4개** (`scripts/daily_update.py`) ✅
+  - `run_index_minute_bars_pipeline` (KOSPI200 + KOSDAQ150)
+  - `run_futures_minute_bars_pipeline` (KOSPI200 F + KOSDAQ150 F, 각 근월/다음월물)
+  - `run_stockfut_minute_today_pipeline` (주식선물 t8406, 당일만, 273 종목 × 근월/다음)
+  - 갭 backfill 로직: `_gap_business_days(table, code_col, target)` — 며칠 누락도 자동 회복
+  - STOP/CONT 정책: `_ls_backfill_pause/resume` — 백필 진행 중에도 일배치 우선
+- [x] **백필 스크립트 신설** ✅ (`backfill_index_minute_bars.py`, `backfill_futures_minute_bars.py`)
+- [x] **scheduler 변경** ✅ (`schedulers/daily_scheduler.py`)
+  - `job_minute_bars_daily` (04:00 KST) — 4 파이프라인 + outer STOP/CONT
+  - `job_stockfut_today` (**22:00 KST 평일**) 신규 — 주식선물 당일 적재
+- [-] **백필 chain 진행 중** — KOSPI200 F ✅ / KOSDAQ150 F 진행 중 / 지수 (101, 301) 대기 / 1분봉 CONT 대기
+- [-] **1분봉 백필 재시작** — 3/6~4/26, 19.85% STOPPED, chain 끝나면 SIGCONT, 최종 완료 5/15 10시 경 예상
+
+### 데이터 정책 (확정)
+- 지수: KOSPI200 (101) + KOSDAQ150 (301) 만
+- 지수선물: KOSPI200 F + KOSDAQ150 F **각 근월+다음월물만** (총 4개, 매일 자동 갱신)
+- 주식선물: 종목별 근월+다음월물 (273 × 2 ≈ 546, basecode 기준 group)
+- 만기 식별: 매일 master 호출 + `select_near_next_two` → 만기 임박 시 자동 다음월물 추가
+
+### 운영 정책
+```
+04:00 KST  daily_minute_bars  종목/ETF + 지수 + 지수선물 (갭 backfill, STOP/CONT)
+05:30 KST  daily_update       OHLCV/수급/외인 + 배당 + LENS export (인포맥스 + DART)
+22:00 KST  stockfut_today     주식선물 t8406 당일 (historical 불가 — 매일 받기 필수)
+일03:00    weekly_backup      DB 백업
+```
+
+### 알려진 한계
+- 주식선물 historical 불가 → 22:00 cron 미실행 시 그날 영구 손실
+- 1/2~3월 시점 진짜 근월(F 2603) 데이터는 master에서 안 잡힘 (LS master active만 반환)
+- 지수 (t8418)는 2026-01-02 이전 lookback 불가 — 그 이전 데이터 영구 없음
 
 ---
 
