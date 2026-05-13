@@ -62,7 +62,12 @@ def _alarm_handler(signum, frame):
 
 @contextmanager
 def hard_timeout(seconds: int):
-    """signal.alarm으로 강제 timeout. main thread에서만 동작."""
+    """signal.alarm으로 강제 timeout.
+    signal handler는 메인 스레드에서만 설치 가능 → worker thread(APScheduler 등)에서는 no-op.
+    그 경우 requests 자체 timeout만 의존."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
     old = signal.signal(signal.SIGALRM, _alarm_handler)
     signal.alarm(seconds)
     try:
