@@ -204,8 +204,8 @@ class LsApiClient:
             self._throttle()
             self._refresh_session()  # 매 호출마다 새 TCP — CLOSE_WAIT 누적 방지
             try:
-                with hard_timeout(25):  # OS-level kill switch (LS 부하 케이스 16초 응답 커버)
-                    r = self.session.post(url, json=body, headers=headers, timeout=(10, 30))
+                with hard_timeout(10):  # OS-level kill switch (5xx 빠른 fail → retry로 다음 호출로)
+                    r = self.session.post(url, json=body, headers=headers, timeout=(5, 15))
                 if r.status_code >= 500:
                     if attempt < MAX_RETRY:
                         time.sleep(RETRY_WAIT * attempt)
@@ -277,8 +277,8 @@ class LsApiClient:
             self._throttle()
             self._refresh_session()
             try:
-                with hard_timeout(25):
-                    r = self.session.post(url, json=body, headers=headers, timeout=(10, 30))
+                with hard_timeout(10):
+                    r = self.session.post(url, json=body, headers=headers, timeout=(5, 15))
                 if r.status_code == 401:
                     # 다른 프로세스가 토큰 발급해서 무효화된 케이스 — 재발급 후 retry
                     self._invalidate_token()
@@ -337,8 +337,8 @@ class LsApiClient:
             self._throttle()
             self._refresh_session()
             try:
-                with hard_timeout(25):
-                    r = self.session.post(url, json=body, headers=headers, timeout=(10, 30))
+                with hard_timeout(10):
+                    r = self.session.post(url, json=body, headers=headers, timeout=(5, 15))
                 if r.status_code == 401:
                     self._invalidate_token()
                     if attempt < MAX_RETRY:
@@ -783,8 +783,8 @@ class _DeprecatedT8412:
             self._throttle()
             self._refresh_session()  # 매 호출마다 새 TCP — CLOSE_WAIT 누적 방지
             try:
-                with hard_timeout(25):  # OS-level kill switch (LS 부하 케이스 16초 응답 커버)
-                    r = self.session.post(url, json=body, headers=headers, timeout=(10, 30))
+                with hard_timeout(10):  # OS-level kill switch (5xx 빠른 fail → retry로 다음 호출로)
+                    r = self.session.post(url, json=body, headers=headers, timeout=(5, 15))
                 if r.status_code >= 500:
                     if attempt < MAX_RETRY:
                         time.sleep(RETRY_WAIT * attempt)
