@@ -5,6 +5,82 @@
 
 ---
 
+## 2026-05-14 — 분봉 일배치 안정화 (운영 사고 + 5중 구조 개선)
+
+### 운영 사고 타임라인
+
+| 시각 (KST) | 사건 |
+|---|---|
+| 5/13 22:00 | 첫 `job_stockfut_today` cron 실행 → **34ms 만에 실패** (`signal only works in main thread`) |
+| 5/13 22:09 | 메인 스레드에서 수동 보충 — 546 코드 / 432,266 row / 에러 0 / 10.2분 |
+| 5/13 23:19 | scheduler 재시작 (hard_timeout fix 적용) |
+| 5/14 04:00 | `job_minute_bars_daily` 트리거 → 5/12 갭 처리 시작 |
+| 5/14 04:00~10:13 | LS API **5xx 다발 (3.4%)** → retry 누적 → 6시간 돌고 5/12 526/2,011 코드만 적재 |
+| 5/14 08:13 | daily_update의 `export_futures_master_json()` HTTP 500 (분봉 일배치와 LS 동시 hit) |
+| 5/14 10:13 | scheduler 강제 종료 → 분봉 일배치 중단 → 5/12 1,485 종목 + 5/13 전체 누락 |
+| 5/14 11:11~13:38 | 수동 보충 — 5/12 + 5/13 종목/ETF (4,032 호출) **5xx 0건 / 154분** |
+
+→ **새벽 vs 한낮 LS API 안정성 35배 차이** 측정 (3.4% → 0%)
+
+### 🔧 5중 구조 개선 (커밋 6개)
+
+#### 1. `hard_timeout` worker thread no-op (`3071fd2`)
+**문제**: APScheduler worker thread에서 `signal.signal(SIGALRM)` 즉시 실패.
+**수정**: `collectors/ls_api.py:64` worker thread면 no-op (requests timeout만 의존). 메인 스레드(수동 실행/백필)에서는 기존 동작 유지.
+
+#### 2. `futures_master.json` export 구조 분리 (`df54abc`)
+**문제**: scheduler 프로세스 안에서 04:00 분봉 일배치(LS API)와 05:30 daily_update의 export(LS t8401)가 동시 실행 → 5xx. `_ls_backfill_pause`는 외부 프로세스만 STOP, 자기 자신은 STOP 못함 (deadlock).
+**수정**: `daily_update.main()`에서 export 호출 제거 → `daily_update`는 LS API 호출 0건. `job_minute_bars_daily` 끝(outer pause/resume 안쪽)에 export 추가. **모든 LS-using 작업이 한 cron job으로 일원화 → 충돌 불가능**.
+
+#### 3. `backfill_index_minute_bars` 정책 정합 (`20b5874`)
+**문제**: 스크립트가 `t8424` 전체업종 master(252개) 받음 → 5/13 보충 시 `run_index_minute_bars_pipeline`의 KOSPI200/KOSDAQ150 hardcoded 정책과 불일치 → 250개 불필요 지수 124,500 row 사후 삭제 필요.
+**수정**: 기본 `["101", "301"]`만. `--codes` override + `--all-master` 예외 플래그.
+
+#### 4. cron 04:00 → 23:00 KST (`86eaa70`)
+**3개 에이전트 병렬 토의 결과** (옵션 1·2·3 분석):
+- 옵션 1 권고: 23:00 — 22:00 stockfut와 1시간 안전 마진 + 데이터 무결성 (정규장 마감 + 시간외 18:00 종료 후 5시간) + 사용자 활동 시간대
+- DB 검증: t8452 응답에 시간외 단일가(16~18시) 봉 미포함 → 정규장만 받음 (사용자 요구 부합)
+- 효과: D-1 처리 (이전 04:00은 ohlcv_daily 미적재로 D-2 처리)
+
+#### 5. LS API 단축 timeout (`262875c`)
+- `hard_timeout` 25→10s, `requests timeout` (10,30)→(5,15) — 4 호출 사이트
+- 효과: 5xx 1건당 묶임 ~120s → ~60s (2x 단축)
+- 정상 호출 1.05s 평균이라 4.7배 안전 마진. 토큰 fetch(critical low-frequency)는 (15s, (10,30)) 유지.
+
+#### 6. 갭 fill 종목별 max(time)으로 전환 (`751d872`)
+**문제**: `_gap_business_days`가 테이블 전체 max(time)만 봄 → 분봉 일배치 도중 죽으면 일부 종목만 적재된 날짜가 done 처리 → 누락 종목 영원히 회복 안 됨 (5/14 5/12 1,485개 누락 사례).
+**수정**: `_per_stock_gap(table, code_col, codes, target_date)` 신규 — bulk 1쿼리로 종목별 max(time) (인덱스 `(stock_code, time DESC)` 활용 ~수십 ms). `run_minute_bars_pipeline` 순회 day-first → **code-first**: 중단 시 완료 종목은 전부 채워지고 미완료 종목은 다음 실행이 자연 재개.
+**비용**: 종목별 쿼리 ~2초/실행 (무시 가능).
+
+### 📊 데이터 영향
+- 종목/ETF 30초봉: 5/8, 5/11, 5/12, 5/13 모두 2,016 코드 적재 완료 ✅
+- 지수 30초봉: 5/13 KOSPI200(101) + KOSDAQ150(301) 각 500 row ✅
+- 지수선물 30초봉: 5/13 KP F + KQ F 각 근/원월물 4 contracts × 1,000 row ✅
+- 주식선물 30초봉: 5/13 546 코드 / 432,432 row ✅ (수동 보충)
+- 5/13 불필요 지수 249개 삭제: 124,500 row
+
+### 📌 다음 작업
+- 5/14 23:00 KST 첫 새 cron 실행 검증 (모니터 `b44if6de0` watch 중)
+- 옵션 2 후속: 한낮 LS latency p95/p99 1주일 측정 → false-fail 발생 시 timeout 상수 조정
+- ETF 청산 종목 blacklist (현재 수동 → 자동 detection: 연속 N일 empty_response → is_active=FALSE)
+
+### 🎓 배운 점
+- **APScheduler 서비스 설계**: `signal.SIGALRM` 등 main-thread-only API는 무조건 worker thread에서 깨짐. 라이브러리에서 사용 시 thread 검사 필수.
+- **scheduler 내부 자기 STOP 불가**: `pgrep + SIGSTOP` 패턴은 외부 프로세스만 가능. 같은 프로세스 안의 두 LS-using job은 별도 cron job으로 일원화하거나 모듈 레벨 lock 필요.
+- **테이블 전체 max(time) 갭 검사의 함정**: 부분 적재 상태에서 max만 보면 회복 불가. **종목별 max** + 인덱스 `(code, time DESC)` 조합이 비용·회복성 모두 만족.
+- **시간대별 LS API 안정성 35배 차이**: 동일 호출량이 새벽 5xx 3.4% / 한낮 0%. 새벽 자동화 작업은 retry 정책으로 가리지 말고 **시간대 자체를 회피**가 ROI 최고.
+- **3 에이전트 병렬 토의의 효과**: 옵션 1·2·3 동시 분석으로 30분 → 5분 단축. 각 에이전트가 코드 + 웹 검증을 독립적으로 수행해 권고가 일관됨.
+
+### 🔗 관련 커밋
+- `3071fd2` fix: hard_timeout worker thread no-op
+- `df54abc` fix: futures_master export 분봉 일배치로 이전
+- `20b5874` fix: backfill_index 기본 KOSPI200/KOSDAQ150만
+- `86eaa70` chore: 분봉 일배치 cron 04:00 → 23:00 KST
+- `262875c` perf: LS API hard_timeout 25→10s, timeout (10,30)→(5,15)
+- `751d872` feat: 분봉 일배치 갭 fill 종목별 max(time)으로 전환
+
+---
+
 ## 2026-05-13 — 지수/지수선물/주식선물 30초봉 통합 (LS API)
 
 ### 배경

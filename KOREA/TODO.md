@@ -1,7 +1,23 @@
 # 📝 TODO - 작업 목록
 
-> **마지막 업데이트**: 2026-05-13
-> **현재 Phase**: Phase 4 + Phase 5(배당) + KRX 휴장일 + KOSPI200/KOSDAQ150 SCD2 + ETF 일별 스냅샷 + 지수/지수선물/주식선물 일별 + **Phase 6 분봉**: 종목/ETF 30초봉 ✅ / 1분봉 백필 중 + **지수/지수선물/주식선물 30초봉 통합 (5/13)**
+> **마지막 업데이트**: 2026-05-14
+> **현재 Phase**: Phase 4 + Phase 5(배당) + KRX 휴장일 + KOSPI200/KOSDAQ150 SCD2 + ETF 일별 스냅샷 + 지수/지수선물/주식선물 일별 + **Phase 6 분봉**: 종목/ETF 30초봉 ✅ / 1분봉 백필 중 + **지수/지수선물/주식선물 30초봉 통합 (5/13)** + **분봉 일배치 안정화 (5/14)**
+
+---
+
+## 🆕 2026-05-14 — 분봉 일배치 안정화 (운영 사고 + 5중 개선)
+
+- [x] **`hard_timeout` worker thread no-op** (`3071fd2`) — APScheduler signal 에러 회피
+- [x] **`futures_master.json` export 구조 분리** (`df54abc`) — 분봉 일배치로 이전, daily_update LS 호출 0건
+- [x] **`backfill_index_minute_bars` 정책 정합** (`20b5874`) — 기본 KOSPI200/KOSDAQ150만
+- [x] **분봉 일배치 cron 04:00 → 23:00 KST** (`86eaa70`) — 새벽 LS 5xx 회피 (3.4% → 0%)
+- [x] **LS API 단축 timeout** (`262875c`) — hard_timeout 25→10s, requests (10,30)→(5,15)
+- [x] **갭 fill 종목별 max(time)** (`751d872`) — 분봉 일배치 자연 회복성 + 인덱스 활용
+- [x] **5/13 불필요 지수 249개 삭제** (124,500 row)
+- [x] **5/12 누락 1,485 종목 + 5/13 전체 종목 수동 보충** (4,032 호출 / 154분 / 5xx 0)
+- [ ] **5/14 23:00 KST 첫 새 cron 실행 검증** — 모니터 `b44if6de0` watch 중
+- [ ] **옵션 2 후속**: 한낮 LS latency p95/p99 1주일 측정 → false-fail 발생 시 timeout 상수 조정
+- [ ] **ETF 청산 자동 detection**: 연속 N일 empty_response → `stocks.is_active=FALSE` (현재 수동 — 472350 사례)
 
 ---
 
