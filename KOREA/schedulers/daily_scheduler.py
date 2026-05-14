@@ -73,9 +73,9 @@ def job_weekly_backup():
 
 
 def job_minute_bars_daily():
-    """매일 04:00 KST — 분봉 일배치 (종목/ETF + 지수 + 지수선물).
+    """매일 23:00 KST — 분봉 일배치 (종목/ETF + 지수 + 지수선물).
     LS 백필 진행 중이면 SIGSTOP → 일배치 → SIGCONT (사용자 정책).
-    주식선물(t8406)은 historical 불가 → 별도 cron(job_stockfut_today) 15:35 KST."""
+    주식선물(t8406)은 historical 불가 → 별도 cron(job_stockfut_today) 22:00 KST."""
     from datetime import timedelta as _td
     from scripts.daily_update import (
         run_minute_bars_pipeline,
@@ -197,10 +197,13 @@ def main():
         max_instances=1,
     )
 
-    # 잡 3: 매일 04:00 KST — 분봉 일배치 (종목/ETF + 지수 + 지수선물)
+    # 잡 3: 매일 23:00 KST — 분봉 일배치 (종목/ETF + 지수 + 지수선물)
+    # 새벽(04~10시) LS API 5xx 다발(3.4%, retry로 6시간 미완료) 회피.
+    # 한낮·저녁 LS는 5xx 0건 / 정상 1.05초 페이스로 35~50분 완료. 22:00 stockfut와 1시간 안전 마진.
+    # 정규장 마감(15:30) + 시간외 단일가(16~18) 종료 후 5시간 → 데이터 무결성 안전.
     scheduler.add_job(
         job_minute_bars_daily,
-        trigger=CronTrigger(hour=4, minute=0, timezone=KST),
+        trigger=CronTrigger(hour=23, minute=0, timezone=KST),
         id="minute_bars_daily",
         name="분봉 일배치 (종목/ETF + 지수 + 지수선물)",
         misfire_grace_time=3600,
