@@ -1764,9 +1764,10 @@ def run_futures_minute_bars_pipeline(target_date: date) -> dict:
         return {"days": 0, "rows": 0}
 
     client = LsApiClient()
-    pairs = fetch_index_futures_master(client)
+    # daily cron — 그 날짜 기준 NEAR + NEXT 4개만 (사용자 정책: 각 contract 유효 구간 내 fetch)
+    pairs = fetch_index_futures_master(client, near_next_only=target_date)
     codes = [c for c, _ in pairs]
-    print(f"  [스코프] {len(codes)} 선물 × {len(biz_days)} 일")
+    print(f"  [스코프] {len(codes)} 선물 (NEAR+NEXT only) × {len(biz_days)} 일")
     for sh, hn in pairs:
         print(f"     {sh:10s} {hn}")
 
