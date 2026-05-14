@@ -1,23 +1,38 @@
 # 📝 TODO - 작업 목록
 
-> **마지막 업데이트**: 2026-05-14
-> **현재 Phase**: Phase 4 + Phase 5(배당) + KRX 휴장일 + KOSPI200/KOSDAQ150 SCD2 + ETF 일별 스냅샷 + 지수/지수선물/주식선물 일별 + **Phase 6 분봉**: 종목/ETF 30초봉 ✅ / 1분봉 백필 중 + **지수/지수선물/주식선물 30초봉 통합 (5/13)** + **분봉 일배치 안정화 (5/14)**
+> **마지막 업데이트**: 2026-05-14 (오후)
+> **현재 Phase**: Phase 4 + Phase 5(배당) + KRX 휴장일 + KOSPI200/KOSDAQ150 SCD2 + ETF 일별 스냅샷 + 지수/지수선물/주식선물 일별 + **Phase 6 분봉**: 종목/ETF 30초봉 ✅ / 1분봉 1/2~4/24 ✅ + **Phase 7**: 지수/지수선물/주식선물 30초봉 + 분봉/일별 NEAR/NEXT 통합 view ✅
 
 ---
 
-## 🆕 2026-05-14 — 분봉 일배치 안정화 (운영 사고 + 5중 개선)
+## 🆕 2026-05-14 (오후) — Phase 7 NEAR/NEXT 정합성
+
+- [x] **1분봉 백필 4/21~4/26 마무리** (148.6분 / 5xx 1건만, 한낮 LS 안정성 입증)
+- [x] **4/20 누락 877 종목 보충** (15.6분 / 5xx 0)
+- [x] **`_per_stock_gap` v2 — (종목, 일자, 인터벌) 3차원** (`cc6e3d3`) — 인터벌 다른 부분 누락 검출
+- [x] **지수선물 백필 contract별 useful 구간** (`62612ca`) — `_useful_start_date(만기)` helper, 3월물(만기됨) 자동 skip + 9월물 1/2~3/12(NEXT 격상 전) 자동 skip
+- [x] **9월물 1/2~3/12 noise 데이터 46k row 삭제** (KP=97 KQ=1 거래량, farther future)
+- [x] **분봉 NEAR/NEXT view v2 — self-join 만기 정렬** (`8e1f695`) — 인포맥스 매핑 의존성 제거, LS 진짜 NEAR+NEXT 자동 식별
+- [x] **일별 NEAR/NEXT 통합 view** (`198d4a3`) — NEAR=인포맥스, NEXT=분봉 derived (정합성 확보)
+- [x] **DB 종합 점검** — 종목/ETF 분봉 + 지수/지수선물/주식선물 + 일별/분봉 view 검증
+
+## 🆕 2026-05-14 (오전) — 분봉 일배치 안정화 (운영 사고 + 5중 개선)
 
 - [x] **`hard_timeout` worker thread no-op** (`3071fd2`) — APScheduler signal 에러 회피
 - [x] **`futures_master.json` export 구조 분리** (`df54abc`) — 분봉 일배치로 이전, daily_update LS 호출 0건
 - [x] **`backfill_index_minute_bars` 정책 정합** (`20b5874`) — 기본 KOSPI200/KOSDAQ150만
 - [x] **분봉 일배치 cron 04:00 → 23:00 KST** (`86eaa70`) — 새벽 LS 5xx 회피 (3.4% → 0%)
 - [x] **LS API 단축 timeout** (`262875c`) — hard_timeout 25→10s, requests (10,30)→(5,15)
-- [x] **갭 fill 종목별 max(time)** (`751d872`) — 분봉 일배치 자연 회복성 + 인덱스 활용
+- [x] **갭 fill 종목별 max(time) v1** (`751d872`) — 분봉 일배치 자연 회복성 + 인덱스 활용
 - [x] **5/13 불필요 지수 249개 삭제** (124,500 row)
 - [x] **5/12 누락 1,485 종목 + 5/13 전체 종목 수동 보충** (4,032 호출 / 154분 / 5xx 0)
-- [ ] **5/14 23:00 KST 첫 새 cron 실행 검증** — 모니터 `b44if6de0` watch 중
+
+## 후속 검증 + 보완
+
+- [ ] **5/14 22:00 stockfut + 23:00 분봉 일배치 첫 새 cron 실행 검증** — 모니터 `b44if6de0` watch 중
 - [ ] **옵션 2 후속**: 한낮 LS latency p95/p99 1주일 측정 → false-fail 발생 시 timeout 상수 조정
 - [ ] **ETF 청산 자동 detection**: 연속 N일 empty_response → `stocks.is_active=FALSE` (현재 수동 — 472350 사례)
+- [ ] **2030년 year wraparound 대비**: 분봉 NEAR/NEXT view 만기 정렬 키 (현재 chars 4-5 알파벳 정렬)
 
 ---
 

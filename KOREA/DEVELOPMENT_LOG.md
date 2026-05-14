@@ -81,6 +81,110 @@
 
 ---
 
+## 2026-05-14 (오후) — Phase 7 NEAR/NEXT 정합성 + 1분봉 백필 마무리
+
+### 1분봉 백필 4/21~4/26 마무리 + 4/20 누락 보충
+
+| 시간 | 작업 | 결과 |
+|---|---|---|
+| 14:44~17:13 | 1분봉 백필 4/21~4/26 (옵션 2 timeout fix 적용 새 PID로 재시작) | 8,064 호출 / 148.6분 / **5xx 에러 1건만** (한낮 LS 안정성 입증) |
+| 17:30~17:46 | 4/20 누락 877 종목 보충 (옛 백필이 5xx 폭주로 죽은 그날 분) | 877 호출 / 15.6분 / **5xx 에러 0건** |
+
+→ 한낮 LS 5xx 0~0.01% (새벽 3.4% 대비 35배 안정).
+→ 1분봉 종목/ETF: 1/2 ~ 4/24 완료 (4/25, 4/26 토/일 휴장).
+
+### Phase 7 NEAR/NEXT 정합성 — 사용자 정책 반영
+
+#### 사용자 정책 (확정)
+- 각 contract 데이터는 **"처음 NEXT(원월)이 됐을 때부터 만기일까지"** 만 유효
+- 분기물(지수선물): NEXT 3개월 + NEAR 3개월 = **6개월** 유효 구간
+- 월별물(주식선물): NEXT 1개월 + NEAR 1개월 = **2개월** 유효 구간
+- 그 이전엔 farther future라 거래량 거의 0 → fetch 무의미
+
+#### 발견된 문제
+- `backfill_futures_minute_bars`가 `today()` 기준 NEAR/NEXT 4개로 모든 백필 일자 처리
+- 결과: 1/2~3/12 시점 진짜 NEAR였던 KP/KQ **3월물 데이터 통째로 누락**
+- 같은 기간의 9월물(그땐 farther future)은 거래량 거의 0인데도 적재됨 (KP=97 vol, KQ=1 vol)
+
+#### 수정 (커밋 `62612ca`)
+- `_useful_start_date(expiry)` helper: 직전 직전 분기 만기일+1 계산
+  - 예: 6월물 → 12/12, 9월물 → 3/13, 12월물 → 6/12
+- `fetch_index_futures_master(client, near_next_only=date)`:
+  - `None`(default): 살아있는 모든 단일선물 (백필용)
+  - `date`: 그 날짜 NEAR+NEXT 4개 (daily cron용)
+- `run_backfill`: (day, code) plan을 contract별 useful 구간으로 필터
+  → 만기된 3월물 자동 skip (LS historical 미제공), 9월물 1/2~3/12 자동 skip
+- `run_futures_minute_bars_pipeline` (daily): `near_next_only=target_date` 호출
+
+#### 데이터 정리
+- **9월물 1/2~3/12 noise 데이터 46k row 삭제** (KP A0169000 + KQ A0669000)
+- 거래량 KP=97 KQ=1 — 그땐 farther future라 의미 없음
+
+#### LS API 한계 — A 작업 불가능 확인
+- 만기된 contract(A0163000=KP 3월물) historical 분봉 호출: **0봉 반환**
+- t8467 master에도 만기된 contract 빠짐
+- 인포맥스도 분봉 미제공 (일별만)
+- **1/2~3/12 KP/KQ 3월물 30초봉은 영구 미수집** — 데이터 소스 자체가 없음
+
+### 분봉 NEAR/NEXT view (커밋 `62612ca` + `8e1f695`)
+
+#### v1 → v2 진화
+- **v1** (62612ca): 일별 `contract_class` 매핑 join → 인포맥스 NEXT 정의가 LS와 달라(인포맥스 = long-dated annual A018C000) **NEXT view 항상 비어있음**
+- **v2** (8e1f695): 일별 의존성 제거. 분봉 self-join 만기 정렬
+  - underlying 추출: futures_code chars 2-3 (`A0166000`→`'01'`, `A0A65000`→`'0A'`)
+  - 만기 정렬: chars 4-5 (year_char, month_char) 알파벳 정렬
+  - DENSE_RANK PARTITION BY (date, underlying): 1=NEAR, 2=NEXT
+- 검증 (5/13): KP200 NEAR=A0166000(6월) NEXT=A0169000(9월), 주식선물 0A NEAR=A0A65000(5월) NEXT=A0A66000(6월) — 모두 정확
+- 한계: 2030년대 year wraparound 시 정렬 깨짐 — 그때 수정 필요
+
+### 일별 NEAR/NEXT 통합 view (커밋 `198d4a3`)
+
+#### 문제
+- 인포맥스 일별 NEXT 매핑이 정책과 다름 (long-dated annual)
+- 일별 NEXT 데이터 5/6~5/13 6일만 + A018C000(28년 12월물)으로 매핑
+- **9월물(A0169000) 일별 데이터 0건** — 인포맥스가 안 줌
+
+#### 절충안
+- **NEAR**: 인포맥스 raw 그대로 (시기별 자동 롤오버 매핑 정확 — 12/12~3/12 A0163000, 3/13~ A0166000)
+- **NEXT**: 분봉 NEXT view (`futures_intraday_next`)에서 일별 OHLCV 집계
+  - open: `(array_agg(open ORDER BY time ASC))[1]`
+  - high/low: MAX/MIN
+  - close: `(array_agg(close ORDER BY time DESC))[1]`
+  - volume: SUM
+  - settle/theoretical/basis: NULL (분봉 미제공)
+- `source` 컬럼: 'infomax' / 'derived_from_intraday' 구분
+
+검증 (5/13 KP200): NEAR=A0166000 close=1222.25 (인포맥스), NEXT=A0169000 close=1228.20 (분봉 derived) ✅
+
+### 📋 Phase 7 NEAR/NEXT 구분 최종 구조
+
+| 데이터 | View / 테이블 | NEAR 출처 | NEXT 출처 |
+|---|---|---|---|
+| **일별** | `futures_daily_with_class` (view) | 인포맥스 raw | 분봉 NEXT view에서 일봉 집계 |
+| **분봉** | `futures_intraday_with_class` / `_near` / `_next` (view) | 분봉 self-join 만기 정렬 1번째 | 동일 2번째 |
+
+### 데이터 가용 범위 (5/14 21:30 기준)
+
+| underlying | 일별 NEAR | 일별 NEXT | 분봉 NEAR | 분봉 NEXT |
+|---|---|---|---|---|
+| KP200 (01) | 2022-01-03 ~ 5/13 (인포맥스) | **3/13 ~ 5/13** (분봉 derived) | 2026-01-02 ~ 5/13 | 2026-03-13 ~ 5/13 |
+| KQ150 (06) | 동일 | 동일 | 동일 | 동일 |
+| 주식선물 | 동일 | 5/13만 | 5/13만 | 5/13만 |
+
+### 🔗 5/14 오후 추가 커밋
+- `cc6e3d3` fix: _per_stock_gap (종목, 일자, 인터벌) 3차원 갭 체크
+- `62612ca` fix: 지수선물 백필 contract별 유효 구간 + NEAR/NEXT view (B+C+D)
+- `8e1f695` fix: 분봉 NEAR/NEXT view self-join 만기 정렬 (인포맥스 매핑 의존성 제거)
+- `198d4a3` feat: 일별 NEAR/NEXT 통합 view (분봉 NEXT에서 일봉 집계)
+
+### 🎓 추가 배운 점
+- **인포맥스 NEAR vs NEXT 정의 차이**: NEAR는 정확한 차월 매핑, NEXT는 long-dated annual을 매핑. 같은 source라도 컬럼별 신뢰도 다름.
+- **데이터 source 한계 명시 필요**: LS API가 만기된 contract historical 미제공 — 1/2~3/12 KP/KQ 3월물 분봉 영구 미수집. view에서 row 0으로 명시적 표현.
+- **view 만기 정렬의 강력함**: contract_code 패턴(year_char, month_char)만으로 NEAR/NEXT 자동 분류 가능. 외부 매핑 의존성 0.
+- **derived view (분봉→일봉 집계)**: 한 source의 결함을 다른 source 집계로 보완. data lineage 명시(source 컬럼)로 추적 가능.
+
+---
+
 ## 2026-05-13 — 지수/지수선물/주식선물 30초봉 통합 (LS API)
 
 ### 배경
