@@ -1564,40 +1564,49 @@ _EPOCH_30SEC = date(2026, 1, 2)  # Phase 6 분봉 시스템 시작일
 
 def _per_stock_gap(table: str, code_col: str, codes: list[str],
                    target_date: date) -> tuple[dict[str, list[date]], int]:
-    """종목별 max(time)+1 ~ target_date 거래일 dict + 총 호출 수.
-    분봉 일배치가 도중에 죽어도 종목별 자연 회복 — 각 종목이 자신의 적재 끝점부터 재개.
+    """종목별 (날짜+인터벌) 단위 갭 체크 → {code: [biz_days]} + 총 호출 수.
 
-    반환: ({code: [biz_days]}, total_calls)
-    종목 인덱스 (code, time DESC) 활용 — bulk 1쿼리 비용 ~수십 ms.
+    각 거래일에 적합한 인터벌(select_ncnt 기반: ≥4/27=30초, 그 이전=1분)이 DB에
+    있는지 확인. 없으면 해당 날짜를 갭으로 잡음.
+
+    이전 버전은 종목별 max(time)만 봤기 때문에, 4/20 1분봉이 누락된 종목도
+    30초봉 5/13까지 있으면 max=5/13으로 인식해 갭 0으로 잘못 판단함 (5/14 사례).
+    이 버전은 (code, day, interval) 3차원 set으로 부분 누락도 정확히 검출.
+
+    비용: bulk 1쿼리 (code IN 2k × 80일 × interval) ~수백 ms. 인덱스 활용.
     """
+    from collectors.ls_api import select_ncnt
+
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                f"SELECT {code_col}, MAX((time AT TIME ZONE 'Asia/Seoul')::date) "
-                f"FROM {table} WHERE {code_col} = ANY(%s) GROUP BY {code_col}",
-                (list(codes),))
-            max_per_code = {r[0]: r[1] for r in cur.fetchall()}
-
             cur.execute(
                 "SELECT time FROM ohlcv_daily WHERE time BETWEEN %s AND %s "
                 "GROUP BY time ORDER BY time",
                 (_EPOCH_30SEC, target_date))
             all_biz = [r[0] for r in cur.fetchall()]
+
+            cur.execute(
+                f"SELECT {code_col}, (time AT TIME ZONE 'Asia/Seoul')::date, interval_seconds "
+                f"FROM {table} WHERE {code_col} = ANY(%s) "
+                f"AND (time AT TIME ZONE 'Asia/Seoul')::date BETWEEN %s AND %s "
+                f"GROUP BY 1, 2, 3",
+                (list(codes), _EPOCH_30SEC, target_date))
+            existing: set[tuple] = {(r[0], r[1], r[2]) for r in cur.fetchall()}
     finally:
         conn.close()
 
     gaps: dict[str, list[date]] = {}
     total = 0
     for code in codes:
-        last = max_per_code.get(code)
-        start = (last + timedelta(days=1)) if last else _EPOCH_30SEC
-        if start > target_date:
-            gaps[code] = []
-        else:
-            days = [d for d in all_biz if start <= d <= target_date]
-            gaps[code] = days
-            total += len(days)
+        days_for_code = []
+        for d in all_biz:
+            ncnt = select_ncnt(d)
+            interval = 30 if ncnt == 0 else 60
+            if (code, d, interval) not in existing:
+                days_for_code.append(d)
+        gaps[code] = days_for_code
+        total += len(days_for_code)
     return gaps, total
 
 
