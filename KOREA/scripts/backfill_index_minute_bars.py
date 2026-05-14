@@ -1,17 +1,22 @@
 """
 지수 30초봉 백필 (LS t8418, /indtp/chart)
 
-스코프: t8424 전체업종 master에서 받은 모든 LS 지수 코드
+스코프(default): KOSPI200(101) + KOSDAQ150(301) — 사용자 정책
+                 --codes로 임의 LS 지수코드 override 가능 (수동 디버그용)
+                 --all-master 플래그로 t8424 전체업종 마스터 사용 (예외 케이스)
 기간: --from (default 2026-01-02) ~ --to (default 어제)
 TPS 1 단일 워커, 1지수 1일 ≈ 1.05초
 
 사용:
-    # 본격 백필 (전체 지수 × 2026-01-02 ~ 어제)
+    # 기본 백필 (KOSPI200 + KOSDAQ150 × 2026-01-02 ~ 어제)
     python scripts/backfill_index_minute_bars.py
 
     # 특정 기간/특정 지수
     python scripts/backfill_index_minute_bars.py --from 20260102 --to 20260301
     python scripts/backfill_index_minute_bars.py --codes 101,301,001
+
+    # 전체 지수 master (t8424) — 예외 사용
+    python scripts/backfill_index_minute_bars.py --all-master
 """
 
 from __future__ import annotations
@@ -148,7 +153,9 @@ def main():
     parser = argparse.ArgumentParser(description="지수 30초봉 백필 (t8418)")
     parser.add_argument("--from", dest="start", default="20260102", help="YYYYMMDD")
     parser.add_argument("--to",   dest="end",   default=None,        help="YYYYMMDD (기본: 어제)")
-    parser.add_argument("--codes", default=None, help="콤마 구분 LS 지수코드 (기본: t8424 master)")
+    parser.add_argument("--codes", default=None, help="콤마 구분 LS 지수코드 (기본: 101,301)")
+    parser.add_argument("--all-master", action="store_true",
+                        help="t8424 전체업종 master 사용 (예외 — 평소 KOSPI200/KOSDAQ150만)")
     parser.add_argument("--ncnt", type=int, default=0, help="0=30초봉(default), 1=1분봉")
     args = parser.parse_args()
 
@@ -157,11 +164,14 @@ def main():
 
     if args.codes:
         codes = [c.strip() for c in args.codes.split(",") if c.strip()]
-    else:
+    elif args.all_master:
         cli = LsApiClient()
         master = fetch_index_master(cli)
-        print(f"[지수 master] t8424로 {len(master)}개 지수 발견")
+        print(f"[지수 master] t8424로 {len(master)}개 지수 발견 (--all-master)")
         codes = [c for c, _ in master]
+    else:
+        codes = ["101", "301"]  # KOSPI200, KOSDAQ150 (사용자 정책)
+        print(f"[지수] 기본 스코프 KOSPI200(101) + KOSDAQ150(301)")
 
     print(f"[지수 30초봉 백필] {start} ~ {end} / 지수 {len(codes)}개 / ncnt={args.ncnt}")
     run_backfill(start, end, codes, ncnt=args.ncnt)
