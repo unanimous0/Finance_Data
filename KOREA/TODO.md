@@ -29,7 +29,7 @@
 
 ## 후속 검증 + 보완
 
-- [ ] **5/14 22:00 stockfut + 23:00 분봉 일배치 첫 새 cron 실행 검증** — 모니터 `b44if6de0` watch 중
+- [ ] **5/14 22:30 stockfut + 23:00 분봉 일배치 첫 새 cron 실행 검증** — 모니터 `b44if6de0` watch 중
 - [ ] **옵션 2 후속**: 한낮 LS latency p95/p99 1주일 측정 → false-fail 발생 시 timeout 상수 조정
 - [ ] **ETF 청산 자동 detection**: 연속 N일 empty_response → `stocks.is_active=FALSE` (현재 수동 — 472350 사례)
 - [ ] **2030년 year wraparound 대비**: 분봉 NEAR/NEXT view 만기 정렬 키 (현재 chars 4-5 알파벳 정렬)
@@ -71,7 +71,7 @@
 - [x] **백필 스크립트 신설** ✅ (`backfill_index_minute_bars.py`, `backfill_futures_minute_bars.py`)
 - [x] **scheduler 변경** ✅ (`schedulers/daily_scheduler.py`)
   - `job_minute_bars_daily` (04:00 KST) — 4 파이프라인 + outer STOP/CONT
-  - `job_stockfut_today` (**22:00 KST 평일**) 신규 — 주식선물 당일 적재
+  - `job_stockfut_today` (**22:30 KST 평일**) 신규 — 주식선물 당일 적재
 - [-] **백필 chain 진행 중** — KOSPI200 F ✅ / KOSDAQ150 F 진행 중 / 지수 (101, 301) 대기 / 1분봉 CONT 대기
 - [-] **1분봉 백필 재시작** — 3/6~4/26, 19.85% STOPPED, chain 끝나면 SIGCONT, 최종 완료 5/15 10시 경 예상
 
@@ -85,12 +85,12 @@
 ```
 04:00 KST  daily_minute_bars  종목/ETF + 지수 + 지수선물 (갭 backfill, STOP/CONT)
 05:30 KST  daily_update       OHLCV/수급/외인 + 배당 + LENS export (인포맥스 + DART)
-22:00 KST  stockfut_today     주식선물 t8406 당일 (historical 불가 — 매일 받기 필수)
+22:30 KST  stockfut_today     주식선물 t8406 당일 (historical 불가 — 매일 받기 필수)
 일03:00    weekly_backup      DB 백업
 ```
 
 ### 알려진 한계
-- 주식선물 historical 불가 → 22:00 cron 미실행 시 그날 영구 손실
+- 주식선물 historical 불가 → 22:30 cron 미실행 시 그날 영구 손실
 - 1/2~3월 시점 진짜 근월(F 2603) 데이터는 master에서 안 잡힘 (LS master active만 반환)
 - 지수 (t8418)는 2026-01-02 이전 lookback 불가 — 그 이전 데이터 영구 없음
 

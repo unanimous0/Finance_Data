@@ -75,7 +75,7 @@ def job_weekly_backup():
 def job_minute_bars_daily():
     """매일 23:00 KST — 분봉 일배치 (종목/ETF + 지수 + 지수선물).
     LS 백필 진행 중이면 SIGSTOP → 일배치 → SIGCONT (사용자 정책).
-    주식선물(t8406)은 historical 불가 → 별도 cron(job_stockfut_today) 22:00 KST."""
+    주식선물(t8406)은 historical 불가 → 별도 cron(job_stockfut_today) 22:30 KST."""
     from datetime import timedelta as _td
     from scripts.daily_update import (
         run_minute_bars_pipeline,
@@ -199,7 +199,7 @@ def main():
 
     # 잡 3: 매일 23:00 KST — 분봉 일배치 (종목/ETF + 지수 + 지수선물)
     # 새벽(04~10시) LS API 5xx 다발(3.4%, retry로 6시간 미완료) 회피.
-    # 한낮·저녁 LS는 5xx 0건 / 정상 1.05초 페이스로 35~50분 완료. 22:00 stockfut와 1시간 안전 마진.
+    # 한낮·저녁 LS는 5xx 0건 / 정상 1.05초 페이스로 35~50분 완료. 22:30 stockfut와 30분 안전 마진.
     # 정규장 마감(15:30) + 시간외 단일가(16~18) 종료 후 5시간 → 데이터 무결성 안전.
     scheduler.add_job(
         job_minute_bars_daily,
@@ -211,11 +211,12 @@ def main():
         max_instances=1,
     )
 
-    # 잡 5: 매일 22:00 KST (월~금) — 주식선물 30초봉 당일 적재
-    # 22시는 장 마감(15:30) + 사후호가/정산 충분히 끝난 시점 — 데이터 안정
+    # 잡 5: 매일 22:30 KST (월~금) — 주식선물 30초봉 당일 적재
+    # 22시 30분은 장 마감(15:30) + 사후호가/정산 충분히 끝난 시점 — 데이터 안정.
+    # 23:00 분봉 일배치와 직렬로 붙여서 LENS 등 외부 LS 사용처가 22:30~24:00 한 블록만 피하면 됨.
     scheduler.add_job(
         job_stockfut_today,
-        trigger=CronTrigger(day_of_week="mon-fri", hour=22, minute=0, timezone=KST),
+        trigger=CronTrigger(day_of_week="mon-fri", hour=22, minute=30, timezone=KST),
         id="stockfut_today",
         name="주식선물 30초봉 당일 (LS t8406, historical 불가)",
         misfire_grace_time=3600,
