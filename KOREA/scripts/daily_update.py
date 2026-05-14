@@ -1541,7 +1541,8 @@ def _last_loaded_date(table: str, code_col: str, code: str = None) -> date | Non
 
 
 def _gap_business_days(table: str, code_col: str, target_date: date) -> list[date]:
-    """table 마지막 적재일+1 ~ target_date 거래일 list (휴장일 제외)."""
+    """table 마지막 적재일+1 ~ target_date 거래일 list (휴장일 제외).
+    code 미명시 — 테이블 전체 max(time) 기준. 지수/지수선물용 (소량 코드)."""
     last = _last_loaded_date(table, code_col)
     start = (last + timedelta(days=1)) if last else date(2026, 1, 2)
     if start > target_date:
@@ -1558,10 +1559,53 @@ def _gap_business_days(table: str, code_col: str, target_date: date) -> list[dat
         conn.close()
 
 
+_EPOCH_30SEC = date(2026, 1, 2)  # Phase 6 분봉 시스템 시작일
+
+
+def _per_stock_gap(table: str, code_col: str, codes: list[str],
+                   target_date: date) -> tuple[dict[str, list[date]], int]:
+    """종목별 max(time)+1 ~ target_date 거래일 dict + 총 호출 수.
+    분봉 일배치가 도중에 죽어도 종목별 자연 회복 — 각 종목이 자신의 적재 끝점부터 재개.
+
+    반환: ({code: [biz_days]}, total_calls)
+    종목 인덱스 (code, time DESC) 활용 — bulk 1쿼리 비용 ~수십 ms.
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {code_col}, MAX((time AT TIME ZONE 'Asia/Seoul')::date) "
+                f"FROM {table} WHERE {code_col} = ANY(%s) GROUP BY {code_col}",
+                (list(codes),))
+            max_per_code = {r[0]: r[1] for r in cur.fetchall()}
+
+            cur.execute(
+                "SELECT time FROM ohlcv_daily WHERE time BETWEEN %s AND %s "
+                "GROUP BY time ORDER BY time",
+                (_EPOCH_30SEC, target_date))
+            all_biz = [r[0] for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+    gaps: dict[str, list[date]] = {}
+    total = 0
+    for code in codes:
+        last = max_per_code.get(code)
+        start = (last + timedelta(days=1)) if last else _EPOCH_30SEC
+        if start > target_date:
+            gaps[code] = []
+        else:
+            days = [d for d in all_biz if start <= d <= target_date]
+            gaps[code] = days
+            total += len(days)
+    return gaps, total
+
+
 def run_minute_bars_pipeline(target_date: date) -> dict:
     """
     분봉 일배치 (종목/ETF, LS t8452).
-    갭 backfill: ohlcv_intraday max(time)+1 ~ target_date 거래일 sweep.
+    갭 backfill: **종목별** max(time)+1 ~ target_date 거래일 sweep.
+    중간 실패/누락도 다음 실행에서 종목별로 자연 회복 (5/12 1,485개 누락 사례 해소).
     백필 동시 진행 시 SIGSTOP → 일배치 → SIGCONT (사용자 정책).
     """
     from collectors.ls_api import LsApiClient, LsApiError
@@ -1574,17 +1618,21 @@ def run_minute_bars_pipeline(target_date: date) -> dict:
 
     paused_pids = _ls_backfill_pause()
     try:
-        biz_days = _gap_business_days("ohlcv_intraday", "stock_code", target_date)
-        if not biz_days:
-            print(f"  [skip] 갭 0일 (target_date={target_date})")
-            return {"days": 0, "rows": 0}
-
         conn = get_conn()
         try:
             codes = fetch_minute_scope(conn)
-            print(f"  [스코프] {len(codes)} 종목 × {len(biz_days)} 일")
         finally:
             conn.close()
+
+        gaps, total_calls = _per_stock_gap("ohlcv_intraday", "stock_code", codes, target_date)
+        if total_calls == 0:
+            print(f"  [skip] 모든 종목 갭 0일 (target_date={target_date})")
+            return {"days": 0, "rows": 0}
+
+        # 종목별 갭 분포 통계
+        gap_lens = [len(d) for d in gaps.values() if d]
+        print(f"  [스코프] {len(codes)} 종목 / 호출 {total_calls:,}건 "
+              f"(종목당 갭: 최소 {min(gap_lens)}일 / 최대 {max(gap_lens)}일 / 평균 {sum(gap_lens)/len(gap_lens):.1f}일)")
 
         client = LsApiClient()
         conn = get_conn()
@@ -1592,11 +1640,15 @@ def run_minute_bars_pipeline(target_date: date) -> dict:
             total_rows = 0
             empty = 0
             errors = []
+            calls_done = 0
             from time import time as now
             t0 = now()
-            for di, day in enumerate(biz_days, 1):
-                print(f"  ▶ day {di}/{len(biz_days)} = {day}", flush=True)
-                for i, code in enumerate(codes, 1):
+            # 종목별 순회 — 각 종목의 자기 갭 day들을 처리. 중단 시 완료 종목은 모든 갭 채워짐.
+            for code in codes:
+                days_for_code = gaps.get(code, [])
+                if not days_for_code:
+                    continue
+                for day in days_for_code:
                     try:
                         bars, interval = client.get_intraday_bars(code, day)
                         if not bars:
@@ -1608,16 +1660,22 @@ def run_minute_bars_pipeline(target_date: date) -> dict:
                         errors.append((code, day, e.category))
                     except Exception as e:
                         errors.append((code, day, f"unexpected:{type(e).__name__}"))
-                    if i % 500 == 0:
+                    calls_done += 1
+                    if calls_done % 500 == 0:
                         elapsed = now() - t0
-                        print(f"    [{i}/{len(codes)}] 적재 {total_rows:,}row / 빈 {empty} / 에러 {len(errors)}", flush=True)
+                        rate = calls_done / elapsed if elapsed else 0
+                        eta_min = (total_calls - calls_done) / rate / 60 if rate else 0
+                        print(f"    [{calls_done}/{total_calls} {calls_done/total_calls*100:.1f}%] "
+                              f"적재 {total_rows:,}row / 빈 {empty} / 에러 {len(errors)} / ETA {eta_min:.0f}min", flush=True)
 
             elapsed = now() - t0
-            print(f"\n  [완료] {len(biz_days)}일 / 소요 {elapsed/60:.1f}분 / 적재 {total_rows:,}row / 빈 {empty} / 에러 {len(errors)}")
+            print(f"\n  [완료] 호출 {calls_done:,}건 / 소요 {elapsed/60:.1f}분 / "
+                  f"적재 {total_rows:,}row / 빈 {empty} / 에러 {len(errors)}")
             if errors:
                 from collections import Counter
                 print(f"    에러 카테고리: {dict(Counter(e[2] for e in errors))}")
-            return {"days": len(biz_days), "stocks": len(codes), "rows": total_rows, "empty": empty, "errors": len(errors)}
+            return {"calls": calls_done, "stocks": len([c for c in codes if gaps.get(c)]),
+                    "rows": total_rows, "empty": empty, "errors": len(errors)}
         finally:
             conn.close()
     finally:
