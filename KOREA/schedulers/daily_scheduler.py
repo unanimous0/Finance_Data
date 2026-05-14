@@ -2,7 +2,8 @@
 데이터 수집 + 백업 스케줄러
 
 잡 목록:
-    daily_update      — 매일 05:30 KST (월~일)           OHLCV/시가총액/수급/외국인지분율 + 배당 + LENS export
+    daily_update      — 매일 04:30 KST (월~일)           OHLCV/시가총액/수급/외국인지분율 + 배당 + LENS export
+                          (기존 05:30 → 04:30 테스트 — 외인지분율 가용성 검증 중. 누락 시 --missing-only로 보충)
     weekly_backup     — 매주 일요일 03:00 KST             DB 백업 + 7일 보관
     quarterly_sector  — 분기 첫 번째 일요일 03:30 KST     FICS 업종 크롤링 (1/4/7/10월)
 
@@ -50,7 +51,9 @@ logger = logging.getLogger(__name__)
 
 
 def job_daily_update():
-    """매일 05:30 KST 실행 — daily_update.main()이 dividend pipeline + LENS export까지 자동 호출"""
+    """매일 04:30 KST 실행 — daily_update.main()이 dividend pipeline + LENS export까지 자동 호출.
+    (테스트: 5:30 → 4:30. 외인지분율은 인포맥스가 익일 새벽~오전 제공이라 5:30이 검증된 안전선.
+     4:30 누락 발견 시 --missing-only로 보충 + cron 5:30으로 되돌림)"""
     from scripts.daily_update import main as run_daily
     logger.info("="*60)
     logger.info(f"[스케줄러] 일별 업데이트 시작: {datetime.now(KST)}")
@@ -170,7 +173,7 @@ def main():
     scheduler.add_job(
         job_daily_update,
         trigger=CronTrigger(
-            hour=5,
+            hour=4,
             minute=30,
             timezone=KST,
         ),
