@@ -2020,19 +2020,10 @@ def main(target_date: date = None, missing_only: bool = False):
         except Exception as idx_err:
             print(f"\n⚠️  지수+선물 단계 오류 (업데이트 결과에는 영향 없음): {idx_err}")
 
-        # 주식선물 master JSON export (LENS futures_master.json)
-        # — LS t8401 호출 (백필과 충돌 가능 → STOP/CONT 가드)
-        try:
-            paused = _ls_backfill_pause()
-            try:
-                export_futures_master_json()
-            finally:
-                _ls_backfill_resume(paused)
-        except Exception as fm_err:
-            print(f"\n⚠️  futures_master.json export 실패 (업데이트 결과에는 영향 없음): {fm_err}")
-
         # 분봉 일배치는 04:00 KST 별도 cron (job_minute_bars_daily)으로 분리됨
         # 주식선물 30초봉은 22:00 KST 별도 cron (job_stockfut_today, t8406 당일만)으로 분리됨
+        # futures_master.json export도 분봉 일배치 끝에서 호출 — daily_update는 LS API 호출 0건
+        # (이전 위치에서 04:00 일배치와 LS hit 동시 발생해 5xx 빈발)
 
     except Exception as e:
         err_msg = traceback.format_exc()

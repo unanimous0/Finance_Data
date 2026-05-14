@@ -81,6 +81,7 @@ def job_minute_bars_daily():
         run_minute_bars_pipeline,
         run_index_minute_bars_pipeline,
         run_futures_minute_bars_pipeline,
+        export_futures_master_json,
         _ls_backfill_pause, _ls_backfill_resume,
         get_conn, last_business_day_on_or_before)
     yesterday = datetime.now(KST).date() - _td(days=1)
@@ -106,6 +107,13 @@ def job_minute_bars_daily():
                 logger.info(f"[스케줄러] {label} 분봉 일배치 완료: {result}")
             except Exception as e:
                 logger.error(f"[스케줄러] {label} 분봉 일배치 실패: {e}")
+
+        # LS-using export — 같은 LS 가드 안에서 호출 (5xx 충돌 회피)
+        try:
+            export_futures_master_json()
+            logger.info("[스케줄러] futures_master.json export 완료")
+        except Exception as fm_err:
+            logger.error(f"[스케줄러] futures_master.json export 실패: {fm_err}")
     finally:
         _ls_backfill_resume(paused)
 
