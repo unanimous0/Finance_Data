@@ -18,6 +18,7 @@
 """
 
 import sys
+import signal
 import logging
 from pathlib import Path
 from datetime import datetime
@@ -168,6 +169,16 @@ def main():
     # 이벤트 리스너
     scheduler.add_listener(on_job_executed, EVENT_JOB_EXECUTED)
     scheduler.add_listener(on_job_error,    EVENT_JOB_ERROR)
+
+    # graceful shutdown — SIGTERM/SIGINT 수신 시 진행 중 job 끝날 때까지 대기 후 종료.
+    # tmux send-keys C-c 또는 kill로 재시작해도 자식 daily_update 안 죽임.
+    # (5/15 사고 재발 방지 — 그 때 5/14 일별 후속 단계 silent kill 됐었음)
+    def _graceful_shutdown(signum, _frame):
+        logger.warning(f"[스케줄러] 신호 {signum} 수신 → 진행 중 job 완료 대기 후 종료")
+        scheduler.shutdown(wait=True)
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, _graceful_shutdown)
+    signal.signal(signal.SIGINT,  _graceful_shutdown)
 
     # 잡 1: 매일 05:30 KST — 데이터 수집 + 배당 + LENS export
     scheduler.add_job(
