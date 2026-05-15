@@ -2076,11 +2076,19 @@ def main(target_date: date = None, missing_only: bool = False):
         except Exception as idx_err:
             print(f"\n⚠️  지수 구성종목 단계 오류 (업데이트 결과에는 영향 없음): {idx_err}")
 
-        # ETF 일별 스냅샷 (PDF + 마스터, 5일 FIFO)
+        # ETF 일별 스냅샷 (PDF + 마스터, 5일 FIFO) — 2-pass 정책:
+        #   Pass 1 (today): D PDF 새벽 가용 (D-1 17~18시 KST 운용사 공시 → 인포맥스 ingest)
+        #   Pass 2 (yesterday): D-1 PDF 재호출 — 어제 today로 받은 게 partial이었으면
+        #                       UPSERT (PK = etf_code+snapshot_date+component_code)으로 자동 정정
+        today_kst = datetime.now(KST).date()
+        try:
+            run_etf_daily_snapshot_pipeline(today_kst)
+        except Exception as etf_err:
+            print(f"\n⚠️  ETF 스냅샷 today 단계 오류 (업데이트 결과에는 영향 없음): {etf_err}")
         try:
             run_etf_daily_snapshot_pipeline(result["end_date"])
         except Exception as etf_err:
-            print(f"\n⚠️  ETF 스냅샷 단계 오류 (업데이트 결과에는 영향 없음): {etf_err}")
+            print(f"\n⚠️  ETF 스냅샷 yesterday 단계 오류 (업데이트 결과에는 영향 없음): {etf_err}")
 
         # 지수 + 선물 일별 OHLCV (인포맥스)
         try:
