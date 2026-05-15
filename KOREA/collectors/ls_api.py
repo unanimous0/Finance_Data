@@ -207,6 +207,9 @@ class LsApiClient:
                 with hard_timeout(10):  # OS-level kill switch (5xx 빠른 fail → retry로 다음 호출로)
                     r = self.session.post(url, json=body, headers=headers, timeout=(5, 15))
                 if r.status_code >= 500:
+                    # 5xx 본문 로깅 (rate/connection 한도 vs 서버 에러 구분 위해)
+                    body_snippet = (r.text or "")[:200].replace("\n", " ")
+                    print(f"    [5xx debug] status={r.status_code} body={body_snippet!r}", flush=True)
                     if attempt < MAX_RETRY:
                         time.sleep(RETRY_WAIT * attempt)
                         continue
@@ -288,6 +291,9 @@ class LsApiClient:
                         continue
                     raise LsApiError("HTTP 401 (token refresh attempts exhausted)", category="other")
                 if r.status_code >= 500:
+                    # 5xx 본문 로깅 (rate/connection 한도 vs 서버 에러 구분 위해)
+                    body_snippet = (r.text or "")[:200].replace("\n", " ")
+                    print(f"    [5xx debug] status={r.status_code} body={body_snippet!r}", flush=True)
                     if attempt < MAX_RETRY:
                         time.sleep(RETRY_WAIT * attempt)
                         continue
@@ -347,6 +353,9 @@ class LsApiClient:
                         continue
                     raise LsApiError("HTTP 401 (token refresh exhausted)", category="other")
                 if r.status_code >= 500:
+                    # 5xx 본문 로깅 (rate/connection 한도 vs 서버 에러 구분 위해)
+                    body_snippet = (r.text or "")[:200].replace("\n", " ")
+                    print(f"    [5xx debug] status={r.status_code} body={body_snippet!r}", flush=True)
                     if attempt < MAX_RETRY:
                         time.sleep(RETRY_WAIT * attempt)
                         continue
@@ -786,6 +795,9 @@ class _DeprecatedT8412:
                 with hard_timeout(10):  # OS-level kill switch (5xx 빠른 fail → retry로 다음 호출로)
                     r = self.session.post(url, json=body, headers=headers, timeout=(5, 15))
                 if r.status_code >= 500:
+                    # 5xx 본문 로깅 (rate/connection 한도 vs 서버 에러 구분 위해)
+                    body_snippet = (r.text or "")[:200].replace("\n", " ")
+                    print(f"    [5xx debug] status={r.status_code} body={body_snippet!r}", flush=True)
                     if attempt < MAX_RETRY:
                         time.sleep(RETRY_WAIT * attempt)
                         continue
