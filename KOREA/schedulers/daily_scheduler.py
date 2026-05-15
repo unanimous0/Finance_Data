@@ -5,7 +5,7 @@
     daily_update      — 매일 04:30 KST (월~일)           OHLCV/시가총액/수급/외국인지분율 + 배당 + LENS export
                           + 끝에 분봉 일배치 직렬 호출 (종목/ETF + 지수 + 지수선물 + futures_master export)
                           (LENS 야간 사용 시간 확보 위해 23:00 분봉 일배치 cron을 daily_update 끝으로 통합)
-    stockfut_today    — 매일 23:00 KST (월~금)           주식선물 30초봉 (t8406 historical 불가, 당일만)
+    stockfut_today    — 매일 23:30 KST (월~금)           주식선물 30초봉 (t8406 historical 불가, 당일만, ~10분)
     weekly_backup     — 매주 일요일 03:00 KST             DB 백업 + 7일 보관
     quarterly_sector  — 분기 첫 번째 일요일 03:30 KST     FICS 업종 크롤링 (1/4/7/10월)
 
@@ -228,12 +228,11 @@ def main():
 
     # 분봉 일배치 cron 제거 — daily_update 끝(job_daily_update 안)에 직렬 호출로 통합 (LENS 야간 사용 시간 확보)
 
-    # 잡 5: 매일 23:00 KST (월~금) — 주식선물 30초봉 당일 적재
-    # 23시는 장 마감(15:30) + 사후호가/정산 + 시간외(18:00) 충분히 끝난 시점.
-    # 분봉 일배치는 04:30 daily_update 끝으로 이전 → LENS는 23:00~23:10 stockfut 10분만 피하면 됨.
+    # 잡 5: 매일 23:30 KST (월~금) — 주식선물 30초봉 당일 적재
+    # 작업 시간 약 10분 → 23:30~23:40. 사용자 LENS는 23:40 ~ 다음날 04:30 자유.
     scheduler.add_job(
         job_stockfut_today,
-        trigger=CronTrigger(day_of_week="mon-fri", hour=23, minute=0, timezone=KST),
+        trigger=CronTrigger(day_of_week="mon-fri", hour=23, minute=30, timezone=KST),
         id="stockfut_today",
         name="주식선물 30초봉 당일 (LS t8406, historical 불가)",
         misfire_grace_time=3600,
