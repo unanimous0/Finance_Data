@@ -3,7 +3,9 @@
 
 잡 목록:
     daily_update      — 매일 04:30 KST (월~일)           OHLCV/시가총액/수급/외국인지분율 + 배당 + LENS export
-                          (기존 05:30 → 04:30 테스트 — 외인지분율 가용성 검증 중. 누락 시 --missing-only로 보충)
+                          + 끝에 분봉 일배치 직렬 호출 (종목/ETF + 지수 + 지수선물 + futures_master export)
+                          (LENS 야간 사용 시간 확보 위해 23:00 분봉 일배치 cron을 daily_update 끝으로 통합)
+    stockfut_today    — 매일 23:00 KST (월~금)           주식선물 30초봉 (t8406 historical 불가, 당일만)
     weekly_backup     — 매주 일요일 03:00 KST             DB 백업 + 7일 보관
     quarterly_sector  — 분기 첫 번째 일요일 03:30 KST     FICS 업종 크롤링 (1/4/7/10월)
 
@@ -52,14 +54,27 @@ logger = logging.getLogger(__name__)
 
 
 def job_daily_update():
-    """매일 04:30 KST 실행 — daily_update.main()이 dividend pipeline + LENS export까지 자동 호출.
-    (테스트: 5:30 → 4:30. 외인지분율은 인포맥스가 익일 새벽~오전 제공이라 5:30이 검증된 안전선.
-     4:30 누락 발견 시 --missing-only로 보충 + cron 5:30으로 되돌림)"""
+    """매일 04:30 KST — daily_update 본체(인포맥스/DART) → 분봉 일배치(LS) 직렬.
+    LENS 야간 사용 시간 확보 위해 분봉 일배치를 23:00 별도 cron에서 daily_update 끝으로 이전.
+    daily_update ~3시간 → 분봉 일배치 ~50분 → 총 04:30~08:30 종료.
+    """
     from scripts.daily_update import main as run_daily
     logger.info("="*60)
     logger.info(f"[스케줄러] 일별 업데이트 시작: {datetime.now(KST)}")
     logger.info("="*60)
-    run_daily()
+    try:
+        run_daily()
+    except Exception as e:
+        logger.error(f"[스케줄러] daily_update 본체 실패: {e}")
+
+    # daily_update 끝나고 분봉 일배치 직렬 호출 (한낮 LS 부하 회피, 사용자 활동 시작 전)
+    logger.info("="*60)
+    logger.info(f"[스케줄러] 분봉 일배치 시작 (daily_update 후속): {datetime.now(KST)}")
+    logger.info("="*60)
+    try:
+        job_minute_bars_daily()
+    except Exception as e:
+        logger.error(f"[스케줄러] 분봉 일배치 실패: {e}")
 
 
 def job_weekly_backup():
@@ -211,26 +226,14 @@ def main():
         max_instances=1,
     )
 
-    # 잡 3: 매일 23:00 KST — 분봉 일배치 (종목/ETF + 지수 + 지수선물)
-    # 새벽(04~10시) LS API 5xx 다발(3.4%, retry로 6시간 미완료) 회피.
-    # 한낮·저녁 LS는 5xx 0건 / 정상 1.05초 페이스로 35~50분 완료. 22:30 stockfut와 30분 안전 마진.
-    # 정규장 마감(15:30) + 시간외 단일가(16~18) 종료 후 5시간 → 데이터 무결성 안전.
-    scheduler.add_job(
-        job_minute_bars_daily,
-        trigger=CronTrigger(hour=23, minute=0, timezone=KST),
-        id="minute_bars_daily",
-        name="분봉 일배치 (종목/ETF + 지수 + 지수선물)",
-        misfire_grace_time=3600,
-        coalesce=True,
-        max_instances=1,
-    )
+    # 분봉 일배치 cron 제거 — daily_update 끝(job_daily_update 안)에 직렬 호출로 통합 (LENS 야간 사용 시간 확보)
 
-    # 잡 5: 매일 22:30 KST (월~금) — 주식선물 30초봉 당일 적재
-    # 22시 30분은 장 마감(15:30) + 사후호가/정산 충분히 끝난 시점 — 데이터 안정.
-    # 23:00 분봉 일배치와 직렬로 붙여서 LENS 등 외부 LS 사용처가 22:30~24:00 한 블록만 피하면 됨.
+    # 잡 5: 매일 23:00 KST (월~금) — 주식선물 30초봉 당일 적재
+    # 23시는 장 마감(15:30) + 사후호가/정산 + 시간외(18:00) 충분히 끝난 시점.
+    # 분봉 일배치는 04:30 daily_update 끝으로 이전 → LENS는 23:00~23:10 stockfut 10분만 피하면 됨.
     scheduler.add_job(
         job_stockfut_today,
-        trigger=CronTrigger(day_of_week="mon-fri", hour=22, minute=30, timezone=KST),
+        trigger=CronTrigger(day_of_week="mon-fri", hour=23, minute=0, timezone=KST),
         id="stockfut_today",
         name="주식선물 30초봉 당일 (LS t8406, historical 불가)",
         misfire_grace_time=3600,
