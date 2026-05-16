@@ -1,7 +1,32 @@
 # 📝 TODO - 작업 목록
 
-> **마지막 업데이트**: 2026-05-16
-> **현재 Phase**: Phase 4 + Phase 5(배당) + KRX 휴장일 + KOSPI200/KOSDAQ150 SCD2 + ETF 일별 스냅샷 + 지수/지수선물/주식선물 일별 + **Phase 6 분봉**: 종목/ETF 30초봉 ✅ / 1분봉 1/2~4/24 ✅ + **Phase 7**: 지수/지수선물/주식선물 30초봉 + 분봉/일별 NEAR/NEXT 통합 view ✅ + **5/15-16 사고 대응**: LS API IGW00121 자동 처리 + cron layout 재구성 ✅
+> **마지막 업데이트**: 2026-05-17
+> **현재 Phase**: Phase 4 + Phase 5(배당) + KRX 휴장일 + KOSPI200/KOSDAQ150 SCD2 + ETF 일별 스냅샷 + 지수/지수선물/주식선물 일별 + **Phase 6 분봉**: 종목/ETF 30초봉 ✅ / 1분봉 1/2~4/24 ✅ + **Phase 7**: 지수/지수선물/주식선물 30초봉 + 분봉/일별 NEAR/NEXT 통합 view ✅ + **5/15-16 사고 대응** ✅ + **수정주가 시스템 (5/16-17) ✅**
+
+---
+
+## 🆕 2026-05-16 ~ 17 — 수정주가(Adjusted Price) 시스템 구축
+
+### 완료 (Phase 1~5)
+- [x] **Phase 1 schema** (`ohlcv_adjusted_migration.sql`) — ohlcv_daily/intraday adj 컬럼 + corporate_actions 테이블
+- [x] **LS API `get_daily_bars(sujung='Y', exchgubun='K')`** (`collectors/ls_api.py`) — t8451 cts_date 페이징
+- [x] **Phase 2 일봉 4년치 backfill** (`scripts/backfill_adjusted_daily.py`) — 3,828 종목 / 1.77M row / 256.9분 / 0 에러
+- [x] **Phase 3 corporate_actions 자동 추출** (`scripts/extract_corporate_actions.py`) — 7,895건 / 1,259 종목
+- [x] **Phase 4 분봉 adj_factor UPDATE** — 11.8M row / 399 영향 종목 / 4.5분
+- [x] **Phase 5 daily_update 자동 통합** (`run_adjusted_price_pipeline`) — gap > 15% 의심 종목만 LS 호출
+- [x] **`ohlcv_intraday_adjusted` view** — LENS가 테이블명만 변경하면 자동 수정주가
+
+### 결정 사항
+- Source = LS sujung=Y (인포맥스/DART는 raw만)
+- 일봉: raw + adj_* 컬럼 (4개) + adj_factor
+- 분봉: raw + adj_factor 컬럼만 (75M row 디스크 절약, query 시 곱셈)
+- 분봉 backfill = LS spec에 분봉 sujung 없음 → 일봉 factor를 분봉 raw에 곱셈 (옵션 D)
+- vendor 일관성: exchgubun='K' (KOSPI 정규시장) — 'N'(NXT)은 인포맥스와 차이
+
+### 후속 검증
+- [ ] **5/19 (화) 04:30 첫 자동 Phase 5 실행 검증** — 모니터 `bohtmr5mm` watch 중
+- [ ] **LENS에 view 사용법 안내 + 마이그**: bars.rs SELECT → `ohlcv_intraday_adjusted`
+- [ ] **DART 공시 매칭으로 event_type 정확 분류** (현재 'UNKNOWN_FROM_FACTOR' 일괄) — 향후
 
 ---
 

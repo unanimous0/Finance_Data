@@ -34,17 +34,27 @@ date '+%Y-%m-%d %A %H:%M:%S KST'
 
 ---
 
-## 운영 cron (5/16 기준)
+## 운영 cron (5/17 기준)
 
 | 시각 (KST) | 작업 | 소요 |
 |---|---|---|
 | 23:30 (월~금) | stockfut (LS) | ~10분 |
-| 04:30 (매일) | daily_update 본체 (인포맥스/DART/KRX) | ~3시간 |
+| 04:30 (매일) | daily_update 본체 (인포맥스/DART/KRX) + Phase 5 수정주가 자동 | ~3시간 |
 | 04:30 후 (직렬) | 분봉 일배치 (LS) | ~50분 |
 | 일 03:00 | DB 백업 | 짧음 |
 
-→ LS 사용 시간대: **23:30~23:40 + 07:30~08:30** (분봉 일배치 시작은 본체 후)
+→ LS 사용 시간대: **23:30~23:40 + 07:30~08:30 (Phase 5 의심 종목만 추가 ~수 분)**
 → LENS 사용 가능: 그 외 시간 (단 LENS 24/7 가동 시 LS token 공유 충돌 가능 — `IGW00121` 발생 시 ls_api.py가 자동 처리)
+
+## 수정주가 query (5/17~)
+
+| 데이터 | raw | adjusted |
+|---|---|---|
+| 일봉 | `SELECT close_price FROM ohlcv_daily` | `SELECT adj_close FROM ohlcv_daily` |
+| 분봉 | `SELECT close FROM ohlcv_intraday` | `SELECT close FROM ohlcv_intraday_adjusted` (view, 자동) |
+
+분봉 view는 raw × adj_factor 자동 곱셈 + volume은 raw 유지 + raw_* 별도 노출.
+corporate_actions 테이블에서 이벤트 발생 종목 + 일자 + factor 조회 가능.
 
 ---
 

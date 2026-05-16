@@ -5,6 +5,96 @@
 
 ---
 
+## 2026-05-16 ~ 17 — 수정주가(Adjusted Price) 시스템 구축 (Phase 1~5)
+
+### 배경
+- 사용자 발견: LS일렉트릭(010120) 4/10 raw 788,000 → 4/13 179,200 (~-77% 점프, 실제는 1:5 분할)
+- 인포맥스 raw만 적재되어 corporate action 미반영
+- LENS stat-arb 등 log-returns 분석 오염 위험
+
+### 핵심 설계 결정 (3 에이전트 + 보강 토의)
+
+| 결정 | 이유 |
+|---|---|
+| **Source = LS sujung=Y** | 인포맥스/DART는 raw만, LS 일봉만 sujung 옵션 (분봉 sujung 없음 확정 — t8452 spec grep) |
+| **저장 = 일봉 raw + adj 컬럼, 분봉 raw + adj_factor 컬럼만** | 분봉 75M row 디스크 절약. raw × factor query 시 자동 계산 |
+| **분봉 backfill = factor 곱셈** | LS 분봉 sujung 없음 + lookback 16일 한계 → 일봉 factor 비율을 분봉 raw에 곱셈 |
+| **vendor 차이 해결 = exchgubun='K'** | 기본 'N'(NXT)은 인포맥스와 1,000원~8,500원 차이. 'K'(KOSPI 정규시장) 통일 |
+
+### Phase별 작업
+
+#### Phase 1 — schema + LS API 함수
+- `database/schema/ohlcv_adjusted_migration.sql` 신규:
+  - `ohlcv_daily`: adj_open/high/low/close/factor/updated_at 컬럼
+  - `ohlcv_intraday`: adj_factor + adj_updated_at 컬럼 (price 컬럼 안 만듦 — 75M row 절약)
+  - `corporate_actions`: 메타 테이블 (event_date, type, ratio, factor, source 등)
+- `collectors/ls_api.py:get_daily_bars(sujung='Y', exchgubun='K')` — t8451 cts_date 페이징
+- 한계: una0 superuser 아님 + chunk owner 일부 postgres → schema ALTER 시 sudo postgres 필요 (TimescaleDB가 chunk owner 변경 막음)
+
+#### Phase 2 — 일봉 4년치 전체 backfill (`scripts/backfill_adjusted_daily.py`)
+- is_active=TRUE 3,828 종목 × 4년치 (2022-01-03 ~ 2026-05-15)
+- 종목당 raw(sujung=N) + adj(sujung=Y) = 2 호출
+- TPS 1, ~134분 예상 → 실제 **256.9분** (IGW00201 rate limit retry 누적)
+- 결과: **1,772,848 row UPDATE / 0 에러**
+- 검증: LS일렉트릭 4/10 factor 0.2 / 4/13 factor 1.0 정확 검출
+
+#### Phase 3 — corporate_actions 자동 추출 (`scripts/extract_corporate_actions.py`)
+- ohlcv_daily의 adj_factor 변화 일자 자동 detect
+- **7,895건 / 1,259 종목** 적재:
+  - LS일렉트릭 4/13 SPLIT 1:5
+  - 신성이엔지 5/15 REVERSE_SPLIT 10:1
+  - ETF 배당락 (factor 0.99~1.01) 다수
+- event_type 일괄 `UNKNOWN_FROM_FACTOR` (향후 DART 매칭으로 정확 분류)
+
+#### Phase 4 — 분봉 adj_factor 채우기
+- SQL 한 줄 UPDATE: `ohlcv_intraday.adj_factor = 일봉.adj_factor (factor != 1만)`
+- **11.8M row UPDATE / 399 영향 종목 / 4.5분**
+- 검증: LS일렉트릭 4/10 분봉 factor=0.2 → query 시 close × 0.2 = adjusted
+
+#### Phase 5 — daily_update 자동 통합 (`scripts/daily_update.py:run_adjusted_price_pipeline`)
+- 매일 04:30 cron 끝 (지수+선물 일별 다음)에 자동 호출
+- STEP 1: 새 raw row에 이전일 adj_factor 곱셈 → adj_close 자동 (**LS 호출 0**)
+- STEP 2: 전일 close vs 당일 open gap > 15% 종목 감지
+- STEP 3: 의심 종목만 LS sujung=Y 전체 history 재호출 + adj_* UPDATE
+- STEP 4: corporate_actions UPSERT + ohlcv_intraday adj_factor UPDATE
+- 검증 (5/15 target): 17 의심 종목 / 34 LS calls / 223 corp_actions / 109k 분봉 UPDATE
+
+#### 추가 — LENS용 view (`ohlcv_intraday_adjusted_view.sql`)
+- LENS가 raw로 query하는 코드 변경 최소화
+```sql
+SELECT close FROM ohlcv_intraday          -- raw (옛 사용)
+SELECT close FROM ohlcv_intraday_adjusted -- adjusted 자동
+```
+- raw_close 컬럼 별도 노출 (원본 비교용). volume은 raw 유지.
+
+### 운영 자동화
+
+매일 04:30 cron이 자동으로:
+1. raw 가격에 이전일 adj_factor 곱셈 (LS 0 호출)
+2. gap > 15% 의심 종목 감지
+3. 의심 종목 LS sujung=Y 재호출 → adj_* 적재
+4. corporate_actions 자동 INSERT
+5. 분봉 adj_factor 자동 UPDATE
+
+→ **평상시 LS 호출 0**, 이벤트 시 의심 종목만 ~10-20 calls.
+
+### 🎓 배운 점
+
+- **LS t8452 (분봉)에 sujung 옵션 없음** — 전 ls_api_full.md grep으로 최종 확정 (Agent A 처음 잘못 인용)
+- **exchgubun='K' vs 'N' vendor 일관성**: 'N'(NXT 대체거래소)은 인포맥스(KOSPI 정규시장)과 가격 다름. 기본 'K' 권장
+- **factor 곱셈 vs LS adjusted 미세 오차 1~2원**: numeric(20,10) 정밀도 한계. 분석 영향 0 (베타/회귀는 % 기반)
+- **TimescaleDB chunk owner 변경 불가**: `operation not supported on chunk tables` 에러. 옛 chunk가 postgres owner면 ALTER 시 postgres role 필요
+- **gap > 15% detection이 LS 호출 절약**: 매일 3,828 종목 sujung=Y 호출(~67분) 대신 의심 종목만 (~수 calls)
+- **분봉은 factor 컬럼만, 일봉은 adj_* 4컬럼**: 분봉 75M row 디스크 절약 (600 MB vs 3 GB) — view에서 곱셈
+
+### 🔗 5/16~17 커밋
+- `7340663` feat: 일봉 수정주가(LS sujung=Y) 인프라 + 전체 백필 시작
+- `9232818` docs: CLAUDE.md 시간 확인 규칙 강화
+- `c377b42` feat: Phase 3+5 — corporate_actions 자동 추출 + daily_update 수정주가 통합
+- `480b881` feat: ohlcv_intraday_adjusted view — LENS 자동 수정주가 query
+
+---
+
 ## 2026-05-15 ~ 16 — 운영 사고 + LENS LS 계정 token contention 확정
 
 ### 5/15 (금) — scheduler 재시작 silent kill 사고
