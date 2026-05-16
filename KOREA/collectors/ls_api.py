@@ -494,6 +494,46 @@ class LsApiClient:
         dedup = {b["time"]: b for b in target_bars}
         return sorted(dedup.values(), key=lambda r: r["time"])
 
+    # ── t8451: 주식 일/주/월/년 차트 (sujung=Y/N 수정주가 지원) ──────────
+    def get_daily_bars(self, shcode: str, sdate: date = None, edate: date = None,
+                       sujung: str = "Y", exchgubun: str = "K") -> list[dict]:
+        """주식 일봉 (sujung=Y → 수정주가, N → raw). 4년치 한 호출에 받기 가능 (qrycnt 큰값).
+        반환: [{"date","open","high","low","close","jdiff_vol","value",...}, ...] (date 오름차순)
+        sdate/edate 모두 date 객체. None이면 max 범위. cts_date 페이징으로 무제한."""
+        url = f"{BASE_URL}/stock/chart"
+        sdate_s = sdate.strftime("%Y%m%d") if sdate else ""
+        edate_s = edate.strftime("%Y%m%d") if edate else "99999999"
+        all_bars: list[dict] = []
+        cts_date = ""
+        seen_cts: set[str] = set()
+
+        while True:
+            in_block = {
+                "shcode": shcode, "gubun": "2", "qrycnt": 2000,
+                "sdate": sdate_s, "edate": edate_s,
+                "cts_date": cts_date, "comp_yn": "N",
+                "sujung": sujung, "exchgubun": exchgubun,
+            }
+            data = self._post_generic("t8451", url, "t8451InBlock", in_block)
+            if data.get("_no_data"):
+                break
+            bars = data.get("t8451OutBlock1", []) or []
+            if not bars:
+                break
+            all_bars.extend(bars)
+            out = data.get("t8451OutBlock", {}) or {}
+            nd = (out.get("cts_date", "") or "").strip()
+            if not nd or nd in seen_cts:
+                break
+            seen_cts.add(nd)
+            cts_date = nd
+            if sdate_s and nd <= sdate_s:
+                break
+
+        # dedup by date, sort ascending
+        dedup = {b["date"]: b for b in all_bars if b.get("date")}
+        return sorted(dedup.values(), key=lambda r: r["date"])
+
     # ── t8406: 주식선물 분차트 (당일만 — historical 불가) ───────────────
     def get_stockfut_today_bars(self, focode: str, bgubun: int = 0) -> list[dict]:
         """주식선물 분봉 (오늘 1일치만). bgubun=0(30초) | 1(1분) | 2/30/60(N분).
