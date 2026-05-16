@@ -1,7 +1,33 @@
 # 📝 TODO - 작업 목록
 
-> **마지막 업데이트**: 2026-05-14 (오후)
-> **현재 Phase**: Phase 4 + Phase 5(배당) + KRX 휴장일 + KOSPI200/KOSDAQ150 SCD2 + ETF 일별 스냅샷 + 지수/지수선물/주식선물 일별 + **Phase 6 분봉**: 종목/ETF 30초봉 ✅ / 1분봉 1/2~4/24 ✅ + **Phase 7**: 지수/지수선물/주식선물 30초봉 + 분봉/일별 NEAR/NEXT 통합 view ✅
+> **마지막 업데이트**: 2026-05-16
+> **현재 Phase**: Phase 4 + Phase 5(배당) + KRX 휴장일 + KOSPI200/KOSDAQ150 SCD2 + ETF 일별 스냅샷 + 지수/지수선물/주식선물 일별 + **Phase 6 분봉**: 종목/ETF 30초봉 ✅ / 1분봉 1/2~4/24 ✅ + **Phase 7**: 지수/지수선물/주식선물 30초봉 + 분봉/일별 NEAR/NEXT 통합 view ✅ + **5/15-16 사고 대응**: LS API IGW00121 자동 처리 + cron layout 재구성 ✅
+
+---
+
+## 🆕 2026-05-15 ~ 16 — 운영 사고 + LENS LS 계정 token contention 대응
+
+### 완료
+- [x] **scheduler SIGTERM/SIGINT graceful handler 추가** (`5368534`) ⚠️ BlockingScheduler에 가려 실제 작동 안 함, fix 필요 (아래 미완 참고)
+- [x] **ETF PDF 2-pass (today + yesterday)** (`d330d8c`) — LENS 당일 PDF 즉시 사용
+- [x] **분봉 일배치 cron 통합** (`2ceeb19`) — 23:00 별도 cron → 04:30 daily_update 끝에 직렬 통합
+- [x] **stockfut cron 22:30 → 23:30** (`91dadc1`) — 사용자 야간 LENS 자유 시간 확보
+- [x] **LS API 5xx 본문 debug 로깅** (`e436db6`) — 사고 본문 캡처에 결정적 역할
+- [x] **LS API IGW00121 자동 처리** (`ed51570`) — 4 호출 사이트, 401과 같은 패턴
+- [x] **5/14 daily_update 후속 단계 수동 복구** — PID 2672623 (지수/선물 일봉 + ETF + 배당)
+- [x] **futures_master.json 5/14→5/15 수동 export** — LENS 5월물 만기 → 6월물 롤오버
+- [x] **5/15 stockfut 5/15 누락 ON CONFLICT 자동 보충**
+- [x] **CLAUDE.md 신규** — 시간/날짜 KST 확인 규칙 + 운영 cron 표 + scheduler 재시작 절대 체크
+- [x] **memory feedback_time_check.md** — 메모리 시스템에도 영구 기록
+
+### 진행 중 (5/16 ~12:50 KST)
+- [-] **5/14, 5/15 분봉 일배치 수동 복구** (PID 2720521) — 종목별 갭 fill로 양일 자동 sweep
+- [-] **5/15 외인지분율 `--missing-only` 보충** (PID 2720561)
+
+### 미완 / 후속 작업
+- [ ] **외인지분율 STEP 분리 + daily_update 끝에서 두 번째로 이동** — 04:30이 외인 안전선 5:30보다 일러서 부족 (1,577/2,646). `run_update` 내부 STEP 3 추출 + 별도 함수 + `main()` 순서 변경 필요
+- [ ] **SIGTERM handler 실제 작동 fix** — BlockingScheduler 내부 SIGINT handler가 우리 거 가림. 다른 패턴 필요 (BackgroundScheduler 전환 또는 wrapper script)
+- [ ] **scheduler 재시작 pre-flight wrapper script** (`scripts/scheduler_restart.sh`) — `pgrep -f daily_update` 자동 체크 + 진행 중 차단
 
 ---
 

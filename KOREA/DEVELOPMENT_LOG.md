@@ -5,6 +5,99 @@
 
 ---
 
+## 2026-05-15 ~ 16 — 운영 사고 + LENS LS 계정 token contention 확정
+
+### 5/15 (금) — scheduler 재시작 silent kill 사고
+
+| 시각 (KST) | 사건 |
+|---|---|
+| 5/15 05:30 | daily_update cron 정상 시작 |
+| 5/15 **08:28** | **scheduler 재시작 (cron 5:30→4:30 변경)** — `tmux send-keys C-c`가 자식 daily_update process 동시 종료 → 5/14 후속 단계(지수/선물 일봉, ETF 스냅샷, 배당 일부, futures_master export) 미적재 |
+| 5/15 11:58 | futures_master.json 수동 export 복구 (5/14 만기 5월물 → 6월물 롤오버 못한 상태였음) |
+| 5/15 12:46 | 5/14 daily_update 수동 재실행 (PID 2672623) |
+| 5/15 ~16:00 | PID 2672623 완료 — 5/14 모든 후속 단계 적재 (지수 1,500 / 선물 3,576 / ETF 38,868 PDF) |
+| 5/15 **22:30** | stockfut cron 진행 중 22:37 또 scheduler 재시작 → silent kill 재발 → 5/15 stockfut 420/546만 적재 |
+| 5/15 23:30 | 새 cron으로 stockfut 재실행 → ON CONFLICT UPSERT로 546/546 자동 보충 ✅ |
+
+### 5/15 코드 변경 (7 commits)
+
+| 커밋 | 변경 | 검증 결과 |
+|---|---|---|
+| `5368534` | scheduler에 SIGTERM/SIGINT graceful handler 추가 (`shutdown(wait=True)`) | ⚠️ **실제 작동 안 함** — BlockingScheduler 내부 SIGINT handler가 우리 거 가림. fix 필요 (TODO) |
+| `d330d8c` | ETF PDF 2-pass (today + yesterday) | ✅ LENS 당일 PDF 즉시 사용 가능 |
+| `2ceeb19` | 분봉 일배치 cron 23:00 → daily_update(04:30) 끝으로 통합 + stockfut 22:30 → 23:00 | ✅ 사용자 야간 LENS 자유 시간 확보 |
+| `91dadc1` | stockfut cron 23:00 → 23:30 (사용자 자기 전 LENS +30분 추가 확보) | ✅ |
+| `e436db6` | LS API 5xx 본문 debug 로깅 | ✅ 5/16 사고 본문 캡처에 결정적 역할 |
+
+### 5/16 (토) 04:30 통합 cron 첫 실행
+
+| 단계 | 결과 |
+|---|---|
+| daily_update 본체 (인포맥스/DART/KRX) | ✅ OHLCV/수급/배당/ETF/지수+선물 일별 모두 적재 |
+| **외인지분율** | ⚠️ **1,577/2,646 (40% 누락)** — 04:30이 외인 안전선 5:30보다 일러서 인포맥스 외인 데이터 미완 |
+| **분봉 일배치 (LS API)** | ❌ **전부 `IGW00121` token invalid** → 5/14, 5/15 분봉 0 row 적재 |
+
+### 원인 확정 — LENS LS 계정 token contention
+
+가설 추적:
+- 5/14 새벽 LS 5xx 3.4% 다발 → 처음엔 "LS 새벽 시간대 자체 불안정"으로 추정
+- 5/15 23:30 stockfut + LENS 동시 가동 → 0 에러 → 가설 약화
+- **5/16 04:30 무거운 부하 (분봉 일배치 ~2,000 LS 호출)에서 IGW00121 다발 → 가설 재확정**
+
+본문 (e436db6 debug 로깅 덕분):
+```
+{"rsp_cd":"IGW00121","rsp_msg":"유효하지 않은 token 입니다."}
+{"rsp_cd":"IGW00201","rsp_msg":"호출 거래건수를 초과하였습니다."}
+```
+
+→ LENS realtime 24/7 가동 + 같은 LS 계정 공유 → LENS의 token refresh가 우리 token 무효화. LS는 token invalid를 **HTTP 401 아닌 500 + IGW00121**로 응답하는 케이스 존재.
+
+### 5/16 fix + 복구 (커밋 1)
+
+| 커밋 | 변경 |
+|---|---|
+| `ed51570` | LS API 4 호출 사이트에 IGW00121 자동 처리 — 5xx 응답 본문에 "IGW00121" 있으면 invalidate + 재발급 + retry (기존 401과 같은 패턴, LS의 일관성 부재 보완) |
+
+복구 작업 (5/16 ~12:50 진행 중):
+- 분봉 일배치 5/14, 5/15 수동 재실행 (PID 2720521, 종목별 갭 fill로 양일 자동 sweep)
+- 외인지분율 5/15 `--missing-only` 보충 (PID 2720561)
+
+### CLAUDE.md 신규 작성
+
+5/14~5/16 사이 시간/날짜 여러 번 착각 (모니터 알림 timestamp, 로그 mtime, 앞 메시지 시각을 현재로 추정 → 4~10시간 차이) → 사용자 지적.
+
+`/home/una0/projects/Finance_Data/KOREA/CLAUDE.md` 신규 작성 — 시간 의존 작업 전 `date '+%Y-%m-%d %A %H:%M:%S KST'` 필수 실행 규칙 명시 + 운영 cron 표 + scheduler 재시작 절대 체크.
+
+메모리 시스템에도 `feedback_time_check.md` 추가.
+
+### 새 cron 운영 layout (확정)
+
+| 시각 (KST) | 작업 | 소요 |
+|---|---|---|
+| 23:30 (월~금) | stockfut (LS) | ~10분 |
+| 04:30 (매일) | daily_update 본체 (인포맥스/DART/KRX) → 분봉 일배치 (LS) 직렬 | ~3시간 + ~50분 |
+| 일 03:00 | DB 백업 | 짧음 |
+
+LENS 사용 가능: **23:40 ~ 04:30** (야간 4h 50m) + **08:30 ~ 23:30** (한낮 15h)
+
+### 🎓 배운 점
+
+- **scheduler 재시작 = 자식 process 죽음**: `tmux send-keys C-c`는 PTY 전체에 SIGINT. SIGTERM handler 추가했지만 BlockingScheduler 내부에 가려 작동 안 함 (별도 fix 필요)
+- **scheduler 재시작 전 절대 체크**: `pgrep -f daily_update` — 진행 중 job 있으면 차단 (CLAUDE.md 강제 규칙)
+- **시간/날짜 KST 실제 확인**: 모니터 알림 / 로그 mtime / 앞 메시지 시각을 현재로 착각 위험. `date` 명령 필수 (CLAUDE.md + memory 강제)
+- **LS API 일관성 부재**: token invalid를 401과 500(IGW00121) 둘 다로 응답. 양쪽 핸들링 필요
+- **debug 로깅의 가치**: e436db6 (5xx 본문 로깅)이 없었으면 IGW00121 진단 불가능했을 것. **사고 발생 한 사이클 안에 본문 캡처 → 다음 사이클에 fix 적용**
+
+### 🔗 5/15~16 커밋
+- `5368534` fix: scheduler SIGTERM graceful (작동 안 함 — TODO)
+- `d330d8c` feat: ETF PDF 2-pass
+- `2ceeb19` chore: 분봉 일배치 daily_update 통합 + stockfut 23:00
+- `91dadc1` chore: stockfut 23:30
+- `e436db6` debug: LS API 5xx 본문 로깅
+- `ed51570` fix: LS API IGW00121 자동 처리
+
+---
+
 ## 2026-05-14 — 분봉 일배치 안정화 (운영 사고 + 5중 구조 개선)
 
 ### 운영 사고 타임라인

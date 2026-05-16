@@ -1,7 +1,7 @@
 # 🏢 한국 주식시장 데이터 중앙 관리 시스템
 
-> **마지막 업데이트**: 2026-05-14 (오후)
-> **프로젝트 상태**: Phase 4 완료 + Phase 5(배당) + KRX 휴장일 SSoT + KOSPI200/KOSDAQ150 SCD2 + ETF 일별 스냅샷 + 지수/지수선물/주식선물 **일별** OHLCV + **Phase 6 분봉**: 종목/ETF 30초봉 ✅ (1분봉 1/2~4/24 완료) + **Phase 7 (지수/지수선물/주식선물 30초봉)**: contract별 useful 구간 백필 + 분봉/일별 NEAR/NEXT 통합 view (자동 만기 정렬)
+> **마지막 업데이트**: 2026-05-16
+> **프로젝트 상태**: Phase 4 완료 + Phase 5(배당) + KRX 휴장일 SSoT + KOSPI200/KOSDAQ150 SCD2 + ETF 일별 스냅샷 + 지수/지수선물/주식선물 **일별** OHLCV + **Phase 6 분봉**: 종목/ETF 30초봉 ✅ (1분봉 1/2~4/24 완료) + **Phase 7 (지수/지수선물/주식선물 30초봉)**: contract별 useful 구간 백필 + 분봉/일별 NEAR/NEXT 통합 view (자동 만기 정렬) + **5/15-16 운영 사고 fix**: LS API IGW00121 token invalid 자동 처리 + cron layout 재구성 (stockfut 23:30 + daily_update 04:30 통합) + ETF PDF 2-pass + **CLAUDE.md 신규** (시간/날짜 KST 확인 규칙)
 > **Repository**: https://github.com/unanimous0/Finance_Data/tree/main/KOREA
 
 ---
