@@ -1562,6 +1562,48 @@ def _gap_business_days(table: str, code_col: str, target_date: date) -> list[dat
 _EPOCH_30SEC = date(2026, 1, 2)  # Phase 6 분봉 시스템 시작일
 
 
+def _per_code_gap_simple(table: str, code_col: str, codes: list[str],
+                         target_date: date) -> tuple[dict[str, list[date]], int]:
+    """code별 max(time)+1 ~ target_date 거래일 dict. interval 무관 (지수/지수선물용).
+
+    종목/ETF용 _per_stock_gap은 interval_seconds 분리 검사 (30초/1분봉 혼재).
+    지수/지수선물은 30초봉 한 종류만 받으니 더 단순한 종목별 max만으로 충분.
+
+    이 함수가 필요한 이유: 같은 테이블(futures_ohlcv_intraday)에 stockfut과 지수선물이
+    공존. 옛 _gap_business_days (테이블 전체 max) 사용 시 stockfut max가 지수선물 갭
+    가림 → 지수선물 4 contracts 누락 (5/14, 5/15 사례).
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {code_col}, MAX((time AT TIME ZONE 'Asia/Seoul')::date) "
+                f"FROM {table} WHERE {code_col} = ANY(%s) GROUP BY {code_col}",
+                (list(codes),))
+            max_per_code = {r[0]: r[1] for r in cur.fetchall()}
+
+            cur.execute(
+                "SELECT time FROM ohlcv_daily WHERE time BETWEEN %s AND %s "
+                "GROUP BY time ORDER BY time",
+                (_EPOCH_30SEC, target_date))
+            all_biz = [r[0] for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+    gaps: dict[str, list[date]] = {}
+    total = 0
+    for code in codes:
+        last = max_per_code.get(code)
+        start = (last + timedelta(days=1)) if last else _EPOCH_30SEC
+        if start > target_date:
+            gaps[code] = []
+        else:
+            days = [d for d in all_biz if start <= d <= target_date]
+            gaps[code] = days
+            total += len(days)
+    return gaps, total
+
+
 def _per_stock_gap(table: str, code_col: str, codes: list[str],
                    target_date: date) -> tuple[dict[str, list[date]], int]:
     """종목별 (날짜+인터벌) 단위 갭 체크 → {code: [biz_days]} + 총 호출 수.
@@ -1694,7 +1736,8 @@ def run_minute_bars_pipeline(target_date: date) -> dict:
 def run_index_minute_bars_pipeline(target_date: date) -> dict:
     """
     지수 30초봉 일배치 (LS t8418, /indtp/chart).
-    갭 backfill: index_ohlcv_intraday max(time)+1 ~ target_date.
+    갭 backfill: **종목별** max(time)+1 ~ target_date (옛 테이블 전체 max는 다른 contract에
+    가려질 위험 — 5/16 지수선물 사례. _per_code_gap_simple 사용).
     스코프: KOSPI200(101) + KOSDAQ150(301) 만 (사용자 정책).
     """
     from collectors.ls_api import LsApiClient, LsApiError
@@ -1704,25 +1747,28 @@ def run_index_minute_bars_pipeline(target_date: date) -> dict:
     print("  ⏱️  지수 분봉 일배치 (LS t8418)")
     print("=" * 70)
 
-    biz_days = _gap_business_days("index_ohlcv_intraday", "index_code", target_date)
-    if not biz_days:
-        print(f"  [skip] 갭 0일")
-        return {"days": 0, "rows": 0}
+    codes = ["101", "301"]  # KOSPI200, KOSDAQ150
+    gaps, total_calls = _per_code_gap_simple("index_ohlcv_intraday", "index_code", codes, target_date)
+    if total_calls == 0:
+        print(f"  [skip] 모든 지수 갭 0일 (target_date={target_date})")
+        return {"calls": 0, "rows": 0}
+
+    print(f"  [스코프] {len(codes)} 지수 (KOSPI200, KOSDAQ150) / 호출 {total_calls}건")
+    for c in codes:
+        days = gaps.get(c, [])
+        if days: print(f"     {c}: {len(days)}일 → {days[0]} ~ {days[-1]}")
 
     client = LsApiClient()
-    codes = ["101", "301"]  # KOSPI200, KOSDAQ150
-    print(f"  [스코프] {len(codes)} 지수 (KOSPI200, KOSDAQ150) × {len(biz_days)} 일")
-
     conn = get_conn()
     try:
         total_rows = 0
         empty = 0
         errors = []
+        calls_done = 0
         from time import time as now
         t0 = now()
-        for di, day in enumerate(biz_days, 1):
-            print(f"  ▶ day {di}/{len(biz_days)} = {day}", flush=True)
-            for i, code in enumerate(codes, 1):
+        for code in codes:
+            for day in gaps.get(code, []):
                 try:
                     bars = client.get_index_intraday_bars(code, day, ncnt=0)
                     if not bars:
@@ -1734,12 +1780,11 @@ def run_index_minute_bars_pipeline(target_date: date) -> dict:
                     errors.append((code, day, e.category))
                 except Exception as e:
                     errors.append((code, day, f"unexpected:{type(e).__name__}"))
-                if i % 100 == 0:
-                    print(f"    [{i}/{len(codes)}] 적재 {total_rows:,}row", flush=True)
+                calls_done += 1
 
         elapsed = now() - t0
-        print(f"\n  [완료] {len(biz_days)}일 / 소요 {elapsed/60:.1f}분 / 적재 {total_rows:,}row / 빈 {empty} / 에러 {len(errors)}")
-        return {"days": len(biz_days), "indices": len(codes), "rows": total_rows, "empty": empty, "errors": len(errors)}
+        print(f"\n  [완료] 호출 {calls_done}건 / 소요 {elapsed/60:.1f}분 / 적재 {total_rows:,}row / 빈 {empty} / 에러 {len(errors)}")
+        return {"calls": calls_done, "indices": len(codes), "rows": total_rows, "empty": empty, "errors": len(errors)}
     finally:
         conn.close()
 
@@ -1747,7 +1792,8 @@ def run_index_minute_bars_pipeline(target_date: date) -> dict:
 def run_futures_minute_bars_pipeline(target_date: date) -> dict:
     """
     지수선물 30초봉 일배치 (LS t8465).
-    갭 backfill: futures_ohlcv_intraday max(time)+1 ~ target_date.
+    갭 backfill: **contract별** max(time)+1 ~ target_date (옛 테이블 전체 max는 같은 테이블의
+    stockfut 적재 시 가려져 지수선물 4 contracts 누락 — 5/14, 5/15 사례. _per_code_gap_simple 사용).
     스코프: KOSPI200 F + KOSDAQ150 F 중 근월+다음월물만 (4개, 매일 자동 갱신).
     주식선물(t8406)은 별도 함수 (당일만, run_stockfut_minute_today_pipeline).
     """
@@ -1758,29 +1804,31 @@ def run_futures_minute_bars_pipeline(target_date: date) -> dict:
     print("  ⏱️  지수선물 분봉 일배치 (LS t8465, 근월+다음월물만)")
     print("=" * 70)
 
-    biz_days = _gap_business_days("futures_ohlcv_intraday", "futures_code", target_date)
-    if not biz_days:
-        print(f"  [skip] 갭 0일")
-        return {"days": 0, "rows": 0}
-
     client = LsApiClient()
     # daily cron — 그 날짜 기준 NEAR + NEXT 4개만 (사용자 정책: 각 contract 유효 구간 내 fetch)
     pairs = fetch_index_futures_master(client, near_next_only=target_date)
     codes = [c for c, _ in pairs]
-    print(f"  [스코프] {len(codes)} 선물 (NEAR+NEXT only) × {len(biz_days)} 일")
+
+    gaps, total_calls = _per_code_gap_simple("futures_ohlcv_intraday", "futures_code", codes, target_date)
+    if total_calls == 0:
+        print(f"  [skip] 모든 선물 갭 0일 (target_date={target_date})")
+        return {"calls": 0, "rows": 0}
+
+    print(f"  [스코프] {len(codes)} 선물 (NEAR+NEXT only) / 호출 {total_calls}건")
     for sh, hn in pairs:
-        print(f"     {sh:10s} {hn}")
+        days = gaps.get(sh, [])
+        if days: print(f"     {sh:10s} {hn:20s} {len(days)}일 → {days[0]} ~ {days[-1]}")
 
     conn = get_conn()
     try:
         total_rows = 0
         empty = 0
         errors = []
+        calls_done = 0
         from time import time as now
         t0 = now()
-        for di, day in enumerate(biz_days, 1):
-            print(f"  ▶ day {di}/{len(biz_days)} = {day}", flush=True)
-            for i, code in enumerate(codes, 1):
+        for code in codes:
+            for day in gaps.get(code, []):
                 try:
                     bars = client.get_futures_intraday_bars(code, day, ncnt=0)
                     if not bars:
@@ -1792,10 +1840,11 @@ def run_futures_minute_bars_pipeline(target_date: date) -> dict:
                     errors.append((code, day, e.category))
                 except Exception as e:
                     errors.append((code, day, f"unexpected:{type(e).__name__}"))
+                calls_done += 1
 
         elapsed = now() - t0
-        print(f"\n  [완료] {len(biz_days)}일 / 소요 {elapsed/60:.1f}분 / 적재 {total_rows:,}row / 빈 {empty} / 에러 {len(errors)}")
-        return {"days": len(biz_days), "futures": len(codes), "rows": total_rows, "empty": empty, "errors": len(errors)}
+        print(f"\n  [완료] 호출 {calls_done}건 / 소요 {elapsed/60:.1f}분 / 적재 {total_rows:,}row / 빈 {empty} / 에러 {len(errors)}")
+        return {"calls": calls_done, "futures": len(codes), "rows": total_rows, "empty": empty, "errors": len(errors)}
     finally:
         conn.close()
 
