@@ -1255,6 +1255,157 @@ def run_index_components_pipeline(target_date: date) -> dict:
     return summary
 
 
+def run_adjusted_price_pipeline(target_date: date) -> dict:
+    """일봉 수정주가(adj_*) 적재 + corporate action 감지.
+
+    정책: 매일 LS 호출 최소화 — gap > 15% 종목만 sujung=Y로 전체 history 재호출.
+    평상시 (이벤트 없음):
+        - 어제 raw에 이전 일자의 adj_factor 곱셈 → adj_close = raw * factor (DB 내부 계산)
+        - 단 1회 SQL UPDATE. LS 호출 0.
+    이벤트 감지 (gap > 15%):
+        - 의심 종목 전체 history sujung=Y 재호출 (LS)
+        - corporate_actions INSERT + 분봉 adj_factor UPDATE
+    """
+    print("\n" + "=" * 70)
+    print(f"  📈 수정주가 적재 (target={target_date})")
+    print("=" * 70)
+    conn = get_conn()
+    try:
+        # STEP 1: 평상시 — adj_close = raw * 이전일 factor (LS 호출 0)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE ohlcv_daily a SET
+                      adj_open       = (a.open_price  * COALESCE(p.adj_factor, 1.0))::numeric(12,2),
+                      adj_high       = (a.high_price  * COALESCE(p.adj_factor, 1.0))::numeric(12,2),
+                      adj_low        = (a.low_price   * COALESCE(p.adj_factor, 1.0))::numeric(12,2),
+                      adj_close      = (a.close_price * COALESCE(p.adj_factor, 1.0))::numeric(12,2),
+                      adj_factor     = COALESCE(p.adj_factor, 1.0),
+                      adj_updated_at = NOW()
+                    FROM (
+                        SELECT DISTINCT ON (stock_code) stock_code, adj_factor
+                        FROM ohlcv_daily
+                        WHERE time < %s AND adj_factor IS NOT NULL
+                        ORDER BY stock_code, time DESC
+                    ) p
+                    WHERE a.time = %s
+                      AND a.stock_code = p.stock_code
+                      AND a.adj_close IS NULL
+                """, (target_date, target_date))
+                inserted = cur.rowcount
+        print(f"  [STEP 1] adj_* 적재 (raw × prev factor): {inserted:,} 종목")
+
+        # STEP 2: gap > 15% 의심 종목 추출 (전일 close vs 당일 open)
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT a.stock_code, a.open_price, p.close_price,
+                       ROUND((a.open_price::numeric / NULLIF(p.close_price, 0) - 1) * 100, 2) AS pct
+                FROM ohlcv_daily a
+                JOIN LATERAL (
+                    SELECT close_price FROM ohlcv_daily
+                    WHERE stock_code = a.stock_code AND time < %s
+                    ORDER BY time DESC LIMIT 1
+                ) p ON true
+                WHERE a.time = %s
+                  AND p.close_price > 0
+                  AND (a.open_price::numeric / p.close_price < 0.85
+                       OR a.open_price::numeric / p.close_price > 1.15)
+                ORDER BY a.stock_code
+            """, (target_date, target_date))
+            suspects = cur.fetchall()
+        print(f"  [STEP 2] gap > 15% 의심 종목: {len(suspects)}건")
+        for s in suspects[:5]:
+            print(f"     {s[0]}: prev close={s[2]:,} → today open={s[1]:,} ({s[3]:+}%)")
+
+        if not suspects:
+            print("  ✅ 이벤트 0 — LS 호출 없이 완료")
+            return {"updated": inserted, "suspects": 0, "ls_calls": 0}
+
+        # STEP 3: 의심 종목 sujung=Y 전체 history 재호출 + UPDATE
+        from collectors.ls_api import LsApiClient
+        cli = LsApiClient()
+        EPOCH = date(2022, 1, 3)
+        full_updates = 0
+        ls_calls = 0
+        new_events = 0
+        for code, _, _, _ in suspects:
+            try:
+                raw = cli.get_daily_bars(code, sdate=EPOCH, edate=target_date, sujung="N")
+                adj = cli.get_daily_bars(code, sdate=EPOCH, edate=target_date, sujung="Y")
+                ls_calls += 2
+            except Exception as e:
+                print(f"     [err] {code}: {e}")
+                continue
+            raw_map = {b["date"]: b for b in raw if b.get("date")}
+            adj_map = {b["date"]: b for b in adj if b.get("date")}
+            rows = []
+            for ymd, ab in adj_map.items():
+                rb = raw_map.get(ymd)
+                if not rb: continue
+                rc, ac = rb.get("close"), ab.get("close")
+                if not rc or not ac: continue
+                factor = ac / rc
+                rows.append((
+                    date(int(ymd[:4]), int(ymd[4:6]), int(ymd[6:8])),
+                    code, ab.get("open"), ab.get("high"), ab.get("low"), ac,
+                    round(factor, 10),
+                ))
+            if rows:
+                with conn:
+                    with conn.cursor() as cur:
+                        psycopg2.extras.execute_values(cur, """
+                            UPDATE ohlcv_daily SET
+                              adj_open=data.adj_open::numeric, adj_high=data.adj_high::numeric,
+                              adj_low=data.adj_low::numeric, adj_close=data.adj_close::numeric,
+                              adj_factor=data.adj_factor::numeric, adj_updated_at=NOW()
+                            FROM (VALUES %s) AS data(time, stock_code, adj_open, adj_high, adj_low, adj_close, adj_factor)
+                            WHERE ohlcv_daily.time = data.time::date
+                              AND ohlcv_daily.stock_code = data.stock_code
+                        """, rows, page_size=500)
+                full_updates += len(rows)
+                new_events += 1
+        print(f"  [STEP 3] 의심 {len(suspects)} 종목 LS 재호출 ({ls_calls} calls) / {full_updates:,} row UPDATE")
+
+        # STEP 4: corporate_actions 추출 + 분봉 adj_factor UPDATE (의심 종목만)
+        if new_events:
+            suspect_codes = [s[0] for s in suspects]
+            with conn:
+                with conn.cursor() as cur:
+                    # corporate_actions 재추출 (해당 종목들)
+                    cur.execute("""
+                        INSERT INTO corporate_actions (stock_code, event_date, event_type, price_factor, source, description, applied, created_at)
+                        SELECT stock_code, time, 'UNKNOWN_FROM_FACTOR',
+                               ROUND((prev_factor / NULLIF(adj_factor, 0))::numeric, 10),
+                               'LS',
+                               'auto-detect (gap > 15%%): factor ' || prev_factor || '→' || adj_factor,
+                               FALSE, NOW()
+                        FROM (
+                            SELECT stock_code, time, adj_factor,
+                                   LAG(adj_factor) OVER (PARTITION BY stock_code ORDER BY time) AS prev_factor
+                            FROM ohlcv_daily WHERE stock_code = ANY(%s) AND adj_factor IS NOT NULL
+                        ) t
+                        WHERE prev_factor IS NOT NULL AND ABS(prev_factor - adj_factor) > 0.001
+                        ON CONFLICT (stock_code, event_date, event_type) DO UPDATE
+                          SET price_factor = EXCLUDED.price_factor, description = EXCLUDED.description
+                    """, (suspect_codes,))
+                    n_corp = cur.rowcount
+                    # 분봉 adj_factor 적용 (의심 종목만)
+                    cur.execute("""
+                        UPDATE ohlcv_intraday i SET adj_factor = d.adj_factor, adj_updated_at = NOW()
+                        FROM ohlcv_daily d
+                        WHERE d.stock_code = i.stock_code AND i.stock_code = ANY(%s)
+                          AND d.time = (i.time AT TIME ZONE 'Asia/Seoul')::date
+                          AND d.adj_factor IS NOT NULL AND ABS(d.adj_factor - 1) > 0.0001
+                    """, (suspect_codes,))
+                    n_intraday = cur.rowcount
+            print(f"  [STEP 4] corporate_actions UPSERT: {n_corp} / 분봉 adj_factor UPDATE: {n_intraday:,}")
+
+        return {"updated": inserted, "suspects": len(suspects),
+                "ls_calls": ls_calls, "full_updates": full_updates}
+    finally:
+        conn.close()
+
+
 def run_etf_daily_snapshot_pipeline(target_date: date) -> dict:
     """
     한국 ETF 590개의 PDF + 마스터를 매일 스냅샷으로 적재.
@@ -2144,6 +2295,12 @@ def main(target_date: date = None, missing_only: bool = False):
             run_indices_futures_daily_pipeline(result["end_date"])
         except Exception as idx_err:
             print(f"\n⚠️  지수+선물 단계 오류 (업데이트 결과에는 영향 없음): {idx_err}")
+
+        # 수정주가 적재 + corporate action 자동 감지 (gap > 15% 의심 종목만 LS sujung=Y 호출)
+        try:
+            run_adjusted_price_pipeline(result["end_date"])
+        except Exception as adj_err:
+            print(f"\n⚠️  수정주가 단계 오류 (업데이트 결과에는 영향 없음): {adj_err}")
 
         # 분봉 일배치는 04:00 KST 별도 cron (job_minute_bars_daily)으로 분리됨
         # 주식선물 30초봉은 22:30 KST 별도 cron (job_stockfut_today, t8406 당일만)으로 분리됨
