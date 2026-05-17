@@ -1500,23 +1500,14 @@ def run_etf_daily_snapshot_pipeline(target_date: date) -> dict:
             except Exception as e:
                 errors.append((etf_code, "master", str(e)[:80]))
 
-        # 5일 FIFO DELETE
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM etf_portfolio_daily WHERE snapshot_date < %s - INTERVAL '5 days'",
-                            (target_date,))
-                pdf_deleted = cur.rowcount
-                cur.execute("DELETE FROM etf_master_daily WHERE snapshot_date < %s - INTERVAL '5 days'",
-                            (target_date,))
-                master_deleted = cur.rowcount
+        # 5일 FIFO 폐지 — NAV 괴리 시계열 분석 위해 영구 보관 (5/17 결정)
+        # 디스크 비용: 평균 50 components × 636 ETF = ~31,800 row/day × 1000일 ≈ 1.5 GB/4년
 
         print(f"  [완료] ETF {len(etfs)}개")
         print(f"    PDF 적재 {pdf_rows} / 빈응답 {empty_pdf} / 마스터 적재 {master_rows} / 빈응답 {empty_master}")
-        print(f"    5일 FIFO DELETE: PDF {pdf_deleted} / 마스터 {master_deleted}")
         print(f"    에러 {len(errors)}")
         return {"etfs": len(etfs), "pdf_rows": pdf_rows, "master_rows": master_rows,
                 "empty_pdf": empty_pdf, "empty_master": empty_master,
-                "pdf_deleted": pdf_deleted, "master_deleted": master_deleted,
                 "errors": len(errors)}
     finally:
         conn.close()
