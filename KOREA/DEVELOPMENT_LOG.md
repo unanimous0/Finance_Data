@@ -5,6 +5,41 @@
 
 ---
 
+## 2026-05-17 — investor_trading 단위 오류 잔존 91,833 row 정정 (3/24 commit 후속)
+
+### 배경
+- 다른 클로드가 삼양식품(003230) 9/4, 9/12 외국인 net_buy_value 비정상 큰 값 신고 (~10조원, 역산단가 16억/주)
+- 3/24 commit `36c9356`가 "단위 자동감지 → 항상 ×1000 강제"로 fix했지만, 그 이전 backfill (2026-02-19 적재) 데이터에 1000배 큰 값 잔존
+
+### 진단 결과
+- 총 **91,833 row** (668 종목 × 1,044 일자, 2022-01-03 ~ 2026-05-15) 비정상
+- 모두 정확히 **1000배 큼** (정상값 × 1000)
+- 적재 시점 분포: 2026-02 91,586건 / 2026-03 222 / 04-05 25건 (commit 후 급감)
+- volume(수량)은 정상, value(금액)만 오류
+- UNIT_CHECK는 2026-03-20부터 동작하지만 **신규 수집만 검증** → 과거 backfill 미검증
+
+### 진행 작업
+- **3-pass fix (모두 ÷1000)**:
+  - 1차 (±2배 가드): 89,713 row
+  - 2차 (±10배 가드): 2,014 row
+  - 3차 (잔존 일괄): 106 row (vol 작아서 ratio 가드 통과 못 한 케이스)
+- 인포맥스 raw 재호출 비교로 ÷1000이 정답 확정 (휴젤/보로노이/금양 3건 검증, match=True)
+- 최종 잔존 5건은 데이터 정상 (bid≈ask로 net_vol 작은데 가격차로 net_val 큰 microstructure)
+- **다른 backfill 테이블 sanity sweep**: foreign_ownership(135만 row), dividends(7,456 row) → **이상 없음**
+
+### 배운 점
+- 옛 단위 자동감지 로직: `bid_val/bid_vol ≥ 100 → unit=1`이 고가 종목(close≥100,000원)에서 오인식 + 일부 케이스에서 반대로 unit×1000 두 번 적용 → 1000배 부풀림
+- UNIT_CHECK 가드 `|vol| >= 1000`은 false positive 차단엔 효과적이나 vol 작은 row의 단위 오류는 영원히 못 잡음
+- 미래 backfill 데이터에는 UNIT_CHECK 적용 안 됨 — 백필 직후 별도 sanity sweep 필요
+- raw 비교(API 재호출) 가 ratio 비교보다 안전 — vol 작은 경우 ratio가 무의미
+
+### 산출물
+- DB: investor_trading net_buy_value 91,833 row 정정
+- CLAUDE.md: 인포맥스 API 단위 규약 ("천원 단위 raw, ×1000 후 저장") 명시 추가
+- 신규 데이터 검증: 삼양식품 9/4, 9/11, 9/12 모두 정상 단가 (FOREIGN ~160만원/주)
+
+---
+
 ## 2026-05-16 ~ 17 — 수정주가(Adjusted Price) 시스템 구축 (Phase 1~5)
 
 ### 배경

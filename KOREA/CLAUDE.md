@@ -58,6 +58,32 @@ corporate_actions 테이블에서 이벤트 발생 종목 + 일자 + factor 조�
 
 ---
 
+## 투자자 수급 query 주의 (investor_trading)
+
+| 의미 | SQL |
+|---|---|
+| 기관 전체 (연기금 포함) | `WHERE investor_type='INSTITUTION'` |
+| **순수 기관 (연기금 제외)** | `INSTITUTION 값 − PENSION 값` (계산) |
+| 연기금 단독 | `WHERE investor_type='PENSION'` |
+
+⚠️ API `기관계` = DB `INSTITUTION` = **연기금 포함** 기관 전체. 순수 기관 합계가 필요하면 PENSION을 빼야 함.
+인포맥스 raw는 `연기금` 대신 `기금공제`로 반환 (`collectors/infomax.py` 매핑).
+상세: `PROJECT.md:184-191`, `docs/인포맥스_API_정리.md:155-160`.
+
+### 단위 규약 — 인포맥스 API로 받는 경우 한정
+
+| 항목 | API raw 단위 | DB 저장 단위 | 변환 |
+|---|---|---|---|
+| `net_buy_value` | **천원** | **원** | 반드시 ×1000 (`collectors/infomax.py:149` `unit=1000` 강제) |
+| `net_buy_volume` | 주 | 주 | 변환 없음 |
+
+⚠️ 옛 코드의 단위 자동감지 로직(`bid_val/bid_vol`로 추정)이 고가 종목에서 오인식 → 1000배 큼/작음 버그.
+3/24 commit `36c9356`에서 자동감지 제거 + 항상 ×1000 강제로 fix.
+**다른 vendor로 교체 시**: raw 단위 다시 확인하고 변환 로직 별도 작성. 인포맥스 가정 답습 금지.
+2026-05-17에 잔존 91,833 row (2026-02 백필분) 일괄 ÷1000 정정 완료 (DEVELOPMENT_LOG 참조).
+
+---
+
 ## scheduler 재시작 전 절대 체크
 
 ```bash
