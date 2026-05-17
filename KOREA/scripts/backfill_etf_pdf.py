@@ -153,6 +153,8 @@ def main():
     parser.add_argument("--from", dest="start", default="20260102", help="YYYYMMDD")
     parser.add_argument("--to",   dest="end",   default=None,        help="YYYYMMDD (기본: 어제)")
     parser.add_argument("--limit", type=int, default=None, help="상위 N ETF (sanity)")
+    parser.add_argument("--desc", action="store_true",
+                        help="최신 일자부터 옛 일자 순으로 (점진 분석용)")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -166,8 +168,11 @@ def main():
         if args.limit:
             etfs = etfs[:args.limit]
         biz_days = fetch_biz_days(conn, start, end)
+        if args.desc:
+            biz_days = list(reversed(biz_days))
         total = len(etfs) * len(biz_days)
-        print(f"[ETF PDF 백필] {start}~{end} 거래일 {len(biz_days)}일 × ETF {len(etfs)}개 = {total:,} 호출")
+        order = "desc (최신→옛)" if args.desc else "asc (옛→최신)"
+        print(f"[ETF PDF 백필 {order}] {start}~{end} 거래일 {len(biz_days)}일 × ETF {len(etfs)}개 = {total:,} 호출")
         print(f"  TPS 1 (60 RPM 기준) → 예상 ~{total/60:.0f}분 = ~{total/3600:.1f}시간")
 
         if args.dry_run:
@@ -177,9 +182,11 @@ def main():
         t0 = time.time()
         ok = empty = err = 0
         total_pdf = total_master = 0
+        # 분석 점진 확보 위해 outer=days (desc 시 5/15부터), inner=ETFs
+        # 한 day의 전체 ETF 완료되면 그 일자 NAV 분석 가능
         i = 0
-        for etf_code, etf_name in etfs:
-            for d in biz_days:
+        for d in biz_days:
+            for etf_code, etf_name in etfs:
                 i += 1
                 maybe_pause_for_daily_update()  # 04:30~09:00 daily_update와 충돌 회피
                 pdf_n, master_n, status = process_etf_day(client, conn, etf_code, d)
