@@ -1762,11 +1762,11 @@ def _per_stock_gap(table: str, code_col: str, codes: list[str],
     각 거래일에 적합한 인터벌(select_ncnt 기반: ≥4/27=30초, 그 이전=1분)이 DB에
     있는지 확인. 없으면 해당 날짜를 갭으로 잡음.
 
-    이전 버전은 종목별 max(time)만 봤기 때문에, 4/20 1분봉이 누락된 종목도
-    30초봉 5/13까지 있으면 max=5/13으로 인식해 갭 0으로 잘못 판단함 (5/14 사례).
-    이 버전은 (code, day, interval) 3차원 set으로 부분 누락도 정확히 검출.
+    listing_date fallback: 종목 시작일 = max(_EPOCH_30SEC, stocks.listing_date).
+    상장 전 일자엔 LS도 데이터 없으니 갭 검사 안 함 (5/17 신규 상장 ETF 38개 헛 호출
+    ~1,900건 회피).
 
-    비용: bulk 1쿼리 (code IN 2k × 80일 × interval) ~수백 ms. 인덱스 활용.
+    비용: bulk 2 쿼리 (거래일 + 존재 + listing_date) ~수백 ms. 인덱스 활용.
     """
     from collectors.ls_api import select_ncnt
 
@@ -1786,14 +1786,23 @@ def _per_stock_gap(table: str, code_col: str, codes: list[str],
                 f"GROUP BY 1, 2, 3",
                 (list(codes), _EPOCH_30SEC, target_date))
             existing: set[tuple] = {(r[0], r[1], r[2]) for r in cur.fetchall()}
+
+            # 종목별 listing_date — 상장 전 일자 헛 호출 방지
+            cur.execute(
+                "SELECT stock_code, listing_date FROM stocks WHERE stock_code = ANY(%s)",
+                (list(codes),))
+            listing_map: dict = {r[0]: r[1] for r in cur.fetchall() if r[1]}
     finally:
         conn.close()
 
     gaps: dict[str, list[date]] = {}
     total = 0
     for code in codes:
+        start = max(_EPOCH_30SEC, listing_map.get(code) or _EPOCH_30SEC)
         days_for_code = []
         for d in all_biz:
+            if d < start:
+                continue
             ncnt = select_ncnt(d)
             interval = 30 if ncnt == 0 else 60
             if (code, d, interval) not in existing:
