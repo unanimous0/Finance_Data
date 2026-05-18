@@ -34,17 +34,27 @@ date '+%Y-%m-%d %A %H:%M:%S KST'
 
 ---
 
-## 운영 cron (5/17 기준)
+## 운영 cron (5/18 기준)
 
-| 시각 (KST) | 작업 | 소요 |
-|---|---|---|
-| 23:30 (월~금) | stockfut (LS) | ~10분 |
-| 04:30 (매일) | daily_update 본체 (인포맥스/DART/KRX) + Phase 5 수정주가 자동 | ~3시간 |
-| 04:30 후 (직렬) | 분봉 일배치 (LS) | ~50분 |
-| 일 03:00 | DB 백업 | 짧음 |
+| 시각 (KST) | 작업 | 소요 | 비고 |
+|---|---|---|---|
+| 23:30 (월~금) | stockfut (LS) | ~10분 | |
+| 04:30 (매일) | daily_update 본체 (인포맥스/DART/KRX) + Phase 5 수정주가 자동 | ~1.5~3시간 | ETF PDF는 분리 |
+| 04:30 후 (직렬) | 분봉 일배치 (LS) | ~50분 | |
+| **08:30 (매일)** | **etf_snapshot (ETF PDF/마스터, today+yesterday)** | ~20분 | 04:30이 늦게 끝나면 자동 대기 |
+| 일 03:00 | DB 백업 | 짧음 | |
 
 → LS 사용 시간대: **23:30~23:40 + 07:30~08:30 (Phase 5 의심 종목만 추가 ~수 분)**
 → LENS 사용 가능: 그 외 시간 (단 LENS 24/7 가동 시 LS token 공유 충돌 가능 — `IGW00121` 발생 시 ls_api.py가 자동 처리)
+
+### ETF PDF는 왜 04:30이 아닌 08:30?
+04:30 시점엔 인포맥스가 당일 ETF PDF 데이터 ingest 미완 (KODEX 200 등 빈 응답 실측). 09시 이후 정상 반환 → 안전 마진 두고 08:30. `scripts/etf_snapshot.py`가 today + yesterday 2-pass 호출. 08:30 시점에 daily_update가 아직 진행 중이면 `wait_for_daily_update()`가 60s 단위로 대기해 인포맥스 충돌 회피.
+
+### 인포맥스 호출 동시성 가드
+인포맥스 60 RPM 한도를 공유하는 3 프로세스: `daily_update.py`, `etf_snapshot.py`, `backfill_etf_pdf.py`.
+- `etf_snapshot`은 `daily_update` 진행 중이면 대기
+- `backfill_etf_pdf`는 위 둘 중 하나라도 진행 중이면 대기 (`maybe_pause_for_daily_update` in `scripts/backfill_etf_pdf.py`)
+- 옛 시간대 hardcode(04~09)는 폐기 — 실제 프로세스 존재(pgrep) 기반으로 정밀화
 
 ## 수정주가 query (5/17~)
 

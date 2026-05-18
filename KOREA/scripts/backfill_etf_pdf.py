@@ -33,14 +33,28 @@ KST = ZoneInfo("Asia/Seoul")
 
 
 def maybe_pause_for_daily_update():
-    """매일 04:30~09:00 KST: daily_update cron이 인포맥스 한도(60 RPM) 점유.
-    그 시간엔 백필 sleep해서 한도 초과(429/timeout) 회피."""
-    now = datetime.now(KST)
-    if 4 <= now.hour < 9:
-        next_resume = now.replace(hour=9, minute=0, second=0, microsecond=0)
-        wait = (next_resume - now).total_seconds()
-        print(f"  [PAUSE] daily_update 시간대 ({now:%H:%M}) — {wait/60:.0f}분 대기 (~09:00 KST 재개)", flush=True)
-        time.sleep(wait)
+    """daily_update.py 또는 etf_snapshot.py 둘 중 하나라도 살아있으면 sleep.
+    둘 다 인포맥스 60 RPM 한도 점유 → 동시 호출 시 429/timeout 발생."""
+    import subprocess
+    targets = ["scripts/daily_update.py", "scripts/etf_snapshot.py"]
+    while True:
+        busy = None
+        try:
+            for t in targets:
+                r = subprocess.run(
+                    ["pgrep", "-f", t],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if r.returncode == 0:
+                    busy = t
+                    break
+            if busy is None:
+                return  # 모두 미실행 → 즉시 진행
+        except Exception:
+            return  # pgrep 실패 시 진행 (안전 측)
+        now = datetime.now(KST)
+        print(f"  [PAUSE] {busy} 진행 중 ({now:%H:%M}) — 60s 후 재확인", flush=True)
+        time.sleep(60)
 
 
 # _minute_scope의 ETF filter와 동일 (해외 제외, KRX/H 예외)
@@ -137,7 +151,7 @@ def process_etf_day(client, conn, etf_code, target_date) -> tuple[int, int, str]
             with conn.cursor() as cur:
                 cur.execute(MASTER_UPSERT_SQL, (
                     etf_code, target_date, m.get("kr_name"), m.get("kr_company"),
-                    m.get("creation_unit"), m.get("listed_shares"), m.get("net_asset"),
+                    m.get("creationunit"), m.get("listed_shares"), m.get("net_asset"),
                     m.get("underlying_index"), m.get("tracking_multiple"),
                     m.get("replication"), m.get("total_fee"),
                 ))

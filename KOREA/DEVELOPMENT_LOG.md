@@ -5,6 +5,46 @@
 
 ---
 
+## 2026-05-18 — ETF PDF 08:30 분리 + creation_unit 키 버그 fix + 가드 정밀화
+
+### 배경
+- 사용자가 "5/18 ETF PDF 받았나" 확인 — 5/18 PDF 0건 발견
+- 원인 추적: daily_update 04:30 시점에 인포맥스가 당일 PDF 아직 ingest 안 함 (KODEX 200 호출 빈 응답)
+- 09시 이후 호출 시 정상 반환 확인
+
+### 옆에서 드러난 버그
+- `etf_master_daily.creation_unit`이 5/12~15 모두 NULL (5/16~18은 정상)
+- 원인: 인포맥스 응답 키는 `creationunit` (밑줄 없음)
+  - `backfill_etf_pdf.py:148`이 `m.get("creation_unit")` (밑줄)로 가져옴 → 항상 None
+  - `daily_update.py:1494`는 `m.get("creationunit")`로 정확히 가져옴 → 정상
+
+### 조치
+1. **ETF PDF/마스터 호출을 daily_update에서 분리** → 신규 `scripts/etf_snapshot.py`
+   - today + yesterday 2-pass (UPSERT)
+   - 시작 시 `wait_for_daily_update()` — daily_update 진행 중이면 60s 단위 대기 (08:30이 04:30 끝난 후 도래해도 안전)
+2. **scheduler에 08:30 KST `etf_snapshot` cron 추가** (`schedulers/daily_scheduler.py:job_etf_snapshot`)
+3. **`backfill_etf_pdf.py` 가드 보강**: 옛 시간대 hardcode(04~09 sleep)는 부정확 → `pgrep`으로 `daily_update.py` + `etf_snapshot.py` 둘 다 체크. 둘 중 하나라도 살아있으면 60s 대기 후 재확인
+4. **`backfill_etf_pdf.py:148` 키 fix**: `creation_unit` → `creationunit`
+5. **scheduler 운영 방식 변경**: tmux 세션 → nohup 백그라운드 (tmux 세션이 어떤 이유로 종료되어도 scheduler 본체 유지)
+
+### 5/18 PDF 즉시 보정
+- `scripts/etf_snapshot.py` 수동 1회 실행 (5/18 09:55쯤) → 5/18 PDF/master 적재
+
+### 배운 점
+- 인포맥스는 vendor 응답 시각이 일정하지 않음 — 04:30은 PDF 너무 이름. ingest 보장 시점(09시 이후) 필요
+- 옛 시간대 hardcode 가드는 일찍 끝나도 무의미하게 대기 + 늦게 끝나면 충돌. **프로세스 존재(pgrep) 기반이 정밀하고 견고**
+- API key 이름은 dict로 받을 때 typo 한 글자(밑줄 유무) 차이로 silently NULL — 키 매핑은 코드 리뷰 시 vendor raw 응답과 직접 대조 필요
+- scheduler를 tmux 세션 안에서 돌리면 세션 종료 시 같이 죽음 → nohup이 안정
+
+### 산출물
+- 신규: `scripts/etf_snapshot.py`
+- 수정: `scripts/daily_update.py` (ETF 호출 부분 제거 + 분리 사유 주석)
+- 수정: `scripts/backfill_etf_pdf.py` (가드 보강 + key fix)
+- 수정: `schedulers/daily_scheduler.py` (`job_etf_snapshot` + 08:30 cron)
+- 문서: `CLAUDE.md` 운영 cron 표 갱신 + 동시성 가드 설명
+
+---
+
 ## 2026-05-17 — investor_trading 단위 오류 잔존 91,833 row 정정 (3/24 commit 후속)
 
 ### 배경

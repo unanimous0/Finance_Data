@@ -156,6 +156,20 @@ def job_stockfut_today():
         _ls_backfill_resume(paused)
 
 
+def job_etf_snapshot():
+    """매일 08:30 KST — ETF PDF/마스터 스냅샷 (today + yesterday 2-pass).
+    daily_update에서 분리 — 04:30엔 인포맥스 ingest 미완 (당일 PDF 빈 응답)."""
+    from scripts.etf_snapshot import main as etf_main
+    logger.info("="*60)
+    logger.info(f"[스케줄러] ETF 스냅샷 시작: {datetime.now(KST)}")
+    logger.info("="*60)
+    try:
+        etf_main()
+        logger.info(f"[스케줄러] ETF 스냅샷 완료: {datetime.now(KST)}")
+    except Exception as e:
+        logger.error(f"[스케줄러] ETF 스냅샷 실패: {e}")
+
+
 def job_quarterly_sector():
     """분기 첫 번째 일요일 03:30 실행되는 FICS 업종 크롤링"""
     from scripts.crawl_sector import main as run_crawl
@@ -227,6 +241,17 @@ def main():
     )
 
     # 분봉 일배치 cron 제거 — daily_update 끝(job_daily_update 안)에 직렬 호출로 통합 (LENS 야간 사용 시간 확보)
+
+    # 잡 6: 매일 08:30 KST — ETF PDF/마스터 스냅샷 (daily_update에서 분리, ingest 보장)
+    scheduler.add_job(
+        job_etf_snapshot,
+        trigger=CronTrigger(hour=8, minute=30, timezone=KST),
+        id="etf_snapshot",
+        name="ETF PDF/마스터 스냅샷 (today + yesterday)",
+        misfire_grace_time=1800,
+        coalesce=True,
+        max_instances=1,
+    )
 
     # 잡 5: 매일 23:30 KST (월~금) — 주식선물 30초봉 당일 적재
     # 작업 시간 약 10분 → 23:30~23:40. 사용자 LENS는 23:40 ~ 다음날 04:30 자유.
