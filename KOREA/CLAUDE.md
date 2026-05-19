@@ -56,6 +56,11 @@ date '+%Y-%m-%d %A %H:%M:%S KST'
 - `backfill_etf_pdf`는 위 둘 중 하나라도 진행 중이면 대기 (`maybe_pause_for_daily_update` in `scripts/backfill_etf_pdf.py`)
 - 옛 시간대 hardcode(04~09)는 폐기 — 실제 프로세스 존재(pgrep) 기반으로 정밀화
 
+### 인포맥스 일별 호출 한도
+- `success=False` + `"사용량 제한"` 메시지 → `InfomaxDailyLimitError` 예외 (`collectors/infomax.py`)
+- backfill은 이 예외를 잡아 자정 00:05 KST까지 자동 대기 후 재개 (`wait_until_midnight` in `scripts/backfill_etf_pdf.py`)
+- ⚠️ daily_update + etf_snapshot만으로도 하루 한도가 소진될 수 있음 → backfill은 잉여 한도로만 진행
+
 ## 수정주가 query (5/17~)
 
 | 데이터 | raw | adjusted |

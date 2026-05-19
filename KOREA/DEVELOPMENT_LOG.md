@@ -5,6 +5,40 @@
 
 ---
 
+## 2026-05-19 — 인포맥스 일별 한도 초과 감지 + ETF PDF 백필 자동 재개
+
+### 배경
+- ETF PDF 백필(`backfill_etf_pdf.py`) 재시도 중 6,500건 전부 "빈" 반환 — 처음엔 "API가 과거 데이터 미지원"으로 오판
+- 직접 API 호출 시 `{"success":false,"message":{"errmsg":"일별 사용량 제한 초과"}}` 확인
+- `_get()`이 `success=False`를 파라미터 오류와 동일하게 `None` 반환 → backfill은 "빈"으로 집계하며 6,500 호출 낭비
+
+### 원인 분석
+- 5/18에 daily_update(04:30) + etf_snapshot(08:30 × 636 ETF × 2일) 이미 수천 건 소모 → 이후 backfill 시작 시 한도 이미 초과
+- 인포맥스 API는 과거 날짜 ETF PDF 데이터를 정상 서빙 (5/19 재시도 ok 8,500 / 빈 0 확인)
+
+### 조치
+1. **`collectors/infomax.py`** — `_get()`에서 `"사용량 제한"` 포함 메시지 감지 시 `InfomaxDailyLimitError` 예외 발생 (기존엔 `None` 반환으로 묻힘)
+2. **`scripts/backfill_etf_pdf.py`**
+   - `InfomaxDailyLimitError` import 추가
+   - `wait_until_midnight()` 함수 추가: 자정 00:05 KST까지 sleep 후 재개 메시지 출력
+   - `process_etf_day()` — `InfomaxDailyLimitError`는 re-raise (기존 `except Exception`에 묻히지 않도록)
+   - 메인 루프 — 한도 초과 예외 잡으면 `wait_until_midnight()` 호출 후 해당 ETF부터 재시도
+
+### 결과
+- 5/19 16:14 KST 백필 재시작, 21:27 기준 8,500/57,876 (14.7%) ok / 빈 0 / 에러 0
+- PDF 518,618행, 마스터 8,500행 적재
+- 일별 한도 소진 시 자동 대기 → 다음날 자정 이후 자동 재개
+
+### 배운 점
+- `success=False` 응답이 여러 의미(파라미터 오류 / 권한 없음 / **일별 한도 초과**)를 포함 — 에러 메시지 파싱 필수
+- 한도 초과 상태에서 backfill을 그냥 돌리면 수천 건의 API 슬롯을 낭비하면서 아무것도 안 됨
+
+### 산출물
+- 수정: `collectors/infomax.py` (`InfomaxDailyLimitError` 클래스 + `_get()` 감지 로직)
+- 수정: `scripts/backfill_etf_pdf.py` (`wait_until_midnight` + 한도 초과 자동 재개)
+
+---
+
 ## 2026-05-18 — ETF PDF 08:30 분리 + creation_unit 키 버그 fix + 가드 정밀화
 
 ### 배경

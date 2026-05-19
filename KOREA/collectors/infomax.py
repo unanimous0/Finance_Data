@@ -28,6 +28,10 @@ REQ_DELAY  = 1.05   # 초 (60회/분 Lite 플랜 기준)
 MAX_RETRY  = 3
 RETRY_WAIT = 5.0
 
+
+class InfomaxDailyLimitError(Exception):
+    """인포맥스 일별 API 호출 한도 초과."""
+
 # 투자자 API 코드 → DB investor_type 매핑
 # ※ API는 '연기금' 대신 '기금공제'로 반환함 (실측 확인)
 INVESTOR_MAP = {
@@ -69,6 +73,9 @@ class InfomaxClient:
                     data = r.json()
                     if data.get("success"):
                         return data
+                    msg = data.get("message", {})
+                    if isinstance(msg, dict) and "사용량 제한" in msg.get("errmsg", ""):
+                        raise InfomaxDailyLimitError(msg.get("errmsg", "일별 사용량 제한 초과"))
                     # success=False 면 재시도 불필요 (파라미터 문제)
                     return None
                 # 429 Too Many Requests → 대기 후 재시도

@@ -26,10 +26,20 @@ import psycopg2.extras
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from collectors.infomax import InfomaxClient
+from collectors.infomax import InfomaxClient, InfomaxDailyLimitError
 from config.settings import settings
 
 KST = ZoneInfo("Asia/Seoul")
+
+
+def wait_until_midnight():
+    """자정(KST 00:00) 이후까지 대기 — 인포맥스 일별 한도 리셋 대기용."""
+    now = datetime.now(KST)
+    tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=5, second=0, microsecond=0)
+    secs = (tomorrow - now).total_seconds()
+    print(f"  [LIMIT] 인포맥스 일별 한도 초과 — {tomorrow:%m/%d %H:%M} KST까지 {secs/3600:.1f}h 대기", flush=True)
+    time.sleep(secs)
+    print(f"  [LIMIT] 대기 완료, 재개", flush=True)
 
 
 def maybe_pause_for_daily_update():
@@ -121,6 +131,8 @@ def process_etf_day(client, conn, etf_code, target_date) -> tuple[int, int, str]
     try:
         rows = client.get_etf_portfolio(etf_code, target_date)
         m = client.get_etf_master(etf_code, target_date)
+    except InfomaxDailyLimitError:
+        raise  # 호출자(main loop)가 자정 대기 처리
     except Exception as e:
         return 0, 0, f"err:{type(e).__name__}"
 
@@ -203,7 +215,11 @@ def main():
             for etf_code, etf_name in etfs:
                 i += 1
                 maybe_pause_for_daily_update()  # 04:30~09:00 daily_update와 충돌 회피
-                pdf_n, master_n, status = process_etf_day(client, conn, etf_code, d)
+                try:
+                    pdf_n, master_n, status = process_etf_day(client, conn, etf_code, d)
+                except InfomaxDailyLimitError:
+                    wait_until_midnight()
+                    pdf_n, master_n, status = process_etf_day(client, conn, etf_code, d)
                 if status == "ok":
                     ok += 1
                     total_pdf += pdf_n
