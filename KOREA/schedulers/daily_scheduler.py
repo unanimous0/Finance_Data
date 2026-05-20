@@ -2,7 +2,7 @@
 데이터 수집 + 백업 스케줄러
 
 잡 목록:
-    daily_update      — 매일 04:30 KST (월~일)           OHLCV/시가총액/수급/외국인지분율 + 배당 + LENS export
+    daily_update      — 매일 02:00 KST (월~일)           OHLCV/시가총액/수급/외국인지분율 + 배당 + LENS export
                           + 끝에 분봉 일배치 직렬 호출 (종목/ETF + 지수 + 지수선물 + futures_master export)
                           (LENS 야간 사용 시간 확보 위해 23:00 분봉 일배치 cron을 daily_update 끝으로 통합)
     stockfut_today    — 매일 23:30 KST (월~금)           주식선물 30초봉 (t8406 historical 불가, 당일만, ~10분)
@@ -54,9 +54,10 @@ logger = logging.getLogger(__name__)
 
 
 def job_daily_update():
-    """매일 04:30 KST — daily_update 본체(인포맥스/DART) → 분봉 일배치(LS) 직렬.
+    """매일 02:00 KST — daily_update 본체(인포맥스/DART) → 분봉 일배치(LS) 직렬.
     LENS 야간 사용 시간 확보 위해 분봉 일배치를 23:00 별도 cron에서 daily_update 끝으로 이전.
-    daily_update ~3시간 → 분봉 일배치 ~50분 → 총 04:30~08:30 종료.
+    daily_update ~3시간 → 분봉 일배치 ~50분 → 총 02:00~06:00 종료 (느린 날 최대 ~07:30).
+    키B(와이프) 사용 — 08:50 이전 종료 보장 (LENS REST 09:00~15:45 키B 충돌 회피).
     """
     from scripts.daily_update import main as run_daily
     logger.info("="*60)
@@ -209,12 +210,12 @@ def main():
     signal.signal(signal.SIGTERM, _graceful_shutdown)
     signal.signal(signal.SIGINT,  _graceful_shutdown)
 
-    # 잡 1: 매일 05:30 KST — 데이터 수집 + 배당 + LENS export
+    # 잡 1: 매일 02:00 KST — 데이터 수집 + 배당 + LENS export
     scheduler.add_job(
         job_daily_update,
         trigger=CronTrigger(
-            hour=4,
-            minute=30,
+            hour=2,
+            minute=0,
             timezone=KST,
         ),
         id="daily_update",

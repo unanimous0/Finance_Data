@@ -5,6 +5,31 @@
 
 ---
 
+## 2026-05-20 — daily_update 02:00으로 앞당김 (LS API 키 분리 대응)
+
+### 배경
+- LS API 계좌 추가 (아버지 계좌 신규 발급) → 키 2개 운용 체계 전환
+- LENS: 키A(아버지) = WS 영구 / 키B(와이프) = 장중(09:00~15:45) REST
+- Finance_Data: 키B(와이프) = 장외 일배치 전용
+- 문제: daily_update 04:30 시작 시 분봉 일배치가 느린 날 09:00 이후까지 걸림 (5/19 실측 08:52 완료) → 키B 충돌 위험
+
+### 조치
+- `daily_update` cron: **04:30 → 02:00** 으로 변경 (`schedulers/daily_scheduler.py`)
+- 최악의 날(daily_update 4.5시간 + 분봉 50분) 기준 02:00 + 5.3시간 = **07:18 완료** → 08:50 버퍼 충분
+- Finance_Data `.env`의 `LS_APP_KEY`/`LS_APP_SECRET`은 기존 그대로 (이미 키B = 와이프 계좌)
+- 스케줄러 재시작 (PID 3064869), 내일 02:00부터 적용
+
+### 키 배분 합의 (Finance_Data ↔ LENS)
+- 키A(아버지): LENS WebSocket 전용 (24/7 점유)
+- 키B(와이프): LENS REST 09:00~15:45 / Finance_Data 그 외 시간
+- 시간 약속: Finance_Data는 15:50 이후 / 08:50 이전에 키B 작업 종료
+
+### 산출물
+- 수정: `schedulers/daily_scheduler.py` (hour=4,min=30 → hour=2,min=0)
+- 수정: `CLAUDE.md` (cron 표 갱신)
+
+---
+
 ## 2026-05-19 — 인포맥스 일별 한도 초과 감지 + ETF PDF 백필 자동 재개
 
 ### 배경
