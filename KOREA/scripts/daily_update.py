@@ -181,6 +181,28 @@ def _fetch_hist(client, code, name, start, end):
     return code, name, rows
 
 
+def _fetch_ls_ohlcv(ls_client, code, name, start: date, end: date):
+    """LS t8451로 일봉 OHLCV 수집. sujung=N (raw 주가)."""
+    bars = ls_client.get_daily_bars(code, sdate=start, edate=end, sujung="N", exchgubun="K")
+    rows = []
+    for b in bars:
+        dt_s = b.get("date")
+        if not dt_s:
+            continue
+        dt = datetime.strptime(dt_s, "%Y%m%d").date()
+        rows.append({
+            "date":          dt,
+            "stock_code":    code,
+            "open_price":    b.get("open"),
+            "high_price":    b.get("high"),
+            "low_price":     b.get("low"),
+            "close_price":   b.get("close"),
+            "volume":        b.get("jdiff_vol"),
+            "trading_value": (b.get("value") or 0) * 1_000_000,  # 백만원 → 원
+        })
+    return code, name, rows
+
+
 def _fetch_investor(client, code, name, start, end):
     rows = client.get_investor(code, start, end)
     return code, name, rows
@@ -566,6 +588,8 @@ def run_update(target_date: date = None, missing_only: bool = False) -> dict:
     started_at = datetime.now(KST)
     conn = get_conn()
     client = InfomaxClient()
+    from collectors.ls_api import LsApiClient
+    ls_client = LsApiClient()
 
     # ── 업데이트 날짜 결정 ─────────────────────────────────────
     if target_date:
@@ -651,9 +675,20 @@ def run_update(target_date: date = None, missing_only: bool = False) -> dict:
     }
 
     # ─────────────────────────────────────────────────────────
-    # STEP 1: OHLCV + 시가총액 수집 (전 종목, 병렬)
+    # STEP 1: OHLCV + 시가총액 수집 (전 종목, 병렬) — LS t8451
     # ─────────────────────────────────────────────────────────
-    print(f"[1/2] OHLCV + 시가총액 수집 ({total_stocks}개 종목, workers={MAX_WORKERS})...")
+    # floating_shares 최신 total_shares 로드 (market_cap = close × total_shares)
+    db_listed_shares: dict[str, int] = {}
+    with conn.cursor() as _cur:
+        _cur.execute("""
+            SELECT DISTINCT ON (stock_code) stock_code, total_shares
+            FROM floating_shares
+            ORDER BY stock_code, base_date DESC
+        """)
+        for _r in _cur.fetchall():
+            if _r[1]:
+                db_listed_shares[_r[0]] = _r[1]
+    print(f"[1/2] OHLCV + 시가총액 수집 ({total_stocks}개 종목, workers={MAX_WORKERS}) — LS t8451 / floating_shares {len(db_listed_shares)}개...")
 
     ohlcv_batch  = []
     mktcap_batch = []
@@ -662,7 +697,7 @@ def run_update(target_date: date = None, missing_only: bool = False) -> dict:
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
-            executor.submit(_fetch_hist, client, code, name, start_date, end_date): code
+            executor.submit(_fetch_ls_ohlcv, ls_client, code, name, start_date, end_date): code
             for code, name in all_stocks
         }
         for future in as_completed(futures):
@@ -687,9 +722,9 @@ def run_update(target_date: date = None, missing_only: bool = False) -> dict:
                         r["volume"],     r["trading_value"],
                     ))
 
-                    if r["close_price"] and r["listed_shares"]:
-                        mkt_cap = r["close_price"] * r["listed_shares"]
-                        mktcap_batch.append((r["date"], r["stock_code"], mkt_cap))
+                    ls = db_listed_shares.get(r["stock_code"])
+                    if r["close_price"] and ls:
+                        mktcap_batch.append((r["date"], r["stock_code"], r["close_price"] * ls))
 
             # 배치 저장 (500건마다, 메인 스레드에서만 실행)
             if len(ohlcv_batch) >= 500:
@@ -988,7 +1023,7 @@ def generate_report(result: dict) -> str:
     lines.append(f"    전체 건수  : {mktcap['rows']:,}건")
     lines.append(f"    신규/변경  : {mktcap['changed']:,}건")
     lines.append(f"    스킵(동일) : {mktcap['skipped']:,}건")
-    lines.append(f"    산출 방식  : close_price × listed_shares (hist API)")
+    lines.append(f"    산출 방식  : close_price (LS t8451) × total_shares (floating_shares DB)")
 
     lines.append(f"\n  [investor_trading]")
     lines.append(f"    전체 건수  : {investor['rows']:,}건")

@@ -171,6 +171,21 @@ def job_etf_snapshot():
         logger.error(f"[스케줄러] ETF 스냅샷 실패: {e}")
 
 
+def job_quarterly_financials():
+    """분기 재무지표 수집 (FnGuide XML) — 각 분기 제출 마감 직후 일요일 04:00
+    타이밍: 6/1~7 (Q1 5/31 마감), 9/1~7 (H1 8/31), 12/1~7 (Q3 11/30), 4/1~7 (연간 3/31)
+    """
+    from scripts.collect_financials import run as run_financials
+    logger.info("=" * 60)
+    logger.info(f"[스케줄러] 분기 재무지표 수집 시작: {datetime.now(KST)}")
+    logger.info("=" * 60)
+    try:
+        run_financials(delay=0.3)
+        logger.info("[스케줄러] 분기 재무지표 수집 완료")
+    except Exception as e:
+        logger.error(f"[스케줄러] 분기 재무지표 수집 실패: {e}")
+
+
 def job_quarterly_sector():
     """분기 첫 번째 일요일 03:30 실행되는 FICS 업종 크롤링"""
     from scripts.crawl_sector import main as run_crawl
@@ -182,6 +197,20 @@ def job_quarterly_sector():
         logger.info("[스케줄러] FICS 업종 크롤링 완료")
     except Exception as e:
         logger.error(f"[스케줄러] FICS 업종 크롤링 실패: {e}")
+
+
+def job_update_listed_shares():
+    """매주 일요일 03:30 KST — LS t1102로 전종목 상장주식수 갱신 → floating_shares 테이블
+    daily_update의 market_cap 계산 (close × total_shares) 데이터 소스."""
+    from scripts.update_listed_shares import main as run_update_shares
+    logger.info("="*60)
+    logger.info(f"[스케줄러] 상장주식수 갱신 시작: {datetime.now(KST)}")
+    logger.info("="*60)
+    try:
+        run_update_shares()
+        logger.info("[스케줄러] 상장주식수 갱신 완료")
+    except Exception as e:
+        logger.error(f"[스케줄러] 상장주식수 갱신 실패: {e}")
 
 
 def on_job_executed(event):
@@ -266,7 +295,25 @@ def main():
         max_instances=1,
     )
 
-    # 잡 4: 분기 첫 번째 일요일 03:30 KST (1/4/7/10월) — FICS 업종 크롤링
+    # 잡 4: 분기 재무지표 수집 — 각 분기 마감 후 첫 번째 일요일 04:00 (4/6/9/12월)
+    scheduler.add_job(
+        job_quarterly_financials,
+        trigger=CronTrigger(
+            month="4,6,9,12",
+            day="1-7",
+            day_of_week="sun",
+            hour=4,
+            minute=0,
+            timezone=KST,
+        ),
+        id="quarterly_financials",
+        name="분기 재무지표 수집 (FnGuide)",
+        misfire_grace_time=7200,
+        coalesce=True,
+        max_instances=1,
+    )
+
+    # 잡 5: 분기 첫 번째 일요일 03:30 KST (1/4/7/10월) — FICS 업종 크롤링
     scheduler.add_job(
         job_quarterly_sector,
         trigger=CronTrigger(
@@ -284,14 +331,27 @@ def main():
         max_instances=1,
     )
 
+    # 잡 6: 매주 일요일 03:30 KST — 상장주식수 갱신 (LS t1102 → floating_shares)
+    scheduler.add_job(
+        job_update_listed_shares,
+        trigger=CronTrigger(day_of_week="sun", hour=3, minute=30, timezone=KST),
+        id="update_listed_shares",
+        name="상장주식수 갱신 (LS t1102)",
+        misfire_grace_time=3600,
+        coalesce=True,
+        max_instances=1,
+    )
+
     now = datetime.now(KST)
 
     trigger_daily   = CronTrigger(hour=5, minute=30, timezone=KST)
     trigger_backup  = CronTrigger(day_of_week="sun", hour=3, minute=0, timezone=KST)
-    trigger_sector  = CronTrigger(month="1,4,7,10", day="1-7", day_of_week="sun", hour=3, minute=30, timezone=KST)
-    next_daily  = trigger_daily.get_next_fire_time(None, now)
-    next_backup = trigger_backup.get_next_fire_time(None, now)
-    next_sector = trigger_sector.get_next_fire_time(None, now)
+    trigger_sector     = CronTrigger(month="1,4,7,10", day="1-7", day_of_week="sun", hour=3, minute=30, timezone=KST)
+    trigger_financials = CronTrigger(month="4,6,9,12", day="1-7", day_of_week="sun", hour=4, minute=0, timezone=KST)
+    next_daily      = trigger_daily.get_next_fire_time(None, now)
+    next_backup     = trigger_backup.get_next_fire_time(None, now)
+    next_sector     = trigger_sector.get_next_fire_time(None, now)
+    next_financials = trigger_financials.get_next_fire_time(None, now)
 
     logger.info("="*60)
     logger.info("  한국 주식 데이터 수집 + 백업 스케줄러")
@@ -300,9 +360,11 @@ def main():
     logger.info(f"  다음 수집    : {next_daily.strftime('%Y-%m-%d %H:%M KST') if next_daily else '미정'}")
     logger.info(f"  다음 백업    : {next_backup.strftime('%Y-%m-%d %H:%M KST') if next_backup else '미정'}")
     logger.info(f"  다음 섹터    : {next_sector.strftime('%Y-%m-%d %H:%M KST') if next_sector else '미정'}")
-    logger.info(f"  수집 주기    : 매일 05:30 — OHLCV/수급/외인 + 배당 + LENS export")
+    logger.info(f"  수집 주기    : 매일 05:30 — OHLCV(LS t8451)/수급/외인 + 배당 + LENS export")
     logger.info(f"  백업 주기    : 매주 일요일 03:00  (7일 보관)")
+    logger.info(f"  상장주식수   : 매주 일요일 03:30 — LS t1102 → floating_shares")
     logger.info(f"  섹터 주기    : 분기 첫 번째 일요일 03:30 (1/4/7/10월)")
+    logger.info(f"  재무지표     : 분기 마감 후 첫 번째 일요일 04:00 (4/6/9/12월) — 다음: {next_financials.strftime('%Y-%m-%d %H:%M KST') if next_financials else '미정'}")
     logger.info(f"  보고서 저장  : reports/daily_update_YYYYMMDD.txt")
     logger.info("  종료: Ctrl+C")
     logger.info("="*60)

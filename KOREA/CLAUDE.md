@@ -34,17 +34,18 @@ date '+%Y-%m-%d %A %H:%M:%S KST'
 
 ---
 
-## 운영 cron (5/18 기준)
+## 운영 cron (5/21 기준)
 
 | 시각 (KST) | 작업 | 소요 | 비고 |
 |---|---|---|---|
 | 23:30 (월~금) | stockfut (LS) | ~10분 | |
-| 02:00 (매일) | daily_update 본체 (인포맥스/DART/KRX) + Phase 5 수정주가 자동 | ~1.5~4시간 | ETF PDF는 분리 |
+| 02:00 (매일) | daily_update 본체 (OHLCV=LS t8451, 수급/외인=인포맥스, DART/KRX) + Phase 5 수정주가 자동 | ~1.5~4시간 | ETF PDF는 분리 |
 | 02:00 후 (직렬) | 분봉 일배치 (LS) | ~50분 | 늦어도 08:50 전 종료 (키B LENS 09:00 충돌 회피) |
 | **08:30 (매일)** | **etf_snapshot (ETF PDF/마스터, today+yesterday)** | ~20분 | 04:30이 늦게 끝나면 자동 대기 |
 | 일 03:00 | DB 백업 | 짧음 | |
+| **일 03:30** | **update_listed_shares (LS t1102 → floating_shares)** | ~1시간 | daily_update market_cap 계산용 |
 
-→ LS 사용 시간대: **23:30~23:40 + 07:30~08:30 (Phase 5 의심 종목만 추가 ~수 분)**
+→ LS 사용 시간대: **23:30~23:40 + 일 03:30~04:30 + 07:30~08:30 (Phase 5 의심 종목만 추가 ~수 분)**
 → LENS 사용 가능: 그 외 시간 (단 LENS 24/7 가동 시 LS token 공유 충돌 가능 — `IGW00121` 발생 시 ls_api.py가 자동 처리)
 
 ### ETF PDF는 왜 04:30이 아닌 08:30?
@@ -58,8 +59,11 @@ date '+%Y-%m-%d %A %H:%M:%S KST'
 
 ### 인포맥스 일별 호출 한도
 - `success=False` + `"사용량 제한"` 메시지 → `InfomaxDailyLimitError` 예외 (`collectors/infomax.py`)
-- backfill은 이 예외를 잡아 자정 00:05 KST까지 자동 대기 후 재개 (`wait_until_midnight` in `scripts/backfill_etf_pdf.py`)
-- ⚠️ daily_update + etf_snapshot만으로도 하루 한도가 소진될 수 있음 → backfill은 잉여 한도로만 진행
+- backfill은 이 예외를 잡아 09:30 KST까지 자동 대기 후 재개 (`wait_until_midnight` in `scripts/backfill_etf_pdf.py`)
+- **5/21~: daily_update OHLCV를 LS t8451로 교체** → 인포맥스 일별 콜 ~8,100 → ~4,300으로 감소 (OHLCV 3,828콜 제거)
+  - OHLCV: LS t8451 (3,828 LS calls/day)
+  - 수급/외인: 인포맥스 유지 (~4,300 calls/day)
+  - market_cap: close × floating_shares.total_shares (DB, 주 1회 갱신)
 
 ## 수정주가 query (5/17~)
 
@@ -70,6 +74,8 @@ date '+%Y-%m-%d %A %H:%M:%S KST'
 
 분봉 view는 raw × adj_factor 자동 곱셈 + volume은 raw 유지 + raw_* 별도 노출.
 corporate_actions 테이블에서 이벤트 발생 종목 + 일자 + factor 조회 가능.
+
+**ETF NAV 계산 시 반드시 `close_price` (raw) 사용 — `adj_close` 금지.** PDF shares는 실물 주수라 수정주가를 곱하면 corporate action 발생일에 NAV가 튀어버림.
 
 ---
 
