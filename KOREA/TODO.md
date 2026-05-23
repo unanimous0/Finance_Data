@@ -1,7 +1,30 @@
 # 📝 TODO - 작업 목록
 
-> **마지막 업데이트**: 2026-05-17
-> **현재 Phase**: Phase 4 + Phase 5(배당) + KRX 휴장일 + KOSPI200/KOSDAQ150 SCD2 + ETF 일별 스냅샷 + 지수/지수선물/주식선물 일별 + **Phase 6 분봉**: 종목/ETF 30초봉 ✅ / 1분봉 1/2~4/24 ✅ + **Phase 7**: 지수/지수선물/주식선물 30초봉 + 분봉/일별 NEAR/NEXT 통합 view ✅ + **5/15-16 사고 대응** ✅ + **수정주가 시스템 (5/16-17) ✅**
+> **마지막 업데이트**: 2026-05-24
+> **현재 Phase**: Phase 4 + Phase 5(배당) + KRX 휴장일 + KOSPI200/KOSDAQ150 SCD2 + ETF 일별 스냅샷 + 지수/지수선물/주식선물 일별 + **Phase 6 분봉**: 종목/ETF 30초봉 ✅ / 1분봉 1/2~4/24 ✅ + **Phase 7**: 지수/지수선물/주식선물 30초봉 + 분봉/일별 NEAR/NEXT 통합 view ✅ + **5/15-16 사고 대응** ✅ + **수정주가 시스템 (5/16-17) ✅** + **5/24 운영/문서 정비 ✅**
+
+---
+
+## 🆕 2026-05-24 — 운영 / 문서 정비
+
+### 완료
+- [x] **scheduler tmux 세션 재가동** — 기존 nohup 단독 가동 발견 → `kdata_scheduler` tmux 세션으로 재가동 (`logs/scheduler.log` tee)
+- [x] **`daily_scheduler.py` 배너 display 버그 fix** — 옛 `trigger_daily` 05:30 / 배너 문구가 dead code로 남아 있어 실제 잡 02:00과 불일치. 둘 다 02:00으로 동기화.
+- [x] **`etf_snapshot.py` retry 로직 추가** — `wait_for_daily_update`에 단계별 대기:
+  - 1단계: 60s polling × 최대 4h
+  - 2단계: 2h 간격 deep retry × 최대 3회
+  - 합계 10h 후에도 daily_update 진행 중이면 RuntimeError abort (다음날 yesterday 2-pass로 부분 회수)
+  - 08:30~18:30 사이 다른 반복 잡 없어 retry 동안 충돌 없음 검증 완료
+- [x] **CLAUDE.md 슬림화** (189줄 → ~70줄)
+  - 운영 상세 → 신규 `docs/스케줄러_운영.md`
+  - 수정주가 query → `docs/데이터_적재_가이드.md`
+  - 투자자 수급 query + 단위 규약 → `docs/인포맥스_API_정리.md`
+  - CLAUDE.md엔 필수만: date 규칙 / cron 요약 / scheduler 재시작 체크 / 명령 cheatsheet / 포인터
+
+### 미완 / 후속
+- [ ] **scheduler SIGTERM handler 실작동 fix** — BlockingScheduler 내부 SIGINT handler가 우리 거 가림. BackgroundScheduler 전환 또는 wrapper script 필요
+- [ ] **`scripts/scheduler_restart.sh` wrapper** — `pgrep -f daily_update` 자동 차단 + tmux 세션 재가동 자동화
+- [ ] **외인지분율 STEP 분리 + daily_update 끝쪽으로 이동** — 5/15~16 사고 대응 미완 잔여 항목
 
 ---
 

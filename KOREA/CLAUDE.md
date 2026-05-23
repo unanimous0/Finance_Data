@@ -1,107 +1,31 @@
 # Finance_Data/KOREA — Claude Code 작업 규칙
 
-## 🚨 절대 규칙: 모든 응답 첫 줄에 `date` 무조건 실행
+> **SSoT 안내**: 프로젝트 상태/Phase/데이터 현황은 `MEMORY.md` (auto-memory)와 `PROJECT.md` / `TODO.md` 참조. 본 파일은 운영 규칙 + 명령 cheatsheet만.
 
-**예외 없음.** "시간 의존 작업인지" 판단하지 마. 무조건 첫 명령:
+## 🚨 절대 규칙: 모든 응답 첫 줄에 `date` 실행
 
 ```bash
 date '+%Y-%m-%d %A %H:%M:%S KST'
 ```
 
-판단 없이 실행. 결과 시각 기준으로 사용자에게 답변. 시간 의존 아닌 작업이면 결과는 무시하면 됨 — 무시 비용은 0, 안 한 비용은 사고.
-
-### 왜 강제 (CLAUDE.md 규칙 만들어놓고 어긴 사례)
-
-- 5/14~5/16 사이 시간/날짜 4시간~10시간씩 틀림 반복
-- "시간 의존 작업인지 판단 후 date 호출"이 무용지물 — 판단 자체가 종종 틀림
-- 따라서 판단 단계 제거. **무조건 매 응답 첫 명령으로 date**.
-
-### 자주 한 실수 (재발 금지 — date로 확실히 검증)
-
-1. **모니터 알림 timestamp를 현재 시각으로 착각** — `tail -F` 초기 버퍼나 옛 이벤트가 늦게 들어올 수 있음. 알림 timestamp ≠ 현재 시각.
-2. **로그 마지막 mtime을 현재로 착각** — 파일 mtime은 마지막 수정 시각.
-3. **앞 메시지의 KST 시각을 끌어다 씀** — 시간 흘러서 더 이상 유효 X.
-4. **UTC 시각을 KST로 오인** — 9시간 차이.
-5. **cron이 도는지 안 도는지 시간 정확히 안 보고 답함** — stockfut 월~금만, daily_update 매일 등 cron schedule + 현재 시각 + 요일 종합 판단.
-
-### 시간 의존 작업 예시
-
-- "지금 stockfut 도는 중인가" → 현재 시각 + 요일 확인 (23:30 ± 10분 + 월~금)
-- "다음 daily_update 언제" → 현재 시각 + 04:30 cron 비교
-- "데이터 받아온 시점" → 보고서 mtime ≠ 현재. KST date로 비교
-- "X시간 후에 끝남" → 시작 시각 + 소요 시간 = 종료 KST
-- "오늘 무슨 데이터 들어옴" → 오늘 요일 + 어제 영업일 확인
+판단 없이 실행. 시간 의존 아닌 작업이면 결과 무시하면 됨 — 무시 비용 0, 안 한 비용 사고.
+배경/자주 한 실수: memory `feedback_time_check.md`.
 
 ---
 
-## 운영 cron (5/21 기준)
+## 운영 cron (요약)
 
-| 시각 (KST) | 작업 | 소요 | 비고 |
-|---|---|---|---|
-| 23:30 (월~금) | stockfut (LS) | ~10분 | |
-| 02:00 (매일) | daily_update 본체 (OHLCV=LS t8451, 수급/외인=인포맥스, DART/KRX) + Phase 5 수정주가 자동 | ~1.5~4시간 | ETF PDF는 분리 |
-| 02:00 후 (직렬) | 분봉 일배치 (LS) | ~50분 | 늦어도 08:50 전 종료 (키B LENS 09:00 충돌 회피) |
-| **08:30 (매일)** | **etf_snapshot (ETF PDF/마스터, today+yesterday)** | ~20분 | 04:30이 늦게 끝나면 자동 대기 |
-| 일 03:00 | DB 백업 | 짧음 | |
-| **일 03:30** | **update_listed_shares (LS t1102 → floating_shares)** | ~1시간 | daily_update market_cap 계산용 |
-
-→ LS 사용 시간대: **23:30~23:40 + 일 03:30~04:30 + 07:30~08:30 (Phase 5 의심 종목만 추가 ~수 분)**
-→ LENS 사용 가능: 그 외 시간 (단 LENS 24/7 가동 시 LS token 공유 충돌 가능 — `IGW00121` 발생 시 ls_api.py가 자동 처리)
-
-### ETF PDF는 왜 04:30이 아닌 08:30?
-04:30 시점엔 인포맥스가 당일 ETF PDF 데이터 ingest 미완 (KODEX 200 등 빈 응답 실측). 09시 이후 정상 반환 → 안전 마진 두고 08:30. `scripts/etf_snapshot.py`가 today + yesterday 2-pass 호출. 08:30 시점에 daily_update가 아직 진행 중이면 `wait_for_daily_update()`가 60s 단위로 대기해 인포맥스 충돌 회피.
-
-### 인포맥스 호출 동시성 가드
-인포맥스 60 RPM 한도를 공유하는 3 프로세스: `daily_update.py`, `etf_snapshot.py`, `backfill_etf_pdf.py`.
-- `etf_snapshot`은 `daily_update` 진행 중이면 대기
-- `backfill_etf_pdf`는 위 둘 중 하나라도 진행 중이면 대기 (`maybe_pause_for_daily_update` in `scripts/backfill_etf_pdf.py`)
-- 옛 시간대 hardcode(04~09)는 폐기 — 실제 프로세스 존재(pgrep) 기반으로 정밀화
-
-### 인포맥스 일별 호출 한도
-- `success=False` + `"사용량 제한"` 메시지 → `InfomaxDailyLimitError` 예외 (`collectors/infomax.py`)
-- backfill은 이 예외를 잡아 09:30 KST까지 자동 대기 후 재개 (`wait_until_midnight` in `scripts/backfill_etf_pdf.py`)
-- **5/21~: daily_update OHLCV를 LS t8451로 교체** → 인포맥스 일별 콜 ~8,100 → ~4,300으로 감소 (OHLCV 3,828콜 제거)
-  - OHLCV: LS t8451 (3,828 LS calls/day)
-  - 수급/외인: 인포맥스 유지 (~4,300 calls/day)
-  - market_cap: close × floating_shares.total_shares (DB, 주 1회 갱신)
-
-## 수정주가 query (5/17~)
-
-| 데이터 | raw | adjusted |
+| 시각 (KST) | 잡 | 빈도 |
 |---|---|---|
-| 일봉 | `SELECT close_price FROM ohlcv_daily` | `SELECT adj_close FROM ohlcv_daily` |
-| 분봉 | `SELECT close FROM ohlcv_intraday` | `SELECT close FROM ohlcv_intraday_adjusted` (view, 자동) |
+| **02:00** | daily_update 본체 + 분봉 직렬 | 매일 |
+| **08:30** | etf_snapshot (today+yesterday 2-pass) | 매일 |
+| 23:30 | stockfut_today | 평일 |
+| 03:00 | weekly_backup | 일요일 |
+| 03:30 | update_listed_shares | 일요일 |
+| 03:30 | quarterly_sector | 분기 첫 일요일 (1/4/7/10월) |
+| 04:00 | quarterly_financials | 분기 마감 후 첫 일요일 (4/6/9/12월) |
 
-분봉 view는 raw × adj_factor 자동 곱셈 + volume은 raw 유지 + raw_* 별도 노출.
-corporate_actions 테이블에서 이벤트 발생 종목 + 일자 + factor 조회 가능.
-
-**ETF NAV 계산 시 반드시 `close_price` (raw) 사용 — `adj_close` 금지.** PDF shares는 실물 주수라 수정주가를 곱하면 corporate action 발생일에 NAV가 튀어버림.
-
----
-
-## 투자자 수급 query 주의 (investor_trading)
-
-| 의미 | SQL |
-|---|---|
-| 기관 전체 (연기금 포함) | `WHERE investor_type='INSTITUTION'` |
-| **순수 기관 (연기금 제외)** | `INSTITUTION 값 − PENSION 값` (계산) |
-| 연기금 단독 | `WHERE investor_type='PENSION'` |
-
-⚠️ API `기관계` = DB `INSTITUTION` = **연기금 포함** 기관 전체. 순수 기관 합계가 필요하면 PENSION을 빼야 함.
-인포맥스 raw는 `연기금` 대신 `기금공제`로 반환 (`collectors/infomax.py` 매핑).
-상세: `PROJECT.md:184-191`, `docs/인포맥스_API_정리.md:155-160`.
-
-### 단위 규약 — 인포맥스 API로 받는 경우 한정
-
-| 항목 | API raw 단위 | DB 저장 단위 | 변환 |
-|---|---|---|---|
-| `net_buy_value` | **천원** | **원** | 반드시 ×1000 (`collectors/infomax.py:149` `unit=1000` 강제) |
-| `net_buy_volume` | 주 | 주 | 변환 없음 |
-
-⚠️ 옛 코드의 단위 자동감지 로직(`bid_val/bid_vol`로 추정)이 고가 종목에서 오인식 → 1000배 큼/작음 버그.
-3/24 commit `36c9356`에서 자동감지 제거 + 항상 ×1000 강제로 fix.
-**다른 vendor로 교체 시**: raw 단위 다시 확인하고 변환 로직 별도 작성. 인포맥스 가정 답습 금지.
-2026-05-17에 잔존 91,833 row (2026-02 백필분) 일괄 ÷1000 정정 완료 (DEVELOPMENT_LOG 참조).
+상세 (요일별 동작, 2-pass 의미, 대기 로직, 동시성 가드, 일별 콜 분배): **`docs/스케줄러_운영.md`**
 
 ---
 
@@ -111,10 +35,54 @@ corporate_actions 테이블에서 이벤트 발생 종목 + 일자 + factor 조�
 pgrep -f "daily_update|backfill_" && echo "⛔ 진행 중 job 있음 — 재시작 차단"
 ```
 
-진행 중 자식 job이 있으면 `tmux send-keys C-c` 또는 `kill`이 자식까지 죽임. graceful shutdown handler 추가했지만 BlockingScheduler가 가려서 작동 안 함 (별도 fix 필요).
+tmux 세션: `kdata_scheduler`. 진행 중 자식 job이 있으면 `C-c`/`kill`이 자식까지 죽임 (graceful handler 미작동).
+
+---
+
+## 자주 쓰는 명령
+
+```bash
+# 환경
+cd /home/una0/projects/Finance_Data/KOREA
+source venv/bin/activate
+psql -d korea_stock_data                            # peer 인증
+
+# 수동 수집
+python scripts/daily_update.py                      # 기본: end=어제(영업일)
+python scripts/daily_update.py 20260523             # 특정 날짜
+python scripts/daily_update.py --missing-only       # 갭 재수집
+python scripts/update_listed_shares.py
+python scripts/etf_snapshot.py
+
+# 백필 (STOP/CONT 가능)
+python scripts/backfill_etf_pdf.py
+python scripts/backfill_30sec_bars.py
+python scripts/backfill_adjusted_daily.py
+
+# 검증/모니터링
+python scripts/check_collection_status.py
+python scripts/data_quality_report.py
+pytest                                              # 전체 테스트
+pytest tests/test_validators -v
+
+# DB
+python scripts/backup_db.py                         # pg_dump -Fc (주간)
+bash scripts/restore_db.sh <dump_file>              # pg_restore + 인덱스 자동 재생성
+
+# scheduler
+tmux attach -t kdata_scheduler
+```
+
+---
+
+## 쿼리 가이드 포인터
+
+- 수정주가 query (일봉/분봉, raw vs adj): `docs/데이터_적재_가이드.md`
+- 투자자 수급 query (INSTITUTION 연기금 포함/제외) + 단위 규약 (×1000): `docs/인포맥스_API_정리.md`
+- 인포맥스 API 전반: `docs/인포맥스_API_정리.md`
 
 ---
 
 ## 메모리 시스템
 
-`/home/una0/.claude/projects/-home-una0-projects-Finance-Data/memory/` 에 누적된 운영 정책/과거 사고 기록 있음. `MEMORY.md`가 인덱스.
+`/home/una0/.claude/projects/-home-una0-projects-Finance-Data/memory/` 누적된 운영 정책/사고 기록. `MEMORY.md`가 인덱스.

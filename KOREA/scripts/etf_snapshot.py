@@ -28,20 +28,56 @@ from scripts.daily_update import run_etf_daily_snapshot_pipeline
 KST = ZoneInfo("Asia/Seoul")
 
 
+# 정상 케이스 wait: 60s polling, 최대 4h (daily_update 최장 실측 ~5h 기준 안전선)
+WAIT_POLL_TIMEOUT_SEC = 4 * 60 * 60
+# Deep retry: 4h 초과 후 2h 간격으로 최대 3회 추가 확인. 최종 abort 전까지 총 10h
+DEEP_RETRY_INTERVAL_SEC = 2 * 60 * 60
+DEEP_RETRY_MAX = 3
+
+
+def _daily_update_running() -> bool:
+    """pgrep 으로 daily_update.py 프로세스 존재 여부 확인. 오류 시 False(=진행 안 함 가정)."""
+    try:
+        r = subprocess.run(["pgrep", "-f", "scripts/daily_update.py"],
+                           capture_output=True, text=True, timeout=5)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 def wait_for_daily_update():
-    """daily_update.py가 진행 중이면 끝날 때까지 대기 (60s 단위 재확인).
-    08:30 cron 시점에 04:30 daily_update가 아직 안 끝났을 경우 인포맥스 한도 충돌 회피."""
+    """daily_update.py가 진행 중이면 끝날 때까지 대기.
+    1단계: 60s polling, 최대 4h (정상 케이스).
+    2단계: 2h 간격 deep retry 최대 3회 (08:30~18:30 사이 다른 반복 잡 없어 안전).
+    그 후에도 진행 중이면 RuntimeError — 강제 진행 시 인포맥스 충돌 우려."""
+    start = time.monotonic()
+
+    # 1단계: 60s polling
     while True:
-        try:
-            r = subprocess.run(["pgrep", "-f", "scripts/daily_update.py"],
-                               capture_output=True, text=True, timeout=5)
-            if r.returncode != 0:
-                return
-        except Exception:
+        if not _daily_update_running():
             return
+        elapsed = time.monotonic() - start
+        if elapsed > WAIT_POLL_TIMEOUT_SEC:
+            break
         now = datetime.now(KST)
-        print(f"  [WAIT] daily_update 진행 중 ({now:%H:%M}) — 60s 후 재확인", flush=True)
+        print(f"  [WAIT] daily_update 진행 중 ({now:%H:%M}, 누적 {elapsed/60:.0f}분) — 60s 후 재확인", flush=True)
         time.sleep(60)
+
+    # 2단계: 2h deep retry 최대 3회
+    for cycle in range(1, DEEP_RETRY_MAX + 1):
+        now = datetime.now(KST)
+        print(f"  [DEEP-WAIT {cycle}/{DEEP_RETRY_MAX}] 4h 초과 — 2h 후 재확인 ({now:%H:%M})", flush=True)
+        time.sleep(DEEP_RETRY_INTERVAL_SEC)
+        if not _daily_update_running():
+            print(f"  [DEEP-WAIT] daily_update 종료 확인 — snapshot 재개", flush=True)
+            return
+
+    total_h = (time.monotonic() - start) / 3600
+    raise RuntimeError(
+        f"daily_update hang 확정 — {total_h:.1f}h 대기 후 abort "
+        f"(60s polling 4h + deep retry {DEEP_RETRY_MAX}회). "
+        f"오늘 ETF snapshot 포기 — 다음날 yesterday 2-pass로 부분 회수."
+    )
 
 
 def _prev_biz_day(d: date) -> date:

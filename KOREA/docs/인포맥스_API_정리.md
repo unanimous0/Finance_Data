@@ -1,7 +1,7 @@
 # 인포맥스 API 정리
 
 > **출처**: 인포맥스 API 백서.pdf (32페이지)
-> **최종 업데이트**: 2026-02-20
+> **최종 업데이트**: 2026-05-20
 > **HOST**: `https://infomaxy.einfomax.co.kr`
 
 ---
@@ -66,6 +66,7 @@ headers = {"Authorization": "bearer YOUR_API_TOKEN"}
 | **주식** | `/api/stock/tick` | 체결(정규장) 틱 | 🟢 낮음 |
 | **ETF** | `/api/etf/hist` | ETF 일별 NAV | 🟡 중간 |
 | **ETF** | `/api/etf/port` | ETF PDF (구성종목) | 🟡 중간 |
+| **ETF** | `/api/etf/intra` | ETF i-NAV 일중 (실시간 추정) | 🟡 중간 |
 | **ETF** | `/api/etp/list` | ETF/ETN 상세검색 | 🟢 낮음 |
 | **ETF** | `/api/etp` | ETP 추가정보 | 🟢 낮음 |
 | **ETF** | `/api/etf/search` | 종목 보유 ETF 검색 | 🟢 낮음 |
@@ -311,7 +312,61 @@ URL: /api/etf/port
 
 ---
 
-### 9. 지수 일별 - `/api/index/hist`
+### 9. ETF i-NAV 일중 - `/api/etf/intra`
+
+**용도**: 장중 실시간 i-NAV(IIV) / 추적오차율 / 괴리율 조회 → LENS 실시간 ETF 모니터링
+
+> ⚠️ **제한: 최근 1개월만** — `date` 파라미터를 줘도 한 달 이내만 조회 가능. 과거 백필 불가.
+
+```
+URL: /api/etf/intra
+파라미터: code (필수), date (YYYYMMDD, 미입력시 today), startTime, endTime (HHMMSS)
+```
+
+**응답 필드:**
+| 필드 | 타입 | 설명 |
+|-----|------|------|
+| date | Number | 일자 |
+| time | Number | 시간 (HHMMSS) |
+| close_price | Number | 현재가 (ETF 거래가) |
+| trading_volume | Number | 거래량 |
+| trading_value | Number | 거래대금 |
+| **i-nav** | Number | **i-NAV (NAV/IIV)** |
+| tracking_error_rate | Number | 추적오차율 |
+| disparate_ratio | Number | 괴리율 |
+
+**활용 예시 (LENS ETF 모니터링):**
+```python
+# 당일 장중 전체 (startTime/endTime 미입력)
+params = {"code": "069500", "date": "20260520"}
+
+# 09:00~10:00 구간만
+params = {"code": "069500", "date": "20260520", "startTime": "090000", "endTime": "100000"}
+```
+
+---
+
+### 10. 종목 보유 ETF 검색 - `/api/etf/search`
+
+**용도**: 특정 종목(주식·채권)을 편입한 ETF 목록 조회
+
+```
+URL: /api/etf/search
+파라미터: code (필수, 6자리 종목코드 or 채권 KR코드), date (YYYYMMDD, 미입력시 today-1)
+```
+
+**응답 필드:**
+| 필드 | 설명 |
+|-----|------|
+| search_code / search_name | 검색한 구성종목 코드·이름 |
+| etf_code / etf_name | 편입 ETF 코드·이름 |
+| etf_value | ETF 평가금액 |
+| search_value | 구성종목 설정금액 |
+| search_volume | 구성종목 편입수량 |
+
+---
+
+### 11. 지수 일별 - `/api/index/hist`
 
 **용도**: KOSPI/KOSDAQ 지수 데이터 (향후 index_components 테이블 활용)
 
@@ -427,3 +482,32 @@ end_date = today - 1 day  # 당일 데이터는 장 마감 후
 | `scripts/test_pension_fund.py` | 연기금 데이터 존재 여부 테스트 | ✅ 완성 |
 | `scripts/test_pension_fund_comprehensive.py` | 전체 종목 연기금 전수 조사 | ✅ 완성 |
 | `collectors/infomax.py` | 실제 수집기 (ETL용) | ⏳ 미완성 |
+
+---
+
+## 투자자 수급 query 주의 (investor_trading)
+
+| 의미 | SQL |
+|---|---|
+| 기관 전체 (연기금 포함) | `WHERE investor_type='INSTITUTION'` |
+| **순수 기관 (연기금 제외)** | `INSTITUTION 값 − PENSION 값` (계산) |
+| 연기금 단독 | `WHERE investor_type='PENSION'` |
+
+⚠️ API `기관계` = DB `INSTITUTION` = **연기금 포함** 기관 전체. 순수 기관 합계가 필요하면 PENSION을 빼야 함.
+인포맥스 raw는 `연기금` 대신 `기금공제`로 반환 (`collectors/infomax.py` 매핑).
+상세: `PROJECT.md:184-191`, 본 파일 위쪽 투자자 구분 코드 섹션.
+
+---
+
+## 단위 규약 — 인포맥스 API로 받는 경우 한정
+
+| 항목 | API raw 단위 | DB 저장 단위 | 변환 |
+|---|---|---|---|
+| `net_buy_value` | **천원** | **원** | 반드시 ×1000 (`collectors/infomax.py:149` `unit=1000` 강제) |
+| `net_buy_volume` | 주 | 주 | 변환 없음 |
+
+⚠️ 옛 코드의 단위 자동감지 로직(`bid_val/bid_vol`로 추정)이 고가 종목에서 오인식 → 1000배 큼/작음 버그.
+3/24 commit `36c9356`에서 자동감지 제거 + 항상 ×1000 강제로 fix.
+
+**다른 vendor로 교체 시**: raw 단위 다시 확인하고 변환 로직 별도 작성. 인포맥스 가정 답습 금지.
+2026-05-17에 잔존 91,833 row (2026-02 백필분) 일괄 ÷1000 정정 완료 (DEVELOPMENT_LOG 참조).

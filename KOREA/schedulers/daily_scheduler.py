@@ -344,7 +344,7 @@ def main():
 
     now = datetime.now(KST)
 
-    trigger_daily   = CronTrigger(hour=5, minute=30, timezone=KST)
+    trigger_daily   = CronTrigger(hour=2, minute=0, timezone=KST)
     trigger_backup  = CronTrigger(day_of_week="sun", hour=3, minute=0, timezone=KST)
     trigger_sector     = CronTrigger(month="1,4,7,10", day="1-7", day_of_week="sun", hour=3, minute=30, timezone=KST)
     trigger_financials = CronTrigger(month="4,6,9,12", day="1-7", day_of_week="sun", hour=4, minute=0, timezone=KST)
@@ -360,7 +360,7 @@ def main():
     logger.info(f"  다음 수집    : {next_daily.strftime('%Y-%m-%d %H:%M KST') if next_daily else '미정'}")
     logger.info(f"  다음 백업    : {next_backup.strftime('%Y-%m-%d %H:%M KST') if next_backup else '미정'}")
     logger.info(f"  다음 섹터    : {next_sector.strftime('%Y-%m-%d %H:%M KST') if next_sector else '미정'}")
-    logger.info(f"  수집 주기    : 매일 05:30 — OHLCV(LS t8451)/수급/외인 + 배당 + LENS export")
+    logger.info(f"  수집 주기    : 매일 02:00 — OHLCV(LS t8451)/수급/외인 + 배당 + LENS export")
     logger.info(f"  백업 주기    : 매주 일요일 03:00  (7일 보관)")
     logger.info(f"  상장주식수   : 매주 일요일 03:30 — LS t1102 → floating_shares")
     logger.info(f"  섹터 주기    : 분기 첫 번째 일요일 03:30 (1/4/7/10월)")
