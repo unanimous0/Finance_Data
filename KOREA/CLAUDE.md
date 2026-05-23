@@ -32,10 +32,23 @@ date '+%Y-%m-%d %A %H:%M:%S KST'
 ## scheduler 재시작 전 절대 체크
 
 ```bash
-pgrep -f "daily_update|backfill_" && echo "⛔ 진행 중 job 있음 — 재시작 차단"
+pgrep -f "daily_update|backfill_|backup_db|etf_snapshot|update_listed_shares|crawl_sector|collect_financials|stockfut" && echo "⛔ 진행 중 job 있음 — 재시작 차단"
 ```
 
-tmux 세션: `kdata_scheduler`. 진행 중 자식 job이 있으면 `C-c`/`kill`이 자식까지 죽임 (graceful handler 미작동).
+진행 중 자식 job이 있으면 `C-c`/`kill`이 자식까지 죽임 (graceful handler 미작동, 5/24 03:00 백업이 이렇게 절단된 사례 있음).
+
+### 잡 fire 시각 회피 (재시작 30분 전후 피하기)
+- 02:00 daily_update / 03:00 weekly_backup / 03:30 update_listed_shares / 08:30 etf_snapshot / 23:30 stockfut (평일)
+- 가능한 정각/30분 시각에서 5분 이상 떨어진 시점에 재시작
+
+### 시작 시 자동 보충 (`startup_catchup`)
+재시작 시 누락된 주간 잡 자동 보충:
+- weekly_backup: 최신 백업 파일 mtime > 8일 → 즉시 실행
+- update_listed_shares: floating_shares max(updated_at) > 8일 → 즉시 실행
+- daily_update / etf_snapshot은 자체 갭 회수 로직 있어 catch-up 불필요
+- stockfut은 historical 불가 → catch-up 불가능
+
+tmux 세션: `kdata_scheduler`.
 
 ---
 

@@ -32,12 +32,39 @@ from config.settings import settings
 KST = ZoneInfo("Asia/Seoul")
 
 
-def wait_until_midnight():
-    """자정(KST 00:00) 이후까지 대기 — 인포맥스 일별 한도 리셋 대기용."""
+# 인포맥스 일별 한도 = 00:00 KST 리셋. 백필 안전 가동 윈도우는 10:00 ~ 24:00.
+# - 00:00 ~ 10:00 sleep: 일별 한도 리셋 후 daily_update(02:00) + etf_snapshot(08:30) 우선권 보장
+# - 10:00 ~ 24:00 가동: etf_snapshot ~09:00 종료 + 1시간 안전 마진
+SAFE_WINDOW_START_HOUR = 10
+
+
+def wait_for_safe_window():
+    """현재 시각이 00:00 ~ 10:00 KST 사이면 오늘 10:00까지 대기.
+    반복 잡 우선권 + 일별 한도(00:00 리셋) 침범 방지."""
     now = datetime.now(KST)
-    tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=5, second=0, microsecond=0)
-    secs = (tomorrow - now).total_seconds()
-    print(f"  [LIMIT] 인포맥스 일별 한도 초과 — {tomorrow:%m/%d %H:%M} KST까지 {secs/3600:.1f}h 대기", flush=True)
+    if now.hour >= SAFE_WINDOW_START_HOUR:
+        return  # 이미 안전 윈도우 (10:00 ~ 23:59)
+    resume = now.replace(hour=SAFE_WINDOW_START_HOUR, minute=0, second=0, microsecond=0)
+    secs = (resume - now).total_seconds()
+    print(f"  [SAFE-WINDOW] 안전 윈도우 밖 ({now:%H:%M}) — {resume:%H:%M} KST까지 {secs/3600:.1f}h 대기"
+          f" (daily_update + etf_snapshot 우선권 보장)", flush=True)
+    time.sleep(secs)
+    print(f"  [SAFE-WINDOW] 대기 완료, 재개", flush=True)
+
+
+def wait_until_midnight():
+    """인포맥스 일별 한도 초과 → 다음 안전 윈도우 시작(다음날 10:00 KST)까지 대기.
+    이름은 historical (자정 = 한도 리셋 시점). 실제론 자정 + 10h(반복 잡 우선권)."""
+    now = datetime.now(KST)
+    if now.hour < SAFE_WINDOW_START_HOUR:
+        # 오늘 아직 10시 전이면 오늘 10시까지
+        resume = now.replace(hour=SAFE_WINDOW_START_HOUR, minute=0, second=0, microsecond=0)
+    else:
+        # 10시 이후면 다음날 10시까지
+        resume = (now + timedelta(days=1)).replace(hour=SAFE_WINDOW_START_HOUR, minute=0, second=0, microsecond=0)
+    secs = (resume - now).total_seconds()
+    print(f"  [LIMIT] 인포맥스 일별 한도 초과 — {resume:%m/%d %H:%M} KST까지 {secs/3600:.1f}h 대기"
+          f" (한도 리셋 00:00 + 반복 잡 우선권)", flush=True)
     time.sleep(secs)
     print(f"  [LIMIT] 대기 완료, 재개", flush=True)
 
@@ -75,6 +102,7 @@ WHERE market = 'ETF' AND is_active = TRUE
       stock_name ~ '(미국|나스닥|NASDAQ|S&P|필라델피아|차이나|항셍|일본|베트남|인도|유럽|뉴욕|INDXX|SOLACTIVE|WTI|원유|은선물|천연가스|옥수수|대두|엔비디아|테슬라|구글|팔란티어|마이크로소프트|아마존|애플|메타)'
       OR (stock_name LIKE '%(H)%' AND stock_name NOT LIKE '%KRX%')
       OR (stock_name LIKE '%글로벌%' AND stock_name NOT LIKE '%K-글로벌%' AND stock_name NOT LIKE '%K글로벌%')
+      OR stock_name ~ '(채권|리츠|REIT|싱가포르|혼합|커버드콜|금현물|Gold|GOLD)'
   )
 ORDER BY stock_code
 """
@@ -124,6 +152,17 @@ def fetch_biz_days(conn, start: date, end: date) -> list[date]:
             "SELECT DISTINCT time FROM ohlcv_daily WHERE time BETWEEN %s AND %s ORDER BY time",
             (start, end))
         return [r[0] for r in cur.fetchall()]
+
+
+def fetch_existing_pairs(conn, start: date, end: date) -> set[tuple[str, date]]:
+    """etf_portfolio_daily에 이미 적재된 (etf_code, snapshot_date) 쌍.
+    daily etf_snapshot이 매일 적재한 데이터를 백필이 중복 호출하지 않도록 제외용."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT DISTINCT etf_code, snapshot_date FROM etf_portfolio_daily "
+            "WHERE snapshot_date BETWEEN %s AND %s",
+            (start, end))
+        return {(r[0], r[1]) for r in cur.fetchall()}
 
 
 def process_etf_day(client, conn, etf_code, target_date) -> tuple[int, int, str]:
@@ -181,6 +220,8 @@ def main():
     parser.add_argument("--limit", type=int, default=None, help="상위 N ETF (sanity)")
     parser.add_argument("--desc", action="store_true",
                         help="최신 일자부터 옛 일자 순으로 (점진 분석용)")
+    parser.add_argument("--max-calls", type=int, default=None,
+                        help="일별 최대 API 호출 수 self-limit (옵션). 미지정 시 인포맥스가 한도 초과 응답할 때까지 호출 — 반복 잡 남은 한도 풀로 활용.")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -196,9 +237,20 @@ def main():
         biz_days = fetch_biz_days(conn, start, end)
         if args.desc:
             biz_days = list(reversed(biz_days))
-        total = len(etfs) * len(biz_days)
+
+        # 이미 적재된 (etf, date) 쌍 제외 (daily etf_snapshot 커버 구간 중복 호출 방지)
+        existing = fetch_existing_pairs(conn, start, end)
+        full_total = len(etfs) * len(biz_days)
+        work_list = [(d, etf_code, etf_name)
+                     for d in biz_days
+                     for etf_code, etf_name in etfs
+                     if (etf_code, d) not in existing]
+        total = len(work_list)
+        skipped_existing = full_total - total
+
         order = "desc (최신→옛)" if args.desc else "asc (옛→최신)"
-        print(f"[ETF PDF 백필 {order}] {start}~{end} 거래일 {len(biz_days)}일 × ETF {len(etfs)}개 = {total:,} 호출")
+        print(f"[ETF PDF 백필 {order}] {start}~{end} 거래일 {len(biz_days)}일 × ETF {len(etfs)}개")
+        print(f"  전체 {full_total:,} 중 이미 적재 {skipped_existing:,} 건 skip → 실제 호출 {total:,}")
         print(f"  TPS 1 (60 RPM 기준) → 예상 ~{total/60:.0f}분 = ~{total/3600:.1f}시간")
 
         if args.dry_run:
@@ -208,31 +260,44 @@ def main():
         t0 = time.time()
         ok = empty = err = 0
         total_pdf = total_master = 0
-        # 분석 점진 확보 위해 outer=days (desc 시 5/15부터), inner=ETFs
-        # 한 day의 전체 ETF 완료되면 그 일자 NAV 분석 가능
         i = 0
-        for d in biz_days:
-            for etf_code, etf_name in etfs:
-                i += 1
-                maybe_pause_for_daily_update()  # 04:30~09:00 daily_update와 충돌 회피
+        daily_calls = 0
+        for d, etf_code, etf_name in work_list:
+            i += 1
+            daily_calls += 1
+            if args.max_calls is not None and daily_calls > args.max_calls:
+                print(f"  [MAX-CALLS] 일별 self-limit {args.max_calls}콜 도달 — 09:30 재개 대기", flush=True)
+                wait_until_midnight()
+                daily_calls = 1
+            wait_for_safe_window()           # 00:00~10:00 sleep — 반복 잡에 한도 양보
+            maybe_pause_for_daily_update()   # daily_update/etf_snapshot 진행 중이면 PAUSE (방어적 이중 가드)
+            try:
+                pdf_n, master_n, status = process_etf_day(client, conn, etf_code, d)
+            except InfomaxDailyLimitError:
+                wait_until_midnight()
+                daily_calls = 1
+                pdf_n, master_n, status = process_etf_day(client, conn, etf_code, d)
+            except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+                print(f"  [DB 재연결] {type(e).__name__}: {e}", flush=True)
                 try:
-                    pdf_n, master_n, status = process_etf_day(client, conn, etf_code, d)
-                except InfomaxDailyLimitError:
-                    wait_until_midnight()
-                    pdf_n, master_n, status = process_etf_day(client, conn, etf_code, d)
-                if status == "ok":
-                    ok += 1
-                    total_pdf += pdf_n
-                    total_master += master_n
-                elif status == "empty":
-                    empty += 1
-                else:
-                    err += 1
-                if i % 500 == 0:
-                    elapsed = time.time() - t0
-                    rate = i / elapsed if elapsed else 0
-                    eta_min = (total - i) / rate / 60 if rate else 0
-                    print(f"  [{i:>6}/{total} {i/total*100:.1f}%] ok {ok} / 빈 {empty} / 에러 {err} / PDF {total_pdf:,} / 마스터 {total_master:,} / ETA {eta_min:.0f}min", flush=True)
+                    conn.close()
+                except Exception:
+                    pass
+                conn = _conn()
+                pdf_n, master_n, status = process_etf_day(client, conn, etf_code, d)
+            if status == "ok":
+                ok += 1
+                total_pdf += pdf_n
+                total_master += master_n
+            elif status == "empty":
+                empty += 1
+            else:
+                err += 1
+            if i % 500 == 0:
+                elapsed = time.time() - t0
+                rate = i / elapsed if elapsed else 0
+                eta_min = (total - i) / rate / 60 if rate else 0
+                print(f"  [{i:>6}/{total} {i/total*100:.1f}%] ok {ok} / 빈 {empty} / 에러 {err} / PDF {total_pdf:,} / 마스터 {total_master:,} / ETA {eta_min:.0f}min", flush=True)
 
         elapsed = time.time() - t0
         print(f"\n[완료] 소요 {elapsed/60:.1f}분 / ok {ok} / 빈 {empty} / 에러 {err} / PDF {total_pdf:,} / 마스터 {total_master:,}")

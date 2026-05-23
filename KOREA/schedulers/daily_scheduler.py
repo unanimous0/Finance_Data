@@ -35,6 +35,19 @@ sys.path.insert(0, str(project_root))
 
 KST = ZoneInfo("Asia/Seoul")
 
+from schedulers.notifier import notify_job
+
+
+def _read_report_tail(report_path: Path, max_chars: int = 1500) -> str:
+    """daily_update 보고서 마지막 부분 읽기 (Telegram 메시지 길이 제한 안에)."""
+    try:
+        text = report_path.read_text(encoding="utf-8")
+        if len(text) <= max_chars:
+            return text
+        return "...\n" + text[-max_chars:]
+    except Exception as e:
+        return f"(보고서 읽기 실패: {e})"
+
 # logs 폴더 생성 (logging 설정 전에 먼저 생성)
 (project_root / "logs").mkdir(exist_ok=True)
 
@@ -60,36 +73,69 @@ def job_daily_update():
     키B(와이프) 사용 — 08:50 이전 종료 보장 (LENS REST 09:00~15:45 키B 충돌 회피).
     """
     from scripts.daily_update import main as run_daily
+    started = datetime.now(KST)
     logger.info("="*60)
-    logger.info(f"[스케줄러] 일별 업데이트 시작: {datetime.now(KST)}")
+    logger.info(f"[스케줄러] 일별 업데이트 시작: {started}")
     logger.info("="*60)
+
+    # daily_update 본체
+    main_status, main_err = "ok", None
     try:
         run_daily()
     except Exception as e:
+        main_status, main_err = "fail", str(e)
         logger.error(f"[스케줄러] daily_update 본체 실패: {e}")
 
+    # 본체 결과를 보고서 파일에서 추출해서 알림
+    today_kst = datetime.now(KST).date()
+    yesterday = today_kst - __import__("datetime").timedelta(days=1)
+    reports_dir = project_root / "reports"
+    detail = ""
+    status = main_status
+    # 보고서 후보: 영업일 정식 / 휴장 skip
+    for d in (yesterday, today_kst, yesterday - __import__("datetime").timedelta(days=1)):
+        for suffix in ("", "_skip"):
+            p = reports_dir / f"daily_update_{d:%Y%m%d}{suffix}.txt"
+            if p.exists() and (datetime.now().timestamp() - p.stat().st_mtime) < 7200:
+                detail = _read_report_tail(p)
+                if suffix == "_skip" and main_status == "ok":
+                    status = "noop"
+                break
+        if detail:
+            break
+    if main_status == "fail" and main_err:
+        detail = (detail + f"\n\nERROR: {main_err}")[-1500:]
+    notify_job("daily_update", status, started, detail=detail)
+
     # daily_update 끝나고 분봉 일배치 직렬 호출 (한낮 LS 부하 회피, 사용자 활동 시작 전)
+    mb_started = datetime.now(KST)
     logger.info("="*60)
-    logger.info(f"[스케줄러] 분봉 일배치 시작 (daily_update 후속): {datetime.now(KST)}")
+    logger.info(f"[스케줄러] 분봉 일배치 시작 (daily_update 후속): {mb_started}")
     logger.info("="*60)
     try:
         job_minute_bars_daily()
+        # 분봉은 알림 별도로 보내지 않음 (daily_update 알림에 묶이는 흐름).
+        # 실패 시에만 별도 알림.
     except Exception as e:
         logger.error(f"[스케줄러] 분봉 일배치 실패: {e}")
+        notify_job("minute_bars (daily_update 후속)", "fail", mb_started, detail=f"ERROR: {e}")
 
 
 def job_weekly_backup():
-    """매주 일요일 03:00 실행되는 백업 작업"""
+    """매주 일요일 03:00 실행되는 백업 작업. 알림은 실패 시에만."""
     from scripts.backup_db import run_backup, cleanup_old_backups
+    started = datetime.now(KST)
     logger.info("="*60)
-    logger.info(f"[스케줄러] 주간 백업 시작: {datetime.now(KST)}")
+    logger.info(f"[스케줄러] 주간 백업 시작: {started}")
     logger.info("="*60)
     try:
         backup_file = run_backup()
         cleanup_old_backups()
         logger.info(f"[스케줄러] 백업 완료: {backup_file.name}")
+        # 성공 시 알림 안 보냄 (사용자 정책)
     except Exception as e:
         logger.error(f"[스케줄러] 백업 실패: {e}")
+        notify_job("weekly_backup", "fail", started, detail=f"ERROR: {e}")
 
 
 def job_minute_bars_daily():
@@ -138,37 +184,140 @@ def job_minute_bars_daily():
         _ls_backfill_resume(paused)
 
 
+def _verify_stockfut_loaded(today, result) -> tuple[bool, str]:
+    """주식선물 당일 적재 검증.
+    actives 중 95% 이상의 contract가 DB에 30초봉 row를 가지면 성공으로 판정."""
+    if not result or result.get("skipped"):
+        return False, f"skip={result}"
+    actives = result.get("actives", 0)
+    if actives == 0:
+        return False, "actives=0"
+    try:
+        from scripts.daily_update import get_conn
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(DISTINCT futures_code) FROM futures_ohlcv_intraday "
+                    "WHERE time::date = %s AND interval_seconds = 30",
+                    (today,))
+                loaded = cur.fetchone()[0]
+        finally:
+            conn.close()
+        threshold = max(1, int(actives * 0.95))
+        ok = loaded >= threshold
+        return ok, f"actives={actives}, loaded={loaded}, threshold={threshold}"
+    except Exception as e:
+        return False, f"verify error: {e}"
+
+
 def job_stockfut_today():
-    """매일 15:35 KST (장 마감 직후) — 주식선물 30초봉 당일 적재 (LS t8406).
-    historical 불가능 → 매일 받지 않으면 영구 손실."""
+    """매일 23:30 KST (평일) — 주식선물 30초봉 당일 적재 (LS t8406).
+    historical 불가능 → 매일 받지 않으면 영구 손실.
+    실행 후 검증 → 누락 시 5분 간격 최대 3회 재시도 (UPSERT라 안전)."""
     from scripts.daily_update import (run_stockfut_minute_today_pipeline,
                                        _ls_backfill_pause, _ls_backfill_resume)
-    today = datetime.now(KST).date()
+    import time as _time
+    MAX_ATTEMPTS = 3
+    RETRY_WAIT_SEC = 300  # 5분
+
+    started = datetime.now(KST)
+    today = started.date()
     logger.info("="*60)
-    logger.info(f"[스케줄러] 주식선물 당일 30초봉 시작: {datetime.now(KST)}")
+    logger.info(f"[스케줄러] 주식선물 당일 30초봉 시작: {started}")
     logger.info("="*60)
+
     paused = _ls_backfill_pause()
+    last_result = None
+    last_err = None
+    verify_msg = ""
+    ok = False
     try:
-        result = run_stockfut_minute_today_pipeline(today)
-        logger.info(f"[스케줄러] 주식선물 당일 30초봉 완료: {result}")
-    except Exception as e:
-        logger.error(f"[스케줄러] 주식선물 당일 30초봉 실패: {e}")
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            logger.info(f"[스케줄러] stockfut attempt {attempt}/{MAX_ATTEMPTS}")
+            try:
+                last_result = run_stockfut_minute_today_pipeline(today)
+                last_err = None
+            except Exception as e:
+                last_err = e
+                last_result = None
+                logger.error(f"[스케줄러] stockfut attempt {attempt} 예외: {e}")
+
+            ok, verify_msg = _verify_stockfut_loaded(today, last_result)
+            logger.info(f"[스케줄러] stockfut 검증: ok={ok}, {verify_msg}")
+            if ok:
+                break
+            if attempt < MAX_ATTEMPTS:
+                logger.warning(f"[스케줄러] stockfut 검증 실패 — {RETRY_WAIT_SEC}s 후 재시도")
+                _time.sleep(RETRY_WAIT_SEC)
     finally:
         _ls_backfill_resume(paused)
+
+    if ok:
+        status = "ok"
+        detail = f"date: {today}\nresult: {last_result}\nverify: {verify_msg}"
+    else:
+        status = "fail"
+        detail = f"date: {today}\nattempts: {MAX_ATTEMPTS} (UPSERT 모두 임계 미달)\nverify: {verify_msg}"
+        if last_err:
+            detail += f"\nlast ERROR: {last_err}"
+        elif last_result:
+            detail += f"\nlast result: {last_result}"
+    notify_job("stockfut_today", status, started, detail=detail)
 
 
 def job_etf_snapshot():
     """매일 08:30 KST — ETF PDF/마스터 스냅샷 (today + yesterday 2-pass).
     daily_update에서 분리 — 04:30엔 인포맥스 ingest 미완 (당일 PDF 빈 응답)."""
     from scripts.etf_snapshot import main as etf_main
+    started = datetime.now(KST)
     logger.info("="*60)
-    logger.info(f"[스케줄러] ETF 스냅샷 시작: {datetime.now(KST)}")
+    logger.info(f"[스케줄러] ETF 스냅샷 시작: {started}")
     logger.info("="*60)
+    status, detail = "ok", ""
     try:
         etf_main()
         logger.info(f"[스케줄러] ETF 스냅샷 완료: {datetime.now(KST)}")
+        # DB에서 적재 결과 조회 → 알림에 포함
+        detail = _etf_snapshot_summary(started.date())
     except Exception as e:
         logger.error(f"[스케줄러] ETF 스냅샷 실패: {e}")
+        status, detail = "fail", f"ERROR: {e}"
+    notify_job("etf_snapshot", status, started, detail=detail)
+
+
+def _etf_snapshot_summary(today_date) -> str:
+    """오늘+직전 영업일의 ETF PDF / 마스터 적재 row 수 조회."""
+    try:
+        from scripts.daily_update import get_conn
+        import datetime as _dt
+        # 오늘 + 직전 영업일(가장 최근 weekday)
+        yest = today_date - _dt.timedelta(days=1)
+        while yest.weekday() >= 5:
+            yest -= _dt.timedelta(days=1)
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT snapshot_date, COUNT(DISTINCT etf_code) AS etfs, COUNT(*) AS rows "
+                    "FROM etf_portfolio_daily WHERE snapshot_date IN (%s, %s) "
+                    "GROUP BY snapshot_date ORDER BY snapshot_date",
+                    (yest, today_date))
+                pdf_rows = cur.fetchall()
+                cur.execute(
+                    "SELECT snapshot_date, COUNT(*) FROM etf_master_daily "
+                    "WHERE snapshot_date IN (%s, %s) GROUP BY snapshot_date ORDER BY snapshot_date",
+                    (yest, today_date))
+                master_rows = dict(cur.fetchall())
+        finally:
+            conn.close()
+        lines = []
+        for d, etfs, rows in pdf_rows:
+            m = master_rows.get(d, 0)
+            lines.append(f"{d}: PDF {etfs} ETF / {rows:,} row, master {m}")
+        return "\n".join(lines) if lines else "(적재 결과 없음)"
+    except Exception as e:
+        return f"(요약 조회 실패: {e})"
 
 
 def job_quarterly_financials():
@@ -176,41 +325,68 @@ def job_quarterly_financials():
     타이밍: 6/1~7 (Q1 5/31 마감), 9/1~7 (H1 8/31), 12/1~7 (Q3 11/30), 4/1~7 (연간 3/31)
     """
     from scripts.collect_financials import run as run_financials
+    started = datetime.now(KST)
     logger.info("=" * 60)
-    logger.info(f"[스케줄러] 분기 재무지표 수집 시작: {datetime.now(KST)}")
+    logger.info(f"[스케줄러] 분기 재무지표 수집 시작: {started}")
     logger.info("=" * 60)
+    status, detail = "ok", ""
     try:
         run_financials(delay=0.3)
         logger.info("[스케줄러] 분기 재무지표 수집 완료")
     except Exception as e:
         logger.error(f"[스케줄러] 분기 재무지표 수집 실패: {e}")
+        status, detail = "fail", f"ERROR: {e}"
+    notify_job("quarterly_financials", status, started, detail=detail)
 
 
 def job_quarterly_sector():
     """분기 첫 번째 일요일 03:30 실행되는 FICS 업종 크롤링"""
     from scripts.crawl_sector import main as run_crawl
+    started = datetime.now(KST)
     logger.info("="*60)
-    logger.info(f"[스케줄러] 분기별 FICS 업종 크롤링 시작: {datetime.now(KST)}")
+    logger.info(f"[스케줄러] 분기별 FICS 업종 크롤링 시작: {started}")
     logger.info("="*60)
+    status, detail = "ok", ""
     try:
         run_crawl(missing_only=False)
         logger.info("[스케줄러] FICS 업종 크롤링 완료")
     except Exception as e:
         logger.error(f"[스케줄러] FICS 업종 크롤링 실패: {e}")
+        status, detail = "fail", f"ERROR: {e}"
+    notify_job("quarterly_sector", status, started, detail=detail)
 
 
 def job_update_listed_shares():
     """매주 일요일 03:30 KST — LS t1102로 전종목 상장주식수 갱신 → floating_shares 테이블
     daily_update의 market_cap 계산 (close × total_shares) 데이터 소스."""
     from scripts.update_listed_shares import main as run_update_shares
+    started = datetime.now(KST)
     logger.info("="*60)
-    logger.info(f"[스케줄러] 상장주식수 갱신 시작: {datetime.now(KST)}")
+    logger.info(f"[스케줄러] 상장주식수 갱신 시작: {started}")
     logger.info("="*60)
+    status, detail = "ok", ""
     try:
         run_update_shares()
         logger.info("[스케줄러] 상장주식수 갱신 완료")
+        # 갱신 row 수 조회 — created_at 기준 (방금 INSERT/UPDATE된 row)
+        try:
+            from scripts.daily_update import get_conn
+            conn = get_conn()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM floating_shares "
+                    "WHERE created_at >= NOW() - INTERVAL '6 hours'")
+                n = cur.fetchone()[0]
+                cur.execute("SELECT MAX(base_date) FROM floating_shares")
+                base_date = cur.fetchone()[0]
+            conn.close()
+            detail = f"updated {n:,} rows in floating_shares (base_date={base_date})"
+        except Exception:
+            pass
     except Exception as e:
         logger.error(f"[스케줄러] 상장주식수 갱신 실패: {e}")
+        status, detail = "fail", f"ERROR: {e}"
+    notify_job("update_listed_shares", status, started, detail=detail)
 
 
 def on_job_executed(event):
@@ -220,6 +396,60 @@ def on_job_executed(event):
 
 def on_job_error(event):
     logger.error(f"[스케줄러] 작업 오류: {event.job_id} → {event.exception}")
+
+
+def startup_catchup():
+    """scheduler 시작 시 누락된 주간 잡 즉시 보충.
+    APScheduler misfire_grace_time이 시작 시점에 항상 잡아주진 않으므로 명시적 catch-up.
+
+    대상:
+    - weekly_backup: 최신 백업 파일 mtime > 8일 → 즉시 실행
+    - update_listed_shares: floating_shares max(updated_at) > 8일 → 즉시 실행
+    - daily_update: 자체 갭 backfill 로직 있어 제외
+    - etf_snapshot: today+yesterday 2-pass로 자체 회수 → 제외
+    - stockfut_today: historical 불가 → catch-up 불가
+    - quarterly_*: 분기 빈도, 우선순위 낮음 → 제외
+    """
+    import threading
+    now = datetime.now(KST)
+
+    # weekly_backup 체크
+    try:
+        backup_dir = project_root / "backups"
+        dumps = sorted(backup_dir.glob("backup_*.dump"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not dumps:
+            stale_days = float("inf")
+        else:
+            stale_days = (now.timestamp() - dumps[0].stat().st_mtime) / 86400
+        if stale_days > 8:
+            logger.warning(f"[catch-up] 최신 백업 {stale_days:.1f}일 경과 — weekly_backup 보충 실행")
+            threading.Thread(target=job_weekly_backup, daemon=True, name="catchup-backup").start()
+        else:
+            logger.info(f"[catch-up] 최신 백업 {stale_days:.1f}일 — 정상 (8일 이내)")
+    except Exception as e:
+        logger.error(f"[catch-up] weekly_backup 체크 실패: {e}")
+
+    # update_listed_shares 체크 — floating_shares.base_date 기준
+    try:
+        from scripts.daily_update import get_conn
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT MAX(base_date) FROM floating_shares")
+                last_base_date = cur.fetchone()[0]
+        finally:
+            conn.close()
+        if last_base_date is None:
+            stale_days = float("inf")
+        else:
+            stale_days = (now.date() - last_base_date).days
+        if stale_days > 8:
+            logger.warning(f"[catch-up] 상장주식수 {stale_days:.1f}일 경과 — update_listed_shares 보충 실행")
+            threading.Thread(target=job_update_listed_shares, daemon=True, name="catchup-shares").start()
+        else:
+            logger.info(f"[catch-up] 상장주식수 {stale_days:.1f}일 — 정상 (8일 이내)")
+    except Exception as e:
+        logger.error(f"[catch-up] update_listed_shares 체크 실패: {e}")
 
 
 def main():
@@ -368,6 +598,9 @@ def main():
     logger.info(f"  보고서 저장  : reports/daily_update_YYYYMMDD.txt")
     logger.info("  종료: Ctrl+C")
     logger.info("="*60)
+
+    # 시작 시 누락된 주간 잡 보충 (재시작 시점이 잡 fire 시각에 가까웠던 경우 대비)
+    startup_catchup()
 
     try:
         scheduler.start()

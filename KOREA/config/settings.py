@@ -86,6 +86,7 @@ class Settings(BaseSettings):
         env_file = ".env"
         env_file_encoding = "utf-8"
         case_sensitive = True
+        extra = "ignore"  # .env에 정의 안 된 키(TELEGRAM_* 등)는 무시 — notifier가 자체 로드
 
     @property
     def database_url(self) -> str:

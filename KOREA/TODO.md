@@ -5,26 +5,54 @@
 
 ---
 
-## 🆕 2026-05-24 — 운영 / 문서 정비
+## 🆕 2026-05-24 — 운영 / 문서 정비 + Telegram 알림 + 백필 전략 정비
 
-### 완료
+### 완료 (오전)
 - [x] **scheduler tmux 세션 재가동** — 기존 nohup 단독 가동 발견 → `kdata_scheduler` tmux 세션으로 재가동 (`logs/scheduler.log` tee)
 - [x] **`daily_scheduler.py` 배너 display 버그 fix** — 옛 `trigger_daily` 05:30 / 배너 문구가 dead code로 남아 있어 실제 잡 02:00과 불일치. 둘 다 02:00으로 동기화.
 - [x] **`etf_snapshot.py` retry 로직 추가** — `wait_for_daily_update`에 단계별 대기:
   - 1단계: 60s polling × 최대 4h
   - 2단계: 2h 간격 deep retry × 최대 3회
   - 합계 10h 후에도 daily_update 진행 중이면 RuntimeError abort (다음날 yesterday 2-pass로 부분 회수)
-  - 08:30~18:30 사이 다른 반복 잡 없어 retry 동안 충돌 없음 검증 완료
-- [x] **CLAUDE.md 슬림화** (189줄 → ~70줄)
-  - 운영 상세 → 신규 `docs/스케줄러_운영.md`
-  - 수정주가 query → `docs/데이터_적재_가이드.md`
-  - 투자자 수급 query + 단위 규약 → `docs/인포맥스_API_정리.md`
-  - CLAUDE.md엔 필수만: date 규칙 / cron 요약 / scheduler 재시작 체크 / 명령 cheatsheet / 포인터
+- [x] **CLAUDE.md 슬림화** (189줄 → ~70줄), 운영 상세는 `docs/스케줄러_운영.md` 신설로 이관
 
-### 미완 / 후속
-- [ ] **scheduler SIGTERM handler 실작동 fix** — BlockingScheduler 내부 SIGINT handler가 우리 거 가림. BackgroundScheduler 전환 또는 wrapper script 필요
-- [ ] **`scripts/scheduler_restart.sh` wrapper** — `pgrep -f daily_update` 자동 차단 + tmux 세션 재가동 자동화
-- [ ] **외인지분율 STEP 분리 + daily_update 끝쪽으로 이동** — 5/15~16 사고 대응 미완 잔여 항목
+### 완료 (새벽 — 백필/알림/회복성)
+- [x] **ETF PDF 백필 전략 전면 재정비** (`scripts/backfill_etf_pdf.py`)
+  - `fetch_existing_pairs()` 신설 — `etf_portfolio_daily` 에 이미 적재된 `(etf_code, snapshot_date)` 쌍 skip
+  - daily etf_snapshot이 매일 적재한 데이터 중복 호출 회피 → 53,770 → 22,794 콜 (57.6% 감소)
+  - `--desc` 모드로 가동 (최신→옛, 5/20 268개 누락분 우선 회수)
+  - **안전 윈도우 가드** (`wait_for_safe_window`) — 백필은 10:00~24:00만 가동 (00:00~10:00은 daily_update/etf_snapshot에 인포맥스 한도 양보)
+  - 옛 self-limit (`--max-calls 2000`) default 제거 → 인포맥스 한도 풀로 활용
+  - `wait_until_midnight` 의미 정정: 09:30 → 다음 10:00 (한도 리셋 + 반복 잡 우선권)
+  - tmux 세션: `etf_backfill` 별도 가동
+- [x] **Telegram 알림 시스템 구축**
+  - `schedulers/notifier.py` 신설 — `notify_job()` 헬퍼, .env에서 토큰/chat_id 로드, 실패 시 silent skip
+  - 6개 잡에 알림 통합: daily_update(no-op 포함) / etf_snapshot / stockfut_today / update_listed_shares / weekly_backup(실패만) / quarterly_*
+  - daily_update 알림은 보고서 tail 첨부, etf_snapshot은 DB row 수 조회, stockfut는 검증 결과 포함
+  - `config/settings.py`에 `extra = "ignore"` 추가 — pydantic-settings가 TELEGRAM_* 등 unknown 키 거부하던 부작용 fix
+- [x] **stockfut_today 재시도 로직** — historical 불가 → 영구 손실 방지
+  - `_verify_stockfut_loaded()` 신설 — DB의 distinct futures_code 수가 actives의 95% 이상이면 성공
+  - 검증 실패 시 5분 간격 최대 3회 재시도 (UPSERT라 안전)
+  - 마지막 시도까지 실패하면 fail 알림 발송
+- [x] **scheduler 시작 시 catch-up 로직** (`startup_catchup`)
+  - APScheduler misfire_grace_time이 시작 시점 단일 fire를 항상 잡지 않는 한계 보완
+  - weekly_backup: 최신 백업 mtime > 8일 → 즉시 보충 (background thread)
+  - update_listed_shares: floating_shares.base_date > 8일 → 즉시 보충
+  - daily_update / etf_snapshot은 자체 회복 로직 보유로 catch-up 제외
+- [x] **pgrep 가드 확장 (CLAUDE.md)** — backup_db / etf_snapshot / update_listed_shares / crawl_sector / collect_financials / stockfut 포함
+  - 5/24 03:00 weekly_backup partial dump 사례 (scheduler 재시작이 백업 진행 중을 잡지 못해 SIGTERM으로 절단) 재발 방지
+- [x] **5/24 03:00 백업 partial 정리** — 101MB partial dump 삭제 후 수동 백업 재실행 (1008MB 정상 완성)
+
+### 미완 / 후속 — 일단 운영해보고 7일 후(2026-05-31) 재평가
+- [ ] **systemd 서비스 등록** — scheduler crash 자동 재시작 + Restart=always
+- [ ] **graceful shutdown 실작동 fix** — BlockingScheduler가 SIGTERM handler 가림 (BackgroundScheduler 전환 또는 wrapper)
+- [ ] **`scripts/scheduler_restart.sh` wrapper** — pgrep 자동 차단 + fire 시각 회피 자동 검사
+- [ ] **외인지분율 STEP 분리 + daily_update 끝쪽으로 이동** — 5/15~16 사고 대응 잔여
+- [ ] **분봉 일배치 + quality_checks 결과를 daily_update 알림 detail에 포함** — 현재 silent
+- [ ] **DB 연결 retry — daily_update 본체** — 백필은 retry 있는데 본체는 raise
+- [ ] **heartbeat 알림** — N시간마다 "alive" 메시지 (scheduler crash 감지)
+
+---
 
 ---
 
