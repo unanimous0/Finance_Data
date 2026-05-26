@@ -39,7 +39,7 @@ from schedulers.notifier import notify_job
 
 
 def _read_report_tail(report_path: Path, max_chars: int = 1500) -> str:
-    """daily_update 보고서 마지막 부분 읽기 (Telegram 메시지 길이 제한 안에)."""
+    """daily_update 보고서 마지막 부분 읽기 (실패/이상 시 상세 첨부용)."""
     try:
         text = report_path.read_text(encoding="utf-8")
         if len(text) <= max_chars:
@@ -47,6 +47,50 @@ def _read_report_tail(report_path: Path, max_chars: int = 1500) -> str:
         return "...\n" + text[-max_chars:]
     except Exception as e:
         return f"(보고서 읽기 실패: {e})"
+
+
+def _compact_daily_update_summary(report_path: Path) -> tuple[str, bool]:
+    """daily_update 보고서에서 성공용 요약 한두 줄 추출.
+
+    반환: (요약 텍스트, 이상 감지 여부)
+    이상 감지 시 호출자는 전체 tail로 fallback 권장.
+    """
+    try:
+        text = report_path.read_text(encoding="utf-8")
+    except Exception as e:
+        return f"(보고서 읽기 실패: {e})", True
+
+    # skip 보고서는 한 줄 (파일명에 _skip 명시된 경우만)
+    if "_skip.txt" in str(report_path):
+        first = text.strip().splitlines()[0] if text.strip() else ""
+        return f"건너뜀: {first[:200]}", False
+
+    # "수집 요약" 섹션의 합계 행 추출
+    # 라벨 뒤에 (일봉) (OHLCV와 동일) 등 임의 텍스트 허용
+    summary_parts = []
+    anomaly = False
+    import re
+    for label in ("OHLCV", "시가총액", "투자자별 수급", "외국인 지분율"):
+        pat = re.compile(rf"^\s*{re.escape(label)}[^\d\n]+([\d,]+)\s+([\d,]+)\s+([\d,]+)", re.MULTILINE)
+        m = pat.search(text)
+        if not m:
+            continue
+        ok, fail, total = m.group(1), m.group(2), m.group(3)
+        fail_n = int(fail.replace(",", ""))
+        if fail_n > 0:
+            summary_parts.append(f"{label} {ok}/실패{fail}")
+            anomaly = True
+        else:
+            summary_parts.append(f"{label} {ok}")
+
+    # 특이사항 라인 카운트 (있으면 anomaly)
+    if "🚨" in text or "이벤트 의심" in text or "수정계수 확인" in text:
+        anomaly = True
+
+    if not summary_parts:
+        return "(요약 추출 실패 — 보고서 형식 변경 의심)", True
+
+    return " / ".join(summary_parts), anomaly
 
 # logs 폴더 생성 (logging 설정 전에 먼저 생성)
 (project_root / "logs").mkdir(exist_ok=True)
@@ -92,19 +136,39 @@ def job_daily_update():
     reports_dir = project_root / "reports"
     detail = ""
     status = main_status
+    found_report = None
+    found_suffix = ""
     # 보고서 후보: 영업일 정식 / 휴장 skip
     for d in (yesterday, today_kst, yesterday - __import__("datetime").timedelta(days=1)):
         for suffix in ("", "_skip"):
             p = reports_dir / f"daily_update_{d:%Y%m%d}{suffix}.txt"
             if p.exists() and (datetime.now().timestamp() - p.stat().st_mtime) < 7200:
-                detail = _read_report_tail(p)
-                if suffix == "_skip" and main_status == "ok":
-                    status = "noop"
+                found_report = p
+                found_suffix = suffix
                 break
-        if detail:
+        if found_report:
             break
+
+    if found_report:
+        if found_suffix == "_skip":
+            # 휴장 / 영업일 없음 — 짧은 한 줄 + noop으로 표시
+            summary, _ = _compact_daily_update_summary(found_report)
+            detail = summary
+            if main_status == "ok":
+                status = "noop"
+        elif main_status == "ok":
+            # 성공 — 요약만. 이상 감지되면 tail로 fallback
+            summary, anomaly = _compact_daily_update_summary(found_report)
+            if anomaly:
+                detail = summary + "\n\n--- 보고서 끝부분 ---\n" + _read_report_tail(found_report, 1000)
+            else:
+                detail = summary
+        else:
+            # 실패 — 전체 tail 첨부
+            detail = _read_report_tail(found_report)
+
     if main_status == "fail" and main_err:
-        detail = (detail + f"\n\nERROR: {main_err}")[-1500:]
+        detail = (detail + f"\n\n에러: {main_err}")[-1500:]
     notify_job("daily_update", status, started, detail=detail)
 
     # daily_update 끝나고 분봉 일배치 직렬 호출 (한낮 LS 부하 회피, 사용자 활동 시작 전)
@@ -118,7 +182,7 @@ def job_daily_update():
         # 실패 시에만 별도 알림.
     except Exception as e:
         logger.error(f"[스케줄러] 분봉 일배치 실패: {e}")
-        notify_job("minute_bars (daily_update 후속)", "fail", mb_started, detail=f"ERROR: {e}")
+        notify_job("minute_bars (daily_update 후속)", "fail", mb_started, detail=f"에러: {e}")
 
 
 def job_weekly_backup():
@@ -135,7 +199,7 @@ def job_weekly_backup():
         # 성공 시 알림 안 보냄 (사용자 정책)
     except Exception as e:
         logger.error(f"[스케줄러] 백업 실패: {e}")
-        notify_job("weekly_backup", "fail", started, detail=f"ERROR: {e}")
+        notify_job("weekly_backup", "fail", started, detail=f"에러: {e}")
 
 
 def job_minute_bars_daily():
@@ -277,7 +341,7 @@ def job_stockfut_today():
         conn.close()
     if closed:
         logger.info(f"[스케줄러] {today} 휴장일 — stockfut skip (LS 휴장일 fallback 회피)")
-        notify_job("stockfut_today", "noop", started, detail=f"date: {today} 휴장일 — skip")
+        notify_job("stockfut_today", "noop", started, detail=f"{today} 휴장일")
         return
 
     paused = _ls_backfill_pause()
@@ -308,14 +372,20 @@ def job_stockfut_today():
 
     if ok:
         status = "ok"
-        detail = f"date: {today}\nresult: {last_result}\nverify: {verify_msg}"
+        # 성공 — 핵심 한 줄
+        actives = last_result.get("actives", 0) if last_result else 0
+        rows = last_result.get("rows", 0) if last_result else 0
+        detail = f"{actives} 계약 / 적재 {rows:,} row"
     else:
         status = "fail"
-        detail = f"date: {today}\nattempts: {MAX_ATTEMPTS} (UPSERT 모두 임계 미달)\nverify: {verify_msg}"
+        # 실패 — 자세히
+        detail = (f"날짜: {today}\n"
+                  f"시도: {MAX_ATTEMPTS}회 모두 검증 실패\n"
+                  f"검증 결과: {verify_msg}")
         if last_err:
-            detail += f"\nlast ERROR: {last_err}"
+            detail += f"\n마지막 에러: {last_err}"
         elif last_result:
-            detail += f"\nlast result: {last_result}"
+            detail += f"\n마지막 결과: {last_result}"
     notify_job("stockfut_today", status, started, detail=detail)
 
 
@@ -335,7 +405,7 @@ def job_etf_snapshot():
         detail = _etf_snapshot_summary(started.date())
     except Exception as e:
         logger.error(f"[스케줄러] ETF 스냅샷 실패: {e}")
-        status, detail = "fail", f"ERROR: {e}"
+        status, detail = "fail", f"에러: {e}"
     notify_job("etf_snapshot", status, started, detail=detail)
 
 
@@ -367,10 +437,10 @@ def _etf_snapshot_summary(today_date) -> str:
         lines = []
         for d, etfs, rows in pdf_rows:
             m = master_rows.get(d, 0)
-            lines.append(f"{d}: PDF {etfs} ETF / {rows:,} row, master {m}")
-        return "\n".join(lines) if lines else "(적재 결과 없음)"
+            lines.append(f"{d}: PDF {etfs}개 ETF / {rows:,} row, 마스터 {m}")
+        return "\n".join(lines) if lines else "적재 결과 없음"
     except Exception as e:
-        return f"(요약 조회 실패: {e})"
+        return f"요약 조회 실패: {e}"
 
 
 def job_quarterly_financials():
@@ -388,7 +458,7 @@ def job_quarterly_financials():
         logger.info("[스케줄러] 분기 재무지표 수집 완료")
     except Exception as e:
         logger.error(f"[스케줄러] 분기 재무지표 수집 실패: {e}")
-        status, detail = "fail", f"ERROR: {e}"
+        status, detail = "fail", f"에러: {e}"
     notify_job("quarterly_financials", status, started, detail=detail)
 
 
@@ -405,7 +475,7 @@ def job_quarterly_sector():
         logger.info("[스케줄러] FICS 업종 크롤링 완료")
     except Exception as e:
         logger.error(f"[스케줄러] FICS 업종 크롤링 실패: {e}")
-        status, detail = "fail", f"ERROR: {e}"
+        status, detail = "fail", f"에러: {e}"
     notify_job("quarterly_sector", status, started, detail=detail)
 
 
@@ -433,12 +503,12 @@ def job_update_listed_shares():
                 cur.execute("SELECT MAX(base_date) FROM floating_shares")
                 base_date = cur.fetchone()[0]
             conn.close()
-            detail = f"updated {n:,} rows in floating_shares (base_date={base_date})"
+            detail = f"floating_shares {n:,}개 갱신 (기준일 {base_date})"
         except Exception:
             pass
     except Exception as e:
         logger.error(f"[스케줄러] 상장주식수 갱신 실패: {e}")
-        status, detail = "fail", f"ERROR: {e}"
+        status, detail = "fail", f"에러: {e}"
     notify_job("update_listed_shares", status, started, detail=detail)
 
 

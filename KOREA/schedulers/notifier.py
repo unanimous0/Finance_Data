@@ -67,14 +67,14 @@ def notify_job(
     """잡 결과 알림.
 
     status: 'ok' / 'fail' / 'noop'
-    detail: 추가 정보 (row 수, 에러 메시지, 특이사항 등)
+    detail: 추가 정보 (성공 시 한두 줄 요약, 실패/이상 시 상세)
     """
     ended = datetime.now(KST)
     duration = (ended - started).total_seconds()
 
-    tag = {"ok": "OK", "fail": "FAIL", "noop": "NOOP"}.get(status, status.upper())
+    tag = {"ok": "성공", "fail": "실패", "noop": "건너뜀"}.get(status, status)
     head = f"[{tag}] {job_name}"
-    time_line = f"{started:%m-%d %H:%M} - {ended:%H:%M} ({_fmt_duration(duration)})"
+    time_line = f"{started:%m-%d %H:%M} ~ {ended:%H:%M} ({_fmt_duration(duration)})"
 
     lines = [head, time_line]
     if detail:
