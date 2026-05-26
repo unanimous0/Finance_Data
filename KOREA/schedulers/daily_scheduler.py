@@ -67,7 +67,7 @@ def _compact_daily_update_summary(report_path: Path) -> tuple[str, bool]:
 
     # "수집 요약" 섹션의 합계 행 추출
     # 라벨 뒤에 (일봉) (OHLCV와 동일) 등 임의 텍스트 허용
-    summary_parts = []
+    bullet_lines = []
     anomaly = False
     import re
     for label in ("OHLCV", "시가총액", "투자자별 수급", "외국인 지분율"):
@@ -75,22 +75,22 @@ def _compact_daily_update_summary(report_path: Path) -> tuple[str, bool]:
         m = pat.search(text)
         if not m:
             continue
-        ok, fail, total = m.group(1), m.group(2), m.group(3)
+        ok, fail, _total = m.group(1), m.group(2), m.group(3)
         fail_n = int(fail.replace(",", ""))
         if fail_n > 0:
-            summary_parts.append(f"{label} {ok}/실패{fail}")
+            bullet_lines.append(f"• {label}: {ok}개 (실패 {fail}개)")
             anomaly = True
         else:
-            summary_parts.append(f"{label} {ok}")
+            bullet_lines.append(f"• {label}: {ok}개")
 
     # 특이사항 라인 카운트 (있으면 anomaly)
     if "🚨" in text or "이벤트 의심" in text or "수정계수 확인" in text:
         anomaly = True
 
-    if not summary_parts:
+    if not bullet_lines:
         return "(요약 추출 실패 — 보고서 형식 변경 의심)", True
 
-    return " / ".join(summary_parts), anomaly
+    return "\n".join(bullet_lines), anomaly
 
 # logs 폴더 생성 (logging 설정 전에 먼저 생성)
 (project_root / "logs").mkdir(exist_ok=True)
@@ -335,13 +335,22 @@ def job_stockfut_today():
 
     # 휴장일 체크 — krx_holidays 테이블 기반 (mon-fri cron이라 주말은 안 들어옴)
     conn = get_conn()
+    holiday_reason = None
     try:
         closed = is_market_closed(conn, today)
+        if closed:
+            with conn.cursor() as cur:
+                cur.execute("SELECT reason FROM krx_holidays WHERE date = %s", (today,))
+                r = cur.fetchone()
+                if r:
+                    holiday_reason = r[0]
     finally:
         conn.close()
     if closed:
+        reason_str = f" ({holiday_reason})" if holiday_reason else ""
         logger.info(f"[스케줄러] {today} 휴장일 — stockfut skip (LS 휴장일 fallback 회피)")
-        notify_job("stockfut_today", "noop", started, detail=f"{today} 휴장일")
+        notify_job("stockfut_today", "noop", started,
+                   detail=f"{today} 휴장일{reason_str}")
         return
 
     paused = _ls_backfill_pause()
@@ -372,20 +381,29 @@ def job_stockfut_today():
 
     if ok:
         status = "ok"
-        # 성공 — 핵심 한 줄
+        # 성공 — bullet 요약
         actives = last_result.get("actives", 0) if last_result else 0
         rows = last_result.get("rows", 0) if last_result else 0
-        detail = f"{actives} 계약 / 적재 {rows:,} row"
+        empty = last_result.get("empty", 0) if last_result else 0
+        errors = last_result.get("errors", 0) if last_result else 0
+        detail = (f"• 활성 계약: {actives}개\n"
+                  f"• 적재 행: {rows:,}행\n"
+                  f"• 빈 응답: {empty}개\n"
+                  f"• 에러: {errors}개")
     else:
         status = "fail"
-        # 실패 — 자세히
+        # 실패 — 자세히 + ⚠️ 강조
         detail = (f"날짜: {today}\n"
-                  f"시도: {MAX_ATTEMPTS}회 모두 검증 실패\n"
-                  f"검증 결과: {verify_msg}")
+                  f"시도: {MAX_ATTEMPTS}회 모두 검증 실패\n\n"
+                  f"⚠️ 검증 결과\n  {verify_msg}")
         if last_err:
-            detail += f"\n마지막 에러: {last_err}"
+            detail += f"\n\n마지막 에러: {last_err}"
         elif last_result:
-            detail += f"\n마지막 결과: {last_result}"
+            detail += (f"\n\n마지막 결과\n"
+                       f"  • 활성 계약: {last_result.get('actives', 0)}개\n"
+                       f"  • 적재 행: {last_result.get('rows', 0):,}행\n"
+                       f"  • 빈 응답: {last_result.get('empty', 0)}개\n"
+                       f"  • 에러: {last_result.get('errors', 0)}개")
     notify_job("stockfut_today", status, started, detail=detail)
 
 
@@ -434,11 +452,15 @@ def _etf_snapshot_summary(today_date) -> str:
                 master_rows = dict(cur.fetchall())
         finally:
             conn.close()
-        lines = []
+        sections = []
         for d, etfs, rows in pdf_rows:
             m = master_rows.get(d, 0)
-            lines.append(f"{d}: PDF {etfs}개 ETF / {rows:,} row, 마스터 {m}")
-        return "\n".join(lines) if lines else "적재 결과 없음"
+            sections.append(
+                f"📅 {d}\n"
+                f"  • PDF: {etfs}개 ETF / {rows:,}행\n"
+                f"  • 마스터: {m}개"
+            )
+        return "\n\n".join(sections) if sections else "적재 결과 없음"
     except Exception as e:
         return f"요약 조회 실패: {e}"
 
@@ -503,7 +525,8 @@ def job_update_listed_shares():
                 cur.execute("SELECT MAX(base_date) FROM floating_shares")
                 base_date = cur.fetchone()[0]
             conn.close()
-            detail = f"floating_shares {n:,}개 갱신 (기준일 {base_date})"
+            detail = (f"• 갱신: {n:,}개\n"
+                      f"• 기준일: {base_date}")
         except Exception:
             pass
     except Exception as e:
