@@ -186,7 +186,10 @@ def job_minute_bars_daily():
 
 def _verify_stockfut_loaded(today, result) -> tuple[bool, str]:
     """주식선물 당일 적재 검증.
-    actives 중 95% 이상의 contract가 DB에 30초봉 row를 가지면 성공으로 판정."""
+    1) actives 중 95% 이상의 contract가 DB에 30초봉 row를 가지는가
+    2) 직전 영업일 데이터와 100% 동일하지 않은가 (LS t8406 휴장일 fallback 감지)
+       — LS는 휴장일 query 시 직전 영업일 데이터를 반환하는 동작이 있음 (5/25 사례).
+    """
     if not result or result.get("skipped"):
         return False, f"skip={result}"
     actives = result.get("actives", 0)
@@ -197,16 +200,53 @@ def _verify_stockfut_loaded(today, result) -> tuple[bool, str]:
         conn = get_conn()
         try:
             with conn.cursor() as cur:
+                # 1) 적재된 distinct code 수 (KST date 기준)
                 cur.execute(
                     "SELECT COUNT(DISTINCT futures_code) FROM futures_ohlcv_intraday "
-                    "WHERE time::date = %s AND interval_seconds = 30",
+                    "WHERE (time AT TIME ZONE 'Asia/Seoul')::date = %s AND interval_seconds = 30",
                     (today,))
                 loaded = cur.fetchone()[0]
+
+                # 2) 직전 영업일 찾기 (futures_ohlcv_intraday에 데이터 있는 날)
+                cur.execute(
+                    "SELECT MAX((time AT TIME ZONE 'Asia/Seoul')::date) "
+                    "FROM futures_ohlcv_intraday "
+                    "WHERE (time AT TIME ZONE 'Asia/Seoul')::date < %s AND interval_seconds = 30",
+                    (today,))
+                prev_biz = cur.fetchone()[0]
+
+                # 3) 직전 영업일과 close/volume 비교
+                duplicate_of_prev = False
+                if prev_biz is not None:
+                    cur.execute("""
+                        SELECT COUNT(*) FROM (
+                            SELECT t.futures_code,
+                                   (t.time AT TIME ZONE 'Asia/Seoul')::time AS tt,
+                                   t.close, t.volume
+                            FROM futures_ohlcv_intraday t
+                            WHERE (t.time AT TIME ZONE 'Asia/Seoul')::date = %s
+                              AND t.interval_seconds = 30
+                            EXCEPT
+                            SELECT p.futures_code,
+                                   (p.time AT TIME ZONE 'Asia/Seoul')::time AS tt,
+                                   p.close, p.volume
+                            FROM futures_ohlcv_intraday p
+                            WHERE (p.time AT TIME ZONE 'Asia/Seoul')::date = %s
+                              AND p.interval_seconds = 30
+                        ) diff
+                    """, (today, prev_biz))
+                    diff_count = cur.fetchone()[0]
+                    duplicate_of_prev = (diff_count == 0)
         finally:
             conn.close()
+
         threshold = max(1, int(actives * 0.95))
-        ok = loaded >= threshold
-        return ok, f"actives={actives}, loaded={loaded}, threshold={threshold}"
+        if loaded < threshold:
+            return False, f"actives={actives}, loaded={loaded}, threshold={threshold}"
+        if duplicate_of_prev:
+            return False, (f"actives={actives}, loaded={loaded}, 직전 영업일({prev_biz})과 "
+                           f"100% 동일 — LS 휴장일 fallback 의심")
+        return True, f"actives={actives}, loaded={loaded}, threshold={threshold}, prev_biz={prev_biz} OK"
     except Exception as e:
         return False, f"verify error: {e}"
 
@@ -214,9 +254,11 @@ def _verify_stockfut_loaded(today, result) -> tuple[bool, str]:
 def job_stockfut_today():
     """매일 23:30 KST (평일) — 주식선물 30초봉 당일 적재 (LS t8406).
     historical 불가능 → 매일 받지 않으면 영구 손실.
+    휴장일이면 skip (LS t8406이 휴장일에 직전 영업일 데이터를 반환하는 동작 회피).
     실행 후 검증 → 누락 시 5분 간격 최대 3회 재시도 (UPSERT라 안전)."""
     from scripts.daily_update import (run_stockfut_minute_today_pipeline,
-                                       _ls_backfill_pause, _ls_backfill_resume)
+                                       _ls_backfill_pause, _ls_backfill_resume,
+                                       is_market_closed, get_conn)
     import time as _time
     MAX_ATTEMPTS = 3
     RETRY_WAIT_SEC = 300  # 5분
@@ -226,6 +268,17 @@ def job_stockfut_today():
     logger.info("="*60)
     logger.info(f"[스케줄러] 주식선물 당일 30초봉 시작: {started}")
     logger.info("="*60)
+
+    # 휴장일 체크 — krx_holidays 테이블 기반 (mon-fri cron이라 주말은 안 들어옴)
+    conn = get_conn()
+    try:
+        closed = is_market_closed(conn, today)
+    finally:
+        conn.close()
+    if closed:
+        logger.info(f"[스케줄러] {today} 휴장일 — stockfut skip (LS 휴장일 fallback 회피)")
+        notify_job("stockfut_today", "noop", started, detail=f"date: {today} 휴장일 — skip")
+        return
 
     paused = _ls_backfill_pause()
     last_result = None

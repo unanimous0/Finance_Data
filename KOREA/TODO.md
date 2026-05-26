@@ -5,6 +5,25 @@
 
 ---
 
+## 🆕 2026-05-26 — stockfut 휴일 fallback 발견 + ETF PDF 백필 완료
+
+### 발견
+- **LS t8406이 휴장일에 직전 영업일 데이터를 반환** — 2026-05-25(부처님오신날 대체공휴일) 23:30 stockfut가 5/22 데이터를 5/25 timestamp로 적재 (448,266 row)
+- 기존 `_verify_stockfut_loaded`가 row count만 봐서 ok=True 잘못 판정 → "성공" 알림 도착했지만 실제론 가짜 데이터
+
+### 완료
+- [x] **stockfut cron 휴일 체크 추가** — `is_market_closed(conn, today)` true면 즉시 skip + noop 알림
+- [x] **`_verify_stockfut_loaded` 강화** — 직전 영업일 데이터와 close/volume 100% 동일하면 fail (LS 휴장일 fallback 감지)
+- [x] **5/25 corrupt row 삭제** — 448,266 row DELETE (futures_ohlcv_intraday)
+- [x] **ETF PDF 백필 완료** — 22,794/22,794 (100%) / 1,360,878 PDF row / 22,794 master / 에러 0 / 소요 3,430분 (~57h)
+
+### 검증 결과
+- 1~5월 다른 휴장일들(1/1, 2/16-18, 3/2, 5/1, 5/5)은 stockfut cron 미가동 시기라 데이터 없음 (영향 없음)
+- 5/25만 손상 → 정리 완료
+- 첫 정상 영업일 stockfut 실행은 **오늘(5/26) 23:30** 예정
+
+---
+
 ## 🆕 2026-05-24 — 운영 / 문서 정비 + Telegram 알림 + 백필 전략 정비
 
 ### 완료 (오전)
