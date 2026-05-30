@@ -532,6 +532,12 @@ class LsApiClient:
 
         # dedup by date, sort ascending
         dedup = {b["date"]: b for b in all_bars if b.get("date")}
+        # LS t8451이 sdate를 자주 무시하고 edate 기준 과거로 ~500 bar 반환 →
+        # 클라이언트 측에서 sdate ~ edate 범위로 명시적 filter (1일 query에 500 bar 적재 방지)
+        if sdate_s:
+            dedup = {d: b for d, b in dedup.items() if d >= sdate_s}
+        if edate_s and edate_s != "99999999":
+            dedup = {d: b for d, b in dedup.items() if d <= edate_s}
         return sorted(dedup.values(), key=lambda r: r["date"])
 
     # ── t8406: 주식선물 분차트 (당일만 — historical 불가) ───────────────

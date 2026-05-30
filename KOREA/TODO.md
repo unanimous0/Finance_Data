@@ -5,6 +5,33 @@
 
 ---
 
+## 🆕 2026-05-30 — LS t8451 페이징 버그 (보고서 111MB 폭증) 수정
+
+### 발견
+- daily_update 보고서가 5/27분부터 111~112MB로 폭증 (평소 60KB, 1,800배)
+- 원인: `collectors/ls_api.py:get_daily_bars`가 LS t8451 1일 query에 ~500 bar(2년치) 반환
+  - LS t8451이 `sdate`를 자주 무시하고 `edate` 기준 과거로 ~500 bar 반환
+  - 클라이언트가 `dedup`만 하고 sdate~edate 범위 filter 안 함
+  - → `_fetch_ls_ohlcv`가 종목당 ~500 row 적재 → 3,852종목 × ~460 = 1,775,955 row
+  - → `analyze_anomalies`가 1.7M row에서 ±30% 변동 779,897건 감지 → 보고서 폭증
+- 부작용: daily_update 소요 4h21m (정상 1.5~2h), scheduler.log 321MB 누적
+
+### 완료
+- [x] **`get_daily_bars` sdate~edate 범위 filter 추가** — 1일 query에 500 bar 적재 방지
+  - 검증: 005930 1일 query → 1 bar (이전 500), 5/23~5/26 → 1 bar (5/26만 영업일)
+- [x] **거대 보고서 3개 삭제** (5/27~5/29, 각 ~107MB / DB가 SSoT라 보고서는 파생물)
+- [x] **scheduler.log truncate** (321MB → 0, 최근 2000줄 `scheduler_archive_20260530.log`로 백업)
+- [x] **scheduler 재시작** (22:09:50 KST, fix 반영)
+
+### 영향
+- 데이터 무결성 OK — UPSERT라 옛 raw 데이터 덮어써도 손상 없음 (DB row는 정상)
+- fix 적용 첫 정식 수집: **6/2(화) 02:00** (5/31 일·6/1 월은 no-op)
+
+### 후속 검증
+- [ ] **6/2 화 02:00 첫 정식 daily_update** — 보고서 60KB대 복귀 + 소요 1.5~2h 복귀 확인
+
+---
+
 ## 🆕 2026-05-26 — stockfut 휴일 fallback 발견 + ETF PDF 백필 완료
 
 ### 발견
