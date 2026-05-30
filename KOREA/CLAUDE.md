@@ -29,17 +29,32 @@ date '+%Y-%m-%d %A %H:%M:%S KST'
 
 ---
 
-## scheduler 재시작 전 절대 체크
+## scheduler 코드 변경 → 재시작 → 검증 루틴
 
+**scheduler가 참조하는 코드를 바꿨으면 반드시 재시작해야 반영됨** (lazy import라도 프로세스 새로 떠야 새 코드 로드). 안 하면 "바꿨는데 안 도는" 뻘짓.
+
+### 1) 재시작 전 절대 체크 — 진행 중 job 차단
 ```bash
 pgrep -f "daily_update|backfill_|backup_db|etf_snapshot|update_listed_shares|crawl_sector|collect_financials|stockfut" && echo "⛔ 진행 중 job 있음 — 재시작 차단"
 ```
-
 진행 중 자식 job이 있으면 `C-c`/`kill`이 자식까지 죽임 (graceful handler 미작동, 5/24 03:00 백업이 이렇게 절단된 사례 있음).
 
-### 잡 fire 시각 회피 (재시작 30분 전후 피하기)
+### 2) 잡 fire 시각 회피 (재시작 30분 전후 피하기)
 - 02:00 daily_update / 03:00 weekly_backup / 03:30 update_listed_shares / 08:30 etf_snapshot / 23:30 stockfut (평일)
-- 가능한 정각/30분 시각에서 5분 이상 떨어진 시점에 재시작
+- 정각/30분 시각에서 5분 이상 떨어진 시점에 재시작
+
+### 3) 재시작 (tmux 세션 `kdata_scheduler`)
+```bash
+tmux send-keys -t kdata_scheduler C-c    # 종료
+# (몇 초 대기 후)
+tmux send-keys -t kdata_scheduler "python schedulers/daily_scheduler.py 2>&1 | tee -a logs/scheduler.log" Enter
+```
+
+### 4) 재시작 후 반영 검증 — 빠짐없이 반영됐는지 확인
+```bash
+bash scripts/verify_scheduler_sync.sh
+```
+가동 중 프로세스 시작 시각 vs scheduler 참조 .py 전체 mtime 비교. 시작 후 수정된 파일 있으면 ⛔ + 종료코드 1 (재시작 필요). 모두 이전이면 ✅. **변경/재시작 작업 끝에 항상 실행할 것.**
 
 ### 시작 시 자동 보충 (`startup_catchup`)
 재시작 시 누락된 주간 잡 자동 보충:
@@ -84,6 +99,7 @@ bash scripts/restore_db.sh <dump_file>              # pg_restore + 인덱스 자
 
 # scheduler
 tmux attach -t kdata_scheduler
+bash scripts/verify_scheduler_sync.sh                # 재시작 후 코드 반영 검증
 ```
 
 ---
