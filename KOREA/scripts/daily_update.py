@@ -579,10 +579,15 @@ def get_halt_suspects(conn, target_date: date) -> dict[str, tuple[int, float]]:
 
 
 # ── 메인 업데이트 로직 ────────────────────────────────────────────────────
-def run_update(target_date: date = None, missing_only: bool = False) -> dict:
+def run_update(target_date: date = None, missing_only: bool = False,
+               collect_foreign: bool = True, sync_master: bool = True) -> dict:
     """
     일별 업데이트 실행
     missing_only=True: target_date에 누락된 종목만 재수집 (이미 수집된 종목 스킵)
+    collect_foreign=False: 외국인 지분율 STEP 건너뜀 (02:00 본체용 — 외인은 익일
+        05:30 이후라 02:00엔 항상 빈 응답. 08:30 종합 보충에서 missing_only로 수집)
+    sync_master=False: 종목 마스터 갱신 STEP 0 skip (~55초). 08:30 보충 루프에서
+        매 날짜마다 중복 호출 방지 (02:00 본체가 이미 당일 갱신함).
     Returns: 결과 딕셔너리 (보고서 생성용)
     """
     started_at = datetime.now(KST)
@@ -609,11 +614,14 @@ def run_update(target_date: date = None, missing_only: bool = False) -> dict:
 
     # ─────────────────────────────────────────────────────────
     # STEP 0: 종목 마스터 갱신 (신규 상장 / 상장폐지 자동 반영)
+    # sync_master=False면 호출 skip (08:30 보충 루프에서 매번 ~55초 중복 회피).
     # ─────────────────────────────────────────────────────────
-    print("[0/2] 종목 마스터 갱신 중...")
+    print("[0/2] 종목 마스터 갱신 중..." if sync_master
+          else "[0/2] 종목 마스터 갱신 — skip (보충 루프 중복 회피)")
     master_sync = {"new_listed": [], "delisted": [], "ghost_delisted": [], "errors": []}
     try:
-        master_sync = sync_stock_master(conn, client)
+        if sync_master:
+            master_sync = sync_stock_master(conn, client)
         if master_sync["new_listed"]:
             codes_str = ", ".join(master_sync["new_listed"][:5])
             suffix    = f" 외 {len(master_sync['new_listed'])-5}개" if len(master_sync["new_listed"]) > 5 else ""
@@ -839,7 +847,12 @@ def run_update(target_date: date = None, missing_only: bool = False) -> dict:
     # ─────────────────────────────────────────────────────────
     # STEP 3: 외국인 지분율 수집 (ETF/SPAC 제외, 병렬)
     # ─────────────────────────────────────────────────────────
-    print(f"\n[3/3] 외국인 지분율 수집 ({foreign_count}개 종목, workers={MAX_WORKERS})...")
+    if not collect_foreign:
+        print(f"\n[3/3] 외국인 지분율 수집 — skip (02:00 본체, 08:30 종합 보충에서 수집)")
+        foreign_stocks = []
+        foreign_count = 0
+    else:
+        print(f"\n[3/3] 외국인 지분율 수집 ({foreign_count}개 종목, workers={MAX_WORKERS})...")
 
     foreign_batch = []
     done_count    = 0
@@ -1437,6 +1450,95 @@ def run_adjusted_price_pipeline(target_date: date) -> dict:
 
         return {"updated": inserted, "suspects": len(suspects),
                 "ls_calls": ls_calls, "full_updates": full_updates}
+    finally:
+        conn.close()
+
+
+SUPPLEMENT_MAX_LOOKBACK_DAYS = 10  # 종합 보충 검토 범위 상한 (영업일)
+SUPPLEMENT_RECENT_DAYS = 3         # 최근 N영업일은 무조건 검토 (날짜 내 부분 누락 대응)
+
+
+def run_supplement_pipeline() -> dict:
+    """아침 종합 누락 보충 (08:30 잡 — etf_snapshot 다음 단계).
+
+    배경: 일부 데이터는 02:00 본체 시점에 인포맥스에 아직 없음.
+      - 외국인 지분율: 익일 05:30 이후 등록 (02:00 본체에선 collect_foreign=False로 skip)
+      - 그 외 02:00에 일시 실패한 OHLCV/수급 종목
+    08:30(외인 5:30 안전선 지남)에 OHLCV/수급/외인의 마지막 적재일 ~ 어제 영업일을
+    훑어 누락 종목을 missing_only로 보충. 며칠 밀려도 한 번에 따라잡음.
+
+    동작: 세 테이블 중 가장 뒤처진 마지막일 +1 ~ 어제(영업일) 각 날짜에 대해
+    run_update(d, missing_only=True). 누락 0인 날은 빠르게 통과. 상한 10영업일.
+    """
+    print("\n" + "=" * 70)
+    print("  🌐 아침 종합 누락 보충 (OHLCV/수급/외인)")
+    print("=" * 70)
+    conn = get_conn()
+    summary = {"days_processed": 0, "ohlcv": 0, "investor": 0, "foreign": 0, "target_days": 0}
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT MAX(time) FROM ohlcv_daily")
+            ohlcv_last = cur.fetchone()[0]
+            cur.execute("SELECT MAX(time) FROM investor_trading")
+            inv_last = cur.fetchone()[0]
+            cur.execute("SELECT MAX(time) FROM foreign_ownership")
+            fo_last = cur.fetchone()[0]
+
+        def _as_date(x):
+            return x.date() if x is not None and hasattr(x, "date") else x
+
+        lasts = [_as_date(x) for x in (ohlcv_last, inv_last, fo_last) if x is not None]
+        if not lasts:
+            print("  기준 데이터 없음 — skip")
+            return summary
+
+        yesterday = datetime.now(KST).date() - timedelta(days=1)
+        end = last_business_day_on_or_before(conn, yesterday)
+
+        # 검토 시작일:
+        #  (a) 가장 뒤처진 테이블 last+1 — 통째 누락된 날 (외인 등) 따라잡기
+        #  (b) 최근 SUPPLEMENT_RECENT_DAYS 영업일 — 날짜 내 부분 누락(일부 종목) 대응
+        # 둘 중 더 이른 날부터 검토.
+        start = min(lasts) + timedelta(days=1)
+        recent = []
+        dd = end
+        while len(recent) < SUPPLEMENT_RECENT_DAYS and dd >= date(2022, 1, 1):
+            if not is_market_closed(conn, dd):
+                recent.append(dd)
+            dd -= timedelta(days=1)
+        if recent:
+            start = min(start, recent[-1])
+
+        # 검토 대상 영업일 (휴장 제외, 상한 cap)
+        target_days = []
+        d = start
+        while d <= end:
+            if not is_market_closed(conn, d):
+                target_days.append(d)
+            d += timedelta(days=1)
+        if len(target_days) > SUPPLEMENT_MAX_LOOKBACK_DAYS:
+            target_days = target_days[-SUPPLEMENT_MAX_LOOKBACK_DAYS:]
+
+        if not target_days:
+            print(f"  누락 없음 — ohlcv={_as_date(ohlcv_last)} 수급={_as_date(inv_last)} 외인={_as_date(fo_last)}")
+            return summary
+        summary["target_days"] = len(target_days)
+        print(f"  검토 대상 영업일 {len(target_days)}일: {target_days[0]} ~ {target_days[-1]}")
+
+        for d in target_days:
+            r = run_update(d, missing_only=True, collect_foreign=True, sync_master=False)
+            if r.get("skipped_holiday") or r.get("skipped_no_data"):
+                continue
+            o = r.get("ohlcv", {}).get("rows", 0)
+            i = r.get("investor", {}).get("rows", 0)
+            f = r.get("foreign", {}).get("rows", 0)
+            summary["ohlcv"] += o
+            summary["investor"] += i
+            summary["foreign"] += f
+            if o or i or f:
+                summary["days_processed"] += 1
+            print(f"  {d}: OHLCV {o:,} / 수급 {i:,} / 외인 {f:,} 보충")
+        return summary
     finally:
         conn.close()
 
@@ -2266,9 +2368,10 @@ def run_krx_holidays_pipeline() -> dict:
     return result
 
 
-def main(target_date: date = None, missing_only: bool = False):
+def main(target_date: date = None, missing_only: bool = False,
+         collect_foreign: bool = True):
     try:
-        result = run_update(target_date, missing_only)
+        result = run_update(target_date, missing_only, collect_foreign=collect_foreign)
 
         # 휴장일/데이터 없음: 미니 보고서만 남기고 후속 파이프라인은 진행
         if result.get("skipped_holiday") or result.get("skipped_no_data"):

@@ -122,10 +122,10 @@ def job_daily_update():
     logger.info(f"[스케줄러] 일별 업데이트 시작: {started}")
     logger.info("="*60)
 
-    # daily_update 본체
+    # daily_update 본체 (외인 STEP skip — 08:30 종합 보충에서 수집)
     main_status, main_err = "ok", None
     try:
-        run_daily()
+        run_daily(collect_foreign=False)
     except Exception as e:
         main_status, main_err = "fail", str(e)
         logger.error(f"[스케줄러] daily_update 본체 실패: {e}")
@@ -169,7 +169,6 @@ def job_daily_update():
 
     if main_status == "fail" and main_err:
         detail = (detail + f"\n\n에러: {main_err}")[-1500:]
-    notify_job("daily_update", status, started, detail=detail)
 
     # daily_update 끝나고 분봉 일배치 직렬 호출 (한낮 LS 부하 회피, 사용자 활동 시작 전)
     mb_started = datetime.now(KST)
@@ -183,6 +182,9 @@ def job_daily_update():
     except Exception as e:
         logger.error(f"[스케줄러] 분봉 일배치 실패: {e}")
         notify_job("minute_bars (daily_update 후속)", "fail", mb_started, detail=f"에러: {e}")
+
+    # 최종 알림 (본체 보고서 요약). 외인/누락 보충은 08:30 종합 보충 잡에서 별도 알림.
+    notify_job("daily_update", status, started, detail=detail.strip())
 
 
 def job_weekly_backup():
@@ -408,23 +410,48 @@ def job_stockfut_today():
 
 
 def job_etf_snapshot():
-    """매일 08:30 KST — ETF PDF/마스터 스냅샷 (today + yesterday 2-pass).
-    daily_update에서 분리 — 04:30엔 인포맥스 ingest 미완 (당일 PDF 빈 응답)."""
+    """매일 08:30 KST — 아침 종합 보충.
+    1) ETF PDF/마스터 스냅샷 (today + yesterday 2-pass) — 02:00엔 인포맥스 ingest 미완
+    2) 종합 누락 보충 (OHLCV/수급/외인) — 외인은 익일 05:30 이후라 08:30에 수집
+    두 작업 모두 인포맥스 의존 + 늦은 시각 필요라 같은 잡에 통합 (잡 개수 최소화)."""
     from scripts.etf_snapshot import main as etf_main
+    from scripts.daily_update import run_supplement_pipeline
     started = datetime.now(KST)
     logger.info("="*60)
-    logger.info(f"[스케줄러] ETF 스냅샷 시작: {started}")
+    logger.info(f"[스케줄러] 아침 종합 보충 시작 (ETF + 누락 보충): {started}")
     logger.info("="*60)
-    status, detail = "ok", ""
+
+    status = "ok"
+    parts = []
+
+    # 1) ETF 스냅샷
     try:
         etf_main()
         logger.info(f"[스케줄러] ETF 스냅샷 완료: {datetime.now(KST)}")
-        # DB에서 적재 결과 조회 → 알림에 포함
-        detail = _etf_snapshot_summary(started.date())
+        parts.append("[ETF]\n" + _etf_snapshot_summary(started.date()))
     except Exception as e:
         logger.error(f"[스케줄러] ETF 스냅샷 실패: {e}")
-        status, detail = "fail", f"에러: {e}"
-    notify_job("etf_snapshot", status, started, detail=detail)
+        status = "fail"
+        parts.append(f"[ETF] 에러: {e}")
+
+    # 2) 종합 누락 보충 (OHLCV/수급/외인)
+    try:
+        sup = run_supplement_pipeline()
+        logger.info(f"[스케줄러] 종합 누락 보충 완료: {sup}")
+        if sup.get("target_days", 0) == 0:
+            parts.append("[누락 보충] 없음 (최신)")
+        else:
+            line = (f"[누락 보충] {sup['days_processed']}일\n"
+                    f"• OHLCV {sup['ohlcv']:,}개\n"
+                    f"• 수급 {sup['investor']:,}개\n"
+                    f"• 외인 {sup['foreign']:,}개")
+            parts.append(line)
+    except Exception as e:
+        logger.error(f"[스케줄러] 종합 누락 보충 실패: {e}")
+        status = "fail"
+        parts.append(f"[누락 보충] 에러: {e}")
+
+    notify_job("아침 종합 보충", status, started, detail="\n\n".join(parts))
 
 
 def _etf_snapshot_summary(today_date) -> str:

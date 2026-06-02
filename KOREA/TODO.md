@@ -5,6 +5,35 @@
 
 ---
 
+## 🆕 2026-06-02 — 외인 지분율 10일 누락 발견 + 08:30 종합 보충 구조 전환
+
+### 발견
+- 외국인 지분율이 5/22 이후 10일째 적재 0건 (영업일 5일 누락)
+- 원인: 5/21 daily_update를 05:30 → 02:00으로 앞당긴 뒤, 외인은 익일 05:30 이후라야
+  인포맥스에 등록되는데 02:00엔 빈 응답 → STEP3 전량 실패. `get_update_range`가
+  ohlcv 기준으로 날짜 전진시켜 못 받은 외인은 영구 누락.
+
+### 완료
+- [x] **누락 5일치 수동 백필** — `collect_foreign_ownership.py --start 20260526 --end 20260601` (13,240건, 실패 0)
+- [x] **08:30 종합 보충 구조 전환** (잡 개수 3개 유지, etf_snapshot이 종합 보충으로 확장)
+  - `run_update`에 `collect_foreign`/`sync_master` 파라미터 추가
+  - 02:00 본체: `collect_foreign=False` (외인 skip, 어차피 빈 응답)
+  - 08:30 `job_etf_snapshot` = ETF PDF/마스터 + `run_supplement_pipeline()`
+  - `run_supplement_pipeline`: 최근 3영업일 무조건 + 가장 뒤처진 테이블 last+1 검토,
+    각 날짜 `run_update(missing_only=True, sync_master=False)`로 누락 보충 (cap 10일)
+  - `sync_master=False`로 마스터 갱신(~55초) 보충 루프 중복 제거
+- [x] **E2E 검증** — 6/1 외인 10종목 삭제 → supplement가 10건 정확 보충 → 2,648 복구
+
+### 설계 근거
+- 외인·ETF PDF는 둘 다 "당일 새벽 인포맥스에 없고 늦게 등록" → 같은 08:30 잡에 통합
+- daily_update에 합치면 02:00 프로세스가 08:30까지 idle 점유 → 분리 유지
+- catchup = 외인만이 아니라 OHLCV/수급 포함 "전체 누락 종합 검토" 역할
+
+### 후속
+- [ ] **6/3(수) 08:30 첫 실운영 검증** — 6/2 외인이 종합 보충으로 들어오는지 + 알림 확인
+
+---
+
 ## 🆕 2026-05-30 — LS t8451 페이징 버그 (보고서 111MB 폭증) 수정
 
 ### 발견

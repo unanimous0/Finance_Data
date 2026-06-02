@@ -17,13 +17,15 @@ date '+%Y-%m-%d %A %H:%M:%S KST'
 
 | 시각 (KST) | 잡 | 빈도 |
 |---|---|---|
-| **02:00** | daily_update 본체 + 분봉 직렬 | 매일 |
-| **08:30** | etf_snapshot (today+yesterday 2-pass) | 매일 |
+| **02:00** | daily_update 본체 (외인 STEP skip) + 분봉 직렬 | 매일 |
+| **08:30** | 아침 종합 보충 = ETF PDF/마스터 + 누락 보충(OHLCV/수급/외인) | 매일 |
 | 23:30 | stockfut_today | 평일 |
 | 03:00 | weekly_backup | 일요일 |
 | 03:30 | update_listed_shares | 일요일 |
 | 03:30 | quarterly_sector | 분기 첫 일요일 (1/4/7/10월) |
 | 04:00 | quarterly_financials | 분기 마감 후 첫 일요일 (4/6/9/12월) |
+
+**외인 지분율은 02:00이 아니라 08:30에 수집**: 인포맥스 외인은 익일 05:30 이후 등록 → 02:00 본체는 항상 빈 응답이라 STEP skip(`collect_foreign=False`). 08:30 종합 보충이 `run_update(missing_only=True)`로 외인 + 02:00에 빠진 OHLCV/수급을 함께 메움 (최근 3영업일 무조건 검토 + 가장 뒤처진 테이블 last+1, 최대 10일 cap).
 
 상세 (요일별 동작, 2-pass 의미, 대기 로직, 동시성 가드, 일별 콜 분배): **`docs/스케줄러_운영.md`**
 
