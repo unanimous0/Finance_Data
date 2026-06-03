@@ -65,25 +65,46 @@ def _compact_daily_update_summary(report_path: Path) -> tuple[str, bool]:
         first = text.strip().splitlines()[0] if text.strip() else ""
         return f"건너뜀: {first[:200]}", False
 
-    # "수집 요약" 섹션의 합계 행 추출
-    # 라벨 뒤에 (일봉) (OHLCV와 동일) 등 임의 텍스트 허용
+    # "수집 요약" 섹션 파싱. 항목별 컬럼 구조가 다름:
+    #   OHLCV/수급/외인: "라벨  성공  실패  전체  신규/변경  스킵"
+    #   시가총액:        "시가총액  (OHLCV와 동일)  전체  신규/변경  스킵"  (성공/실패 없음)
+    import re
     bullet_lines = []
     anomaly = False
-    import re
-    for label in ("OHLCV", "시가총액", "투자자별 수급", "외국인 지분율"):
-        pat = re.compile(rf"^\s*{re.escape(label)}[^\d\n]+([\d,]+)\s+([\d,]+)\s+([\d,]+)", re.MULTILINE)
-        m = pat.search(text)
+
+    def _n(s):
+        return int(s.replace(",", ""))
+
+    # OHLCV / 투자자별 수급 — 성공/실패 구조
+    for label in ("OHLCV", "투자자별 수급"):
+        m = re.search(rf"^\s*{re.escape(label)}[^\d\n]+([\d,]+)\s+([\d,]+)\s+([\d,]+)", text, re.MULTILINE)
         if not m:
             continue
-        ok, fail, _total = m.group(1), m.group(2), m.group(3)
-        fail_n = int(fail.replace(",", ""))
-        if fail_n > 0:
+        ok, fail = m.group(1), m.group(2)
+        if _n(fail) > 0:
             bullet_lines.append(f"• {label}: {ok}개 (실패 {fail}개)")
             anomaly = True
         else:
             bullet_lines.append(f"• {label}: {ok}개")
 
-    # 특이사항 라인 카운트 (있으면 anomaly)
+    # 시가총액 — "(OHLCV와 동일)" 뒤 전체레코드 (성공/실패 컬럼 없음)
+    m = re.search(r"^\s*시가총액\s+\(OHLCV와 동일\)\s+([\d,]+)", text, re.MULTILINE)
+    if m:
+        bullet_lines.append(f"• 시가총액: {m.group(1)}개")
+
+    # 외국인 지분율 — 02:00 본체는 collect_foreign=False로 skip → 전부 0이면 08:30 보충 안내
+    m = re.search(r"^\s*외국인 지분율\s+([\d,]+)\s+([\d,]+)\s+([\d,]+)", text, re.MULTILINE)
+    if m:
+        ok_fo, fail_fo, total_fo = _n(m.group(1)), _n(m.group(2)), _n(m.group(3))
+        if ok_fo == 0 and total_fo == 0:
+            bullet_lines.append("• 외국인 지분율: 08:30 종합 보충에서 수집")
+        elif fail_fo > 0:
+            bullet_lines.append(f"• 외국인 지분율: {m.group(1)}개 (실패 {m.group(2)}개)")
+            anomaly = True
+        else:
+            bullet_lines.append(f"• 외국인 지분율: {m.group(1)}개")
+
+    # 특이사항 마커 (있으면 anomaly)
     if "🚨" in text or "이벤트 의심" in text or "수정계수 확인" in text:
         anomaly = True
 
