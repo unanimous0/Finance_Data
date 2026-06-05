@@ -49,11 +49,34 @@ def _read_report_tail(report_path: Path, max_chars: int = 1500) -> str:
         return f"(보고서 읽기 실패: {e})"
 
 
+def _extract_price_events(text: str, max_lines: int = 15) -> str:
+    """보고서에서 주가이벤트의심(±30% 초과 — 수정주가 확인 필요) 항목만 추출.
+
+    형식: "🚨 [주가이벤트의심] N건" 헤더 + "날짜 종목코드 종목명 상승/하락 XX% ... [...의심]" 라인.
+    """
+    import re
+    hm = re.search(r"\[주가이벤트의심\]\s*([\d,]+)\s*건", text)
+    if not hm:
+        return ""
+    count = hm.group(1)
+    # 데이터 라인: 날짜 + ... + 상승/하락 N% + [무상감자.../주식병합... 의심]
+    lines = re.findall(
+        r"^\s*(\d{4}-\d{2}-\d{2}\s+\S+\s+.*?(?:상승|하락)\s+[\d.]+%.*?\[[^\]]*의심\])\s*$",
+        text, re.MULTILINE)
+    head = f"🚨 주가이벤트의심 {count}건 (±30% 초과 — 수정주가 확인)"
+    if not lines:
+        return head
+    shown = lines[:max_lines]
+    body = "\n".join("• " + " ".join(l.split()) for l in shown)
+    if len(lines) > max_lines:
+        body += f"\n… 외 {len(lines) - max_lines}건"
+    return head + "\n" + body
+
+
 def _compact_daily_update_summary(report_path: Path) -> tuple[str, bool]:
-    """daily_update 보고서에서 성공용 요약 한두 줄 추출.
+    """daily_update 보고서에서 성공용 요약 + 주가이벤트의심 항목 추출.
 
     반환: (요약 텍스트, 이상 감지 여부)
-    이상 감지 시 호출자는 전체 tail로 fallback 권장.
     """
     try:
         text = report_path.read_text(encoding="utf-8")
@@ -104,9 +127,12 @@ def _compact_daily_update_summary(report_path: Path) -> tuple[str, bool]:
         else:
             bullet_lines.append(f"• 외국인 지분율: {m.group(1)}개")
 
-    # 특이사항 마커 (있으면 anomaly)
-    if "🚨" in text or "이벤트 의심" in text or "수정계수 확인" in text:
+    # 주가이벤트의심 항목 추출 (±30% 초과 — 수정주가 확인 필요) → summary에 포함
+    event_block = _extract_price_events(text)
+    if event_block:
         anomaly = True
+        bullet_lines.append("")
+        bullet_lines.append(event_block)
 
     if not bullet_lines:
         return "(요약 추출 실패 — 보고서 형식 변경 의심)", True
@@ -178,12 +204,9 @@ def job_daily_update():
             if main_status == "ok":
                 status = "noop"
         elif main_status == "ok":
-            # 성공 — 요약만. 이상 감지되면 tail로 fallback
-            summary, anomaly = _compact_daily_update_summary(found_report)
-            if anomaly:
-                detail = summary + "\n\n--- 보고서 끝부분 ---\n" + _read_report_tail(found_report, 1000)
-            else:
-                detail = summary
+            # 성공 — 요약 (이상 시 주가이벤트의심 항목이 summary에 이미 포함됨)
+            summary, _anomaly = _compact_daily_update_summary(found_report)
+            detail = summary
         else:
             # 실패 — 전체 tail 첨부
             detail = _read_report_tail(found_report)
