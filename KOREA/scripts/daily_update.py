@@ -498,14 +498,25 @@ def sync_stock_master(conn, client) -> dict:
 
     # ── 두 API 모두에 없는 활성 종목 (ETF 청산 등) ────────────────
     # api_active_codes, api_expired_codes 둘 다 정상 수집된 경우에만 실행
-    # 안전 장치: API 반환 종목 수가 DB 활성 종목의 90% 미만이면 스킵
-    #   (API 일시 장애로 목록이 불완전하면 정상 종목을 오비활성화 방지)
+    # 안전 장치 1: API 반환 종목 수가 DB 활성 종목의 90% 미만이면 스킵
+    #   (API 대량 장애로 목록이 불완전하면 정상 종목을 오비활성화 방지)
+    # 안전 장치 2: ghost 후보가 GHOST_DELIST_MAX 초과면 부분 누락 의심 → 비활성 skip + 경고
+    #   (2026-06: 인포맥스가 ETF 191개를 부분 누락 반환 → coverage 90%는 통과했으나
+    #    191개 정상 ETF가 오비활성된 사고. 부분 누락도 차단하도록 상한 추가.)
+    GHOST_DELIST_MAX = 20
     db_active_count = sum(1 for v in db_stocks.values() if v)
     api_coverage = len(api_active_codes) / db_active_count if db_active_count else 0
     if api_active_codes and api_expired_codes is not None and api_coverage >= 0.9:
         known_api_codes = api_active_codes | api_expired_codes
-        for code, is_active in db_stocks.items():
-            if is_active and code not in known_api_codes:
+        candidates = [code for code, act in db_stocks.items()
+                      if act and code not in known_api_codes]
+        if len(candidates) > GHOST_DELIST_MAX:
+            msg = (f"ghost_delist 후보 {len(candidates)}개 > 상한 {GHOST_DELIST_MAX} "
+                   f"(coverage {api_coverage:.1%}) — 인포맥스 부분 누락 의심, 비활성 SKIP")
+            print(f"  ⚠️  {msg}")
+            result["errors"].append(msg)
+        else:
+            for code in candidates:
                 with conn.cursor() as cur:
                     cur.execute("""
                         UPDATE stocks

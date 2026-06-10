@@ -5,6 +5,31 @@
 
 ---
 
+## 🆕 2026-06-10 — 191개 ETF 오비활성 발견 + 재활성/백필 + ghost_delist 가드
+
+### 발견 (운영 점검 중)
+- 191개 ETF(국내 118 + 해외 73)가 6/2경 `is_active=FALSE`로 잘못 비활성 → OHLCV 6/2~6/9 누락
+- 종목명 정상(TIGER 코스피고배당/차이나CSI300/KODEX 미국S&P500 등), LS로 보면 거래 중
+- 원인: `sync_stock_master` ghost_delisted 로직 — 인포맥스 `get_stock_codes`가 이 191개를
+  부분 누락 반환. 기존 가드(coverage≥90%)는 통과(191개는 ~5%)해서 191개 오비활성.
+  (6/2 supplement 테스트로 run_update 반복 실행되며 sync_master가 여러 번 돈 시점과 겹침)
+
+### 완료
+- [x] **OHLCV 정책 확인** — `get_stocks(include_etf=True)`는 유형 구분 없이 활성 ETF 전부 수집
+  (국내/해외 무관). etf_snapshot(PDF)만 국내형 필터. 두 정책 별개.
+- [x] **191개 전수 LS 확인** → 전부 거래 중 (진짜 상폐 0)
+- [x] **191개 재활성** (is_active=TRUE, ETF 946→1137)
+- [x] **6/2~6/9 OHLCV 백필** — run_update(missing_only, collect_foreign=False, sync_master=False)
+  각 영업일. LS 호출초과(IGW00201) 떴으나 재시도로 191개 전부 복구. ETF 945→1136~1137.
+- [x] **ghost_delist 가드 추가** (`sync_stock_master`) — 후보가 GHOST_DELIST_MAX(20) 초과면
+  인포맥스 부분 누락 의심 → 비활성 SKIP + errors 기록(알림). 대량 오비활성 재발 방지.
+- [x] **run_update에 sync_master 파라미터** — 보충/백필 루프에서 마스터 갱신(~55초) 중복 회피
+
+### 후속
+- [ ] **6/11~ daily_update에서 가드 작동 확인** — 인포맥스가 또 191개 누락 시 SKIP + 경고 알림 오는지
+
+---
+
 ## 🆕 2026-06-02 — 외인 지분율 10일 누락 발견 + 08:30 종합 보충 구조 전환
 
 ### 발견
