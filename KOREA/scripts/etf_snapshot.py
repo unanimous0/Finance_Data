@@ -23,9 +23,13 @@ from zoneinfo import ZoneInfo
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from scripts.daily_update import run_etf_daily_snapshot_pipeline
+from scripts.daily_update import run_etf_daily_snapshot_pipeline, get_conn
 
 KST = ZoneInfo("Asia/Seoul")
+
+# etf_portfolio_daily 보존 정책 — 최근 N 영업일치만 FIFO 유지 (PDF는 최신만 의미).
+# etf_master_daily 는 대상 아님(소형·전기간 보존).
+PORTFOLIO_RETENTION_DAYS = 5
 
 
 # 정상 케이스 wait: 60s polling, 최대 4h (daily_update 최장 실측 ~5h 기준 안전선)
@@ -88,6 +92,28 @@ def _prev_biz_day(d: date) -> date:
     return prev
 
 
+def prune_portfolio_retention(keep: int = PORTFOLIO_RETENTION_DAYS) -> int:
+    """etf_portfolio_daily 를 최근 `keep`개 snapshot_date(=영업일)만 FIFO 유지.
+    삭제 행수 반환. distinct 날짜가 keep 이하면 아무것도 안 지움(안전)."""
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    DELETE FROM etf_portfolio_daily
+                    WHERE snapshot_date < (
+                        SELECT MIN(d) FROM (
+                            SELECT DISTINCT snapshot_date AS d
+                            FROM etf_portfolio_daily
+                            ORDER BY d DESC LIMIT %s
+                        ) t
+                    )
+                """, (keep,))
+                return cur.rowcount
+    finally:
+        conn.close()
+
+
 def main():
     wait_for_daily_update()  # daily_update가 늦게 끝나면 대기
     today_kst = datetime.now(KST).date()
@@ -99,6 +125,13 @@ def main():
             run_etf_daily_snapshot_pipeline(dt)
         except Exception as e:
             print(f"⚠️ ETF snapshot {tag}({dt}) 단계 오류: {e}")
+
+    # 2-pass 후 FIFO 정리 — etf_portfolio_daily 최근 N영업일만 유지
+    try:
+        deleted = prune_portfolio_retention()
+        print(f"[ETF FIFO] etf_portfolio_daily 최근 {PORTFOLIO_RETENTION_DAYS}영업일 유지 — {deleted:,} 행 삭제")
+    except Exception as e:
+        print(f"⚠️ ETF FIFO prune 오류: {e}")
 
 
 if __name__ == "__main__":

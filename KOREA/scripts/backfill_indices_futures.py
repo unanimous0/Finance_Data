@@ -23,7 +23,7 @@ import psycopg2.extras
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from collectors.infomax import InfomaxClient
+from collectors.infomax import InfomaxClient, pick_nearest_deferred
 from config.settings import settings
 
 
@@ -157,23 +157,31 @@ def backfill_indices_ohlcv(conn, client: InfomaxClient, start: date, end: date) 
     return total
 
 
-def backfill_futures_ohlcv(conn, client: InfomaxClient, start: date, end: date) -> int:
-    """선물 NEAR/NEXT 시계열 백필 (F + L)."""
+def backfill_futures_ohlcv(conn, client: InfomaxClient, start: date, end: date,
+                           underlying_types: tuple = ('F', 'L')) -> int:
+    """선물 NEAR/NEXT 시계열 백필. underlying_types로 F(지수선물)/L(주식선물) 선택."""
     with conn.cursor() as cur:
-        cur.execute("SELECT underlying_code FROM futures_underlyings WHERE underlying_type IN ('F','L') ORDER BY underlying_code")
+        cur.execute(
+            "SELECT underlying_code FROM futures_underlyings WHERE underlying_type = ANY(%s) ORDER BY underlying_code",
+            (list(underlying_types),))
         underlyings = [r[0] for r in cur.fetchall()]
-    print(f"  futures underlying {len(underlyings)}개 × 2(NEAR/NEXT) = {len(underlyings)*2} 호출")
+    print(f"  futures underlying {len(underlyings)}개({','.join(underlying_types)}) × 2(NEAR/NEXT) = {len(underlyings)*2} 호출")
 
     total = 0
     for i, uc in enumerate(underlyings, 1):
         for klass in ['NEAR', 'NEXT']:
             rows = []
-            for s, e in chunked_dates(start, end, 700):
+            # NEXT(2active)는 날짜마다 원월물 여러 개(~6~10행/일) 반환 + API 1000행 한도.
+            # 700일 청크면 truncate되어 과거가 잘림 → NEXT는 90일 청크(≤~990행)로 분할.
+            chunk_days = 90 if klass == 'NEXT' else 700
+            for s, e in chunked_dates(start, end, chunk_days):
                 try:
                     data = client.get_future_active(uc, s, e, contract_class=klass)
                 except Exception as exc:
                     print(f"    {uc} {klass} [{s}~{e}] EXC: {exc}", flush=True)
                     continue
+                if klass == 'NEXT':
+                    data = pick_nearest_deferred(data)  # 진짜 차근월(만기 최소)만
                 for r in data:
                     rows.append((
                         uc, klass, _parse_ymd(r.get('date')),

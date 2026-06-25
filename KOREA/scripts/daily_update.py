@@ -24,7 +24,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from config.settings import settings
-from collectors.infomax import InfomaxClient
+from collectors.infomax import InfomaxClient, pick_nearest_deferred
 from validators.quality_checks import run_quality_checks
 
 KST = ZoneInfo("Asia/Seoul")
@@ -1721,6 +1721,8 @@ def run_indices_futures_daily_pipeline(target_date: date) -> dict:
                     data = client.get_future_active(uc, start, end, contract_class=klass)
                 except Exception:
                     continue
+                if klass == 'NEXT':
+                    data = pick_nearest_deferred(data)  # 진짜 차근월(만기 최소)만
                 rows = [(
                     uc, klass, _parse_ymd_daily(r.get('date')), r.get('code'),
                     r.get('open_price'), r.get('high_price'), r.get('low_price'), r.get('close_price'),

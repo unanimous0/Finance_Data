@@ -5,6 +5,7 @@ Infomax API 수집기
 - /api/stock/foreign  → foreign_ownership
 """
 
+import re
 import time
 import threading
 import sys
@@ -40,6 +41,28 @@ INVESTOR_MAP = {
     "기금공제": "PENSION",   # 연기금 = 기금공제
     "개인":    "RETAIL",
 }
+
+
+def pick_nearest_deferred(rows: list[dict]) -> list[dict]:
+    """NEXT(/api/future/2active) 응답은 날짜마다 근월 이후 상장된 *모든* 원월물을
+    반환한다(가까운→먼 순). 진짜 차근월 = 날짜별 만기 최소 1개만 골라야 한다.
+    (이전 dedup-last 로직은 최원월물을 남겨 OHLC=0 미거래 계약을 적재하던 버그.)
+
+    만기는 kr_name 끝의 YYYYMM(예: "코스피200 F 202406")으로 판정. 못 읽으면 뒤로 보냄.
+    """
+    def _expiry(r: dict) -> str:
+        m = re.search(r"(\d{6})\s*$", str(r.get("kr_name", "") or ""))
+        return m.group(1) if m else "999999"
+
+    best: dict = {}
+    for r in rows:
+        d = r.get("date")
+        if d is None:
+            continue
+        k = _expiry(r)
+        if d not in best or k < best[d][0]:
+            best[d] = (k, r)
+    return [r for _, r in best.values()]
 
 
 class InfomaxClient:
