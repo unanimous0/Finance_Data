@@ -37,9 +37,14 @@ date '+%Y-%m-%d %A %H:%M:%S KST'
 
 ### 1) 재시작 전 절대 체크 — 진행 중 job 차단
 ```bash
-pgrep -f "daily_update|backfill_|backup_db|etf_snapshot|update_listed_shares|crawl_sector|collect_financials|stockfut" && echo "⛔ 진행 중 job 있음 — 재시작 차단"
+# (a) 별도 프로세스로 도는 job
+pgrep -f "daily_update|backfill_|backup_db|etf_snapshot|update_listed_shares|crawl_sector|collect_financials|stockfut" && echo "⛔ 별도 프로세스 job 있음"
+# (b) ★ in-process job — pgrep로 안 잡힘! 스케줄러 로그로 확인 (Running 후 executed 없으면 진행 중)
+tail -40 logs/scheduler.log | grep -E "Running job|executed successfully|시작|완료" | tail -6
 ```
-진행 중 자식 job이 있으면 `C-c`/`kill`이 자식까지 죽임 (graceful handler 미작동, 5/24 03:00 백업이 이렇게 절단된 사례 있음).
+**중요**: 08:30 종합보충(ETF+supplement)·02:00 daily_update 등은 daily_scheduler 안에서 **in-process 함수**로 돌아 pgrep에 안 잡힌다 (etf_snapshot.py 등 파일명으로 검색해도 매칭 안 됨). 반드시 (b) 로그 확인 병행. 로그 마지막이 `Running job`/`시작`인데 짝 `executed successfully`/`완료`가 없으면 진행 중.
+
+graceful shutdown은 **작동함**: `C-c`(SIGINT) 받으면 `신호 2 수신 → 진행 중 job 완료 대기 후 종료`로 실행 중 job을 죽이지 않고 끝까지 기다린 뒤 종료(데이터 안전). 단 08:30 supplement는 ~1h 걸려 그만큼 종료가 늦어지니, 가능하면 job 없을 때 재시작. (과거 5/24 백업 절단은 별도 백업 프로세스를 직접 kill한 사례 — 이제 핸들러로 보호됨.)
 
 ### 2) 잡 fire 시각 회피 (재시작 30분 전후 피하기)
 - 02:00 daily_update / 03:00 weekly_backup / 03:30 update_listed_shares / 08:30 etf_snapshot / 23:30 stockfut (평일)

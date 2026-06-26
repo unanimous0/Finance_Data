@@ -1,7 +1,29 @@
 # 📝 TODO - 작업 목록
 
-> **마지막 업데이트**: 2026-06-17
+> **마지막 업데이트**: 2026-06-26
 > **현재 Phase**: Phase 4 + Phase 5(배당) + KRX 휴장일 + KOSPI200/KOSDAQ150 SCD2 + ETF 일별 스냅샷 + 지수/지수선물/주식선물 일별 + **Phase 6 분봉**: 종목/ETF 30초봉 ✅ / 1분봉 1/2~4/24 ✅ + **Phase 7**: 지수/지수선물/주식선물 30초봉 + 분봉/일별 NEAR/NEXT 통합 view ✅ + **5/15-16 사고 대응** ✅ + **수정주가 시스템 (5/16-17) ✅** + **5/24 운영/문서 정비 ✅**
+
+---
+
+## 🆕 2026-06-26 — DB 전수 검증(에이전트 7개) + 선물 차근월 버그 + ETF 5일 FIFO
+
+### 발견·수정 (검증 중 드러난 실데이터 버그)
+- [x] **5/18~20 외인·수급 갭 복구** — 5월 사고 잔여 미백필분(5/20 외인 전량 0). 날짜 명시 missing_only로 재수집, 인포맥스가 35일 전 과거분 서빙 → 2,646~2,647/10,872~10,884로 복구.
+- [x] **선물 차근월(NEXT) 계약 오선택 버그 (2건)** — `futures_ohlcv_daily` NEXT 전체가 잘못된 계약이었음:
+  - (A) `/api/future/2active`는 날짜마다 모든 원월물 반환인데 dedup이 **최원월물(2028-12, OHLC=0 미거래)** 유지 → 진짜 차근월 버림. `pick_nearest_deferred`(infomax.py, kr_name 만기 최소) 헬퍼로 수정. daily_update + backfill 공통 적용.
+  - (B) 백필 700일 청크가 2active 1000행 한도 초과 → 과거(2024) truncate 누락. NEXT는 **90일 청크**로 분할. `backfill_futures_ohlcv`에 `underlying_types` 필터 추가.
+  - 지수선물(F) 전기간 재수집 완료(25,210행): 코스피200/미니/코스닥150 차근월 2022~ 연속·정확. 섹터선물 OHL0은 실제 저유동(정상).
+  - [ ] **주식선물(L, 275종목) NEXT 재수집 미결** — ~5,000 인포맥스 콜이라 한도 회피 위해 야간/주말 별도 실행 검토. (daily 수집은 이미 수정됨 → 앞으로는 정상)
+- [x] **ETF portfolio 5일 FIFO** — `etf_snapshot.prune_portfolio_retention()` 추가(2-pass 후 최근 5영업일만 유지). 백업(`backups/etf_portfolio_daily_pre_fifo_20260626.dump` 46MB) 후 일회성 4.17M행 삭제 → 178,620행, VACUUM. master는 전기간 보존.
+
+### 운영 교훈
+- [x] **pgrep 가드 허점** — in-process job(08:30 종합보충 등)은 별도 프로세스가 아니라 pgrep에 안 잡힘. 재시작 전 **스케줄러 로그로 진행 중 job 확인** 병행 필요(CLAUDE.md/스케줄러_운영.md 반영). graceful shutdown은 실제 작동 확인(C-c 시 job 완료 대기).
+
+### 검증 총평 (에이전트 7개, read-only)
+- 핵심 raw 시계열(일봉/수급/외인/시총/지수/분봉/배당) 전반 건전. 위 외 잔여는 경미·설명가능:
+  - adj 2022~2023 미백필 + 2024-04말 ~1,205행 아티팩트(raw는 정상)
+  - market_cap_daily.shares_outstanding 100% NULL(값 자체는 정상), floating_shares 2~5월 공백(과거 재계산시만 영향)
+  - corporate_actions event_type 전량 UNKNOWN_FROM_FACTOR(미분류), 분봉 NXT(exchange=N) 미수집, sectors 레거시 死 스키마
 
 ---
 
