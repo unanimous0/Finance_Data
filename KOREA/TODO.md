@@ -13,7 +13,8 @@
   - (A) `/api/future/2active`는 날짜마다 모든 원월물 반환인데 dedup이 **최원월물(2028-12, OHLC=0 미거래)** 유지 → 진짜 차근월 버림. `pick_nearest_deferred`(infomax.py, kr_name 만기 최소) 헬퍼로 수정. daily_update + backfill 공통 적용.
   - (B) 백필 700일 청크가 2active 1000행 한도 초과 → 과거(2024) truncate 누락. NEXT는 **90일 청크**로 분할. `backfill_futures_ohlcv`에 `underlying_types` 필터 추가.
   - 지수선물(F) 전기간 재수집 완료(25,210행): 코스피200/미니/코스닥150 차근월 2022~ 연속·정확. 섹터선물 OHL0은 실제 저유동(정상).
-  - [ ] **주식선물(L, 275종목) NEXT 재수집 미결** — ~5,000 인포맥스 콜이라 한도 회피 위해 야간/주말 별도 실행 검토. (daily 수집은 이미 수정됨 → 앞으로는 정상)
+  - [~] **주식선물(L, 275종목) NEXT 재수집** — 6/26 1차 시도는 한도 조기 도달로 부분완료. 6/30 **안전윈도우 재개 러너 가동**(`scripts/backfill_futures_L_safewindow.py`, tmux `futures_backfill`, 상태파일 `cache/futures_L_backfill_done.txt`). 한도 시 다음날 10시까지 자고 이어받기 → 며칠 내 자동 완료 예정. (daily 수집은 이미 수정됨)
+- [ ] **`futures_daily_with_class` view 후속** — 현재 NEXT를 분봉 집계로 유도(2026+만, 일봉 NEXT 버그 우회 흔적). 일봉 NEXT 수정·**L 백필 완료 후** 이 view의 NEXT를 일봉 테이블 기반으로 바꾸면 2022+ 전체이력 + NEAR/NEXT 소스 일관. (분봉 view futures_intraday_near/next/with_class는 점검 결과 정상 — rank 기반이라 버그 무관, 일봉과 교차일치 OK)
 - [x] **ETF portfolio 5일 FIFO** — `etf_snapshot.prune_portfolio_retention()` 추가(2-pass 후 최근 5영업일만 유지). 백업(`backups/etf_portfolio_daily_pre_fifo_20260626.dump` 46MB) 후 일회성 4.17M행 삭제 → 178,620행, VACUUM. master는 전기간 보존.
 
 ### 운영 교훈
