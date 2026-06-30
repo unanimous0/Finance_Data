@@ -71,27 +71,26 @@ def wait_until_next_window():
     time.sleep(secs)
 
 
-def _tail(path: Path, n_bytes: int = 16384) -> str:
+def _last_ts(pattern: str) -> str:
+    """scheduler.log 전체에서 pattern 마지막 줄의 타임스탬프(앞 23자 'YYYY-MM-DD HH:MM:SS,mmm').
+    tail 대신 grep 전체 스캔 — 장시간 실행 잡의 시작 마커가 밀려나 놓치는 문제 방지."""
+    import subprocess
     try:
-        with path.open("rb") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            f.seek(max(0, size - n_bytes))
-            return f.read().decode("utf-8", "replace")
+        r = subprocess.run(["grep", pattern, str(SCHED_LOG)],
+                           capture_output=True, text=True, timeout=30)
+        lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
+        return lines[-1][:23] if lines else ""
     except Exception:
         return ""
 
 
 def scheduler_busy() -> bool:
     """스케줄러 in-process 잡(02:00 daily / 08:30 종합보충)이 진행 중인지 로그로 판정.
-    마지막 'Running job'/'시작'이 짝 'executed successfully'/'완료'보다 뒤면 진행 중."""
-    last_run = last_done = -1
-    for idx, ln in enumerate(_tail(SCHED_LOG).splitlines()):
-        if "Running job" in ln or "보충 시작" in ln:
-            last_run = idx
-        if "executed successfully" in ln or "작업 완료" in ln:
-            last_done = idx
-    return last_run > last_done
+    마지막 'Running job' 타임스탬프 > 마지막 'executed successfully'면 진행 중.
+    타임스탬프 비교라 장시간 실행 잡도 정확히 감지."""
+    run = _last_ts("Running job")
+    done = _last_ts("executed successfully")
+    return bool(run) and run > done
 
 
 def main():
