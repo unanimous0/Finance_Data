@@ -186,10 +186,11 @@ def main(missing_only: bool = False) -> None:
     for i, (code, name) in enumerate(stocks, 1):
         sector = fetch_fics_sector(code)
 
-        cur.execute(UPSERT_SQL, (code, sector))
-        conn.commit()
-
         if sector:
+            # 유효 섹터만 기록 — None(크롤 실패/미분류)으로 기존 값 덮어쓰기 금지.
+            # 2026-07-04 FnGuide 개편으로 크롤 전량 None → 2,719종목 NULL 참사 재발 방지.
+            cur.execute(UPSERT_SQL, (code, sector))
+            conn.commit()
             cnt_ok += 1
         else:
             cnt_null += 1
