@@ -32,20 +32,20 @@ from config.settings import settings
 
 
 # ── 설정 ──────────────────────────────────────────────────────────────────────
-DELAY      = 1.5    # 요청 간 대기 (초) — FnGuide 차단 방지
+# 소스: Naver 금융 (2026-07 교체). FnGuide가 FICS를 JS 렌더링으로 이동시켜
+# 정적 크롤 불가 → 2,719종목 NULL 참사. Naver는 종목별 업종(GICS식 투자섹터)을
+# 정적 HTML `a[href*=upjong]`로 노출 → 안정적. 컬럼명 fics_sector는 유지(호환).
+DELAY      = 0.4    # 요청 간 대기 (초) — Naver 예의상 딜레이
 RETRY      = 3      # 실패 시 재시도 횟수
 TIMEOUT    = 15     # 요청 타임아웃 (초)
 LOG_EVERY  = 100    # N개마다 진행 현황 출력
 
-FNGUIDE_URL = (
-    "https://comp.fnguide.com/SVO2/ASP/SVD_Main.asp"
-    "?pGB=1&gicode=A{code}&cID=&MenuYn=Y&ReportGB=&NewMenuID=101&stkGb=701"
-)
+NAVER_URL = "https://finance.naver.com/item/main.naver?code={code}"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Referer": "https://comp.fnguide.com/",
+    "Referer": "https://finance.naver.com/",
 }
 
 CREATE_TABLE_SQL = """
@@ -54,9 +54,9 @@ CREATE TABLE IF NOT EXISTS stock_sectors (
     fics_sector VARCHAR(100),
     updated_at  TIMESTAMP DEFAULT NOW()
 );
-COMMENT ON TABLE  stock_sectors               IS 'FnGuide FICS 업종 분류 (GICS 기반)';
+COMMENT ON TABLE  stock_sectors               IS '종목 업종(섹터) 분류 — Naver 금융 GICS식 (2026-07 FnGuide→Naver 교체)';
 COMMENT ON COLUMN stock_sectors.stock_code    IS '종목코드';
-COMMENT ON COLUMN stock_sectors.fics_sector   IS 'FICS 업종명 (예: 반도체 및 관련장비)';
+COMMENT ON COLUMN stock_sectors.fics_sector   IS '업종명 (Naver GICS식, 예: 반도체와반도체장비). 컬럼명은 호환 위해 유지';
 COMMENT ON COLUMN stock_sectors.updated_at    IS '마지막 수집일시';
 """
 
@@ -83,16 +83,15 @@ def get_conn():
 
 # ── 크롤링 ────────────────────────────────────────────────────────────────────
 def extract_fics_sector(soup: BeautifulSoup) -> str | None:
-    """BeautifulSoup 객체에서 FICS 업종명 추출.
+    """BeautifulSoup 객체에서 업종명 추출.
 
-    FnGuide 페이지 텍스트에 'FICS 반도체 및 관련장비' 형태로 존재.
+    Naver 금융 종목 페이지의 업종 링크 `a[href*=upjong]` 텍스트
+    (예: '반도체와반도체장비', '화학', '은행').
     """
     try:
-        text = soup.get_text()
-        match = re.search(r'FICS\s+([^|\n\r\t]+)', text)
-        if match:
-            sector = match.group(1).strip()
-            sector = re.sub(r'\s+', ' ', sector)
+        el = soup.select_one('a[href*="upjong"]')
+        if el:
+            sector = re.sub(r'\s+', ' ', el.get_text(strip=True))
             if 0 < len(sector) < 100:
                 return sector
     except Exception:
@@ -101,13 +100,14 @@ def extract_fics_sector(soup: BeautifulSoup) -> str | None:
 
 
 def fetch_fics_sector(code: str) -> str | None:
-    """FnGuide에서 종목코드의 FICS 업종명 크롤링 (재시도 포함)."""
-    url = FNGUIDE_URL.format(code=code)
+    """Naver 금융에서 종목코드의 업종명 크롤링 (재시도 포함)."""
+    url = NAVER_URL.format(code=code)
 
     for attempt in range(RETRY):
         try:
             resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
             resp.raise_for_status()
+            resp.encoding = resp.apparent_encoding  # Naver UTF-8 자동감지 (mojibake 방지)
             soup = BeautifulSoup(resp.text, "html.parser")
             return extract_fics_sector(soup)
 
