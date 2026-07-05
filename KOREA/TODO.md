@@ -1,7 +1,31 @@
 # 📝 TODO - 작업 목록
 
-> **마지막 업데이트**: 2026-06-26
+> **마지막 업데이트**: 2026-07-05
 > **현재 Phase**: Phase 4 + Phase 5(배당) + KRX 휴장일 + KOSPI200/KOSDAQ150 SCD2 + ETF 일별 스냅샷 + 지수/지수선물/주식선물 일별 + **Phase 6 분봉**: 종목/ETF 30초봉 ✅ / 1분봉 1/2~4/24 ✅ + **Phase 7**: 지수/지수선물/주식선물 30초봉 + 분봉/일별 NEAR/NEXT 통합 view ✅ + **5/15-16 사고 대응** ✅ + **수정주가 시스템 (5/16-17) ✅** + **5/24 운영/문서 정비 ✅**
+
+---
+
+## 🆕 2026-07-05 — 섹터(stock_sectors) NULL 참사 + 크롤러 FnGuide→Naver 교체
+
+### 사고
+- LENS가 섹터 폴백(시장명)만 표시 → `stock_sectors` 2,748종목 중 **2,719개 fics_sector=NULL** (7/4 18:30 크롤 실행이 덮음)
+- 원인 3중: (1) **FnGuide가 FICS를 JS 렌더링으로 이동** → 정적 크롤 전량 None (2) `crawl_sector.py` UPSERT에 **None 가드 없음** → None으로 좋은 값 덮음 (3) 7/4 실행이 이 조합 실행
+- 토요일 휴장과 무관 — 섹터는 시장 개장과 무관한 분류(reference) 데이터
+
+### 복구 조사 (전부 막힘 → 새 소스)
+- 7/4 이전 DB 백업 없음(주간백업 최신 1개=손상후) / PITR 불가(archive_mode=off) / LENS 섹터 export 없음(라이브 조회)
+- pykrx 섹터=빈 df(KRX 변경), KRX 직접=OTP/bld 미해결, DART induty=KSIC(투자섹터 아님)
+- **Naver 금융이 유일 정상** — 종목페이지 `a[href*=upjong]`에 GICS식 업종 정적 노출 (utf-8)
+
+### 완료
+- [x] **None 가드** (`crawl_sector.py`) — 유효 섹터만 UPSERT (커밋 e67f046)
+- [x] 대형주 244개 5/15 xlsx로 임시 복구 (중간 단계)
+- [x] **크롤러 Naver로 교체** (`fetch_fics_sector`/`extract_fics_sector` 재작성, 컬럼명 fics_sector 유지) + **전체 재크롤** → 활성 2,719종목 100% (NULL 0), 88섹터 (커밋 811cf7d/…)
+- [x] 스케줄러 재시작 — 10/4 분기 크롤이 새 코드(Naver+가드) 사용하도록 반영
+- 상폐 29종목만 옛 FICS 명칭 잔존 (is_active=false, LENS 미표시 — 무해)
+
+### ⚠️ LENS 후속 (사용자)
+- **섹터 분류체계 변경**: FICS("반도체 및 관련장비") → Naver GICS식("반도체와반도체장비"/"화학"/"은행"). LENS에서 섹터명 하드코딩 그룹핑/필터 있으면 새 명칭으로 조정 필요. 컬럼명은 유지라 쿼리는 안 깨짐.
 
 ---
 
