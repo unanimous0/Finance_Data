@@ -1,7 +1,21 @@
 # 📝 TODO - 작업 목록
 
-> **마지막 업데이트**: 2026-07-05
+> **마지막 업데이트**: 2026-07-06
 > **현재 Phase**: Phase 4 + Phase 5(배당) + KRX 휴장일 + KOSPI200/KOSDAQ150 SCD2 + ETF 일별 스냅샷 + 지수/지수선물/주식선물 일별 + **Phase 6 분봉**: 종목/ETF 30초봉 ✅ / 1분봉 1/2~4/24 ✅ + **Phase 7**: 지수/지수선물/주식선물 30초봉 + 분봉/일별 NEAR/NEXT 통합 view ✅ + **5/15-16 사고 대응** ✅ + **수정주가 시스템 (5/16-17) ✅** + **5/24 운영/문서 정비 ✅**
+
+---
+
+## 🆕 2026-07-06 — 유동주식수(floating_shares) 주간 갱신 복구 + 선물 L NEXT 완료
+
+### 유동주식수 갱신 끊김 → wisereport 소스로 복구
+- `floating_shares.floating_shares`/`floating_ratio`가 **2026-02-19 이후 갱신 끊김** — 주간 잡(`update_listed_shares.py`)은 `total_shares`(LS t1102)만 갱신, 유동주식 채우는 코드가 repo에 없었음(2월 데이터는 일회성)
+- 소스 조사: LS·인포맥스·Naver메인·FnGuide 전부 상장주식수만 → **wisereport**(`navercomp.wisereport.co.kr/v2/company/c1010001.aspx?cmp_cd=XXX`, =Naver 기업개요 iframe)의 '발행주식수/유동비율' **정적 파싱**으로 확정 (2월 원본 소스. 사용자가 coinfo 링크로 지적 — main.naver엔 없고 coinfo/wisereport에 있음)
+- [x] `update_listed_shares.py`에 **Phase 2** 추가 — 비ETF 활성종목 유동비율 수집 → `floating_shares = total_shares × 비율`, None 가드. 일요일 03:30 주간잡에 통합
+- [x] 즉시 복구: base_date 2026-07-05 **2,716종목** 채움(none 3), 스케줄러 재시작 반영
+
+### 선물 L NEXT 백필 완료
+- [x] 주식선물(L, 275종목) NEXT 안전윈도우 백필 6/30~7/6 자동 완주 → 275/275, 차근월 실거래 정상. (F+L 모두 완료) → `futures_backfill` 세션 자동 종료
+- [ ] **`futures_daily_with_class` view 후속** (F·L NEXT 일봉 수정 완료로 이제 가능) — NEXT를 일봉 테이블 기반으로 전환 시 2022+ 전체이력 일관
 
 ---
 
