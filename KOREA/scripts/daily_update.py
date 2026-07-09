@@ -1661,6 +1661,35 @@ def run_etf_daily_snapshot_pipeline(target_date: date) -> dict:
         conn.close()
 
 
+def sync_stockfut_underlyings(conn) -> int:
+    """t8401(LS 라이브·완전) 단일선물에서 기초종목을 futures_underlyings(type 'L')에 upsert.
+    **신규 상장 종목선물 자동 등록** — 매일 선물 OHLCV 수집 직전 호출해 신규를 그 즉시 수집 대상에 포함.
+    매핑(검증됨): underlying_code=shcode[1:3], stock_code=basecode[1:], kr_name=hname 이름토큰.
+    (인포맥스 get_future_codes는 1000행 상한이라 275개 다 못 잡음 → t8401(무상한 ~3천행) 사용.)"""
+    from collectors.ls_api import LsApiClient
+    master = LsApiClient().get_stockfut_master()
+    rows: dict = {}
+    for x in master:
+        toks = x.get("hname", "").split()
+        if len(toks) < 2 or toks[1] != "F":   # 단일선물(F)만 — 스프레드(SP)/옵션 제외
+            continue
+        sh = x.get("shcode", ""); bc = x.get("basecode", "")
+        if len(sh) >= 3 and bc.startswith("A"):
+            rows[sh[1:3]] = (sh[1:3], toks[0], "L", bc[1:])
+    if rows:
+        with conn:
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_values(cur, """
+                    INSERT INTO futures_underlyings (underlying_code, kr_name, underlying_type, stock_code)
+                    VALUES %s
+                    ON CONFLICT (underlying_code) DO UPDATE SET
+                        kr_name = EXCLUDED.kr_name,
+                        underlying_type = EXCLUDED.underlying_type,
+                        stock_code = EXCLUDED.stock_code
+                """, list(rows.values()), page_size=200)
+    return len(rows)
+
+
 def run_indices_futures_daily_pipeline(target_date: date) -> dict:
     """
     지수 + 선물(NEAR/NEXT) 일별 OHLCV 누적 (인포맥스).
@@ -1674,6 +1703,13 @@ def run_indices_futures_daily_pipeline(target_date: date) -> dict:
     client = InfomaxClient()
     conn = get_conn()
     try:
+        # 신규 종목선물 자동 등록 (t8401 라이브 → futures_underlyings upsert) — fut_codes 조회 전
+        try:
+            n_sync = sync_stockfut_underlyings(conn)
+            print(f"  🔄 종목선물 마스터 sync: {n_sync}개 단일선물 (신규 자동 등록)")
+        except Exception as e:
+            print(f"  ⚠️ 종목선물 마스터 sync 실패 (수집은 계속): {e}")
+
         # 지수: indices 마스터 전체
         with conn.cursor() as cur:
             cur.execute("SELECT code FROM indices ORDER BY code")
