@@ -803,7 +803,7 @@ def select_near_next_two(master: list[dict], today: date,
     parsed: list[tuple[str, date, dict]] = []
     for m in master:
         hname = m.get("hname", "")
-        if "SP" in hname:        # 스프레드 제외
+        if "SP" in hname.split():   # 스프레드 제외 (토큰 매칭 — 'HPSP' 등 이름 내 'SP' 부분문자열 오탐 방지)
             continue
         # 옵션(콜/풋)은 hname이 'C 2605 ...', 'P 2605 ...' (가격 포함) — 첫 토큰 정확히 'C'/'P'
         first_tok = hname.strip().split()[0] if hname.strip() else ""

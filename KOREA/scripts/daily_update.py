@@ -2251,10 +2251,10 @@ def export_futures_master_json() -> dict:
     actives = select_near_next_two(master, today,
                                    group_key=lambda m: m.get("basecode", ""))
 
-    # 3) 스프레드 — basecode별 그룹
+    # 3) 스프레드 — basecode별 그룹 ("SP" 토큰 매칭 — 'HPSP' 등 이름 오탐 방지)
     spreads_by_base: dict[str, list] = defaultdict(list)
     for m in master:
-        if "SP" in m.get("hname", ""):
+        if "SP" in m.get("hname", "").split():
             spreads_by_base[m.get("basecode", "")].append(m)
 
     # 4) DB join — futures_underlyings + stocks
