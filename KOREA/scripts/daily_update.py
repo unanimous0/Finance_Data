@@ -2257,16 +2257,13 @@ def export_futures_master_json() -> dict:
         if "SP" in m.get("hname", "").split():
             spreads_by_base[m.get("basecode", "")].append(m)
 
-    # 4) DB join — futures_underlyings + stocks
+    # 4) DB join — stocks 직접 (base_code = t8401 단일선물 basecode[1:] = 기초 6자리).
+    #    (이전엔 futures_underlyings 경유했으나 그 테이블은 수동 시딩이라 완전 신규
+    #     기초종목이 드롭되던 잠재 갭. stocks는 daily_update가 매일 동기화 → 신규 자동 반영)
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("""
-                SELECT fu.stock_code, s.stock_name, s.market
-                FROM futures_underlyings fu
-                JOIN stocks s ON s.stock_code = fu.stock_code
-                WHERE fu.underlying_type = 'L'
-            """)
+            cur.execute("SELECT stock_code, stock_name, market FROM stocks")
             stock_info = {row[0]: (row[1], row[2]) for row in cur.fetchall()}
     finally:
         conn.close()
