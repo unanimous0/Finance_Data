@@ -11,7 +11,9 @@
 - **원인**: 스프레드 제외 필터 `"SP" in hname`(부분문자열) → **"HPSP"의 "SP"** 오탐 → HPSP 단일선물(F)이 스프레드로 오인돼 제외. `select_near_next_two`(ls_api.py) + `export_futures_master_json`(daily_update.py) 2곳
 - [x] **수정**: `"SP" in hname.split()`(토큰 매칭). 재export → 274종목, HPSP 정상. 스케줄러 재시작 반영. 영향=HPSP 1종목뿐
 - **LENS 답변**: 유니버스=LS t8401(3083행), 근/차월 2개, 매핑(base_code/front.code) export 포함됨. 금양=만기경과로 라이브 계약 없어 정상 제외
-- [ ] **잠재 갭(선택)**: export가 name join을 `futures_underlyings`(수동 시딩 테이블)에 의존 → 완전 신규 기초종목 첫 상장 시 드롭 가능. 현재 드롭 0. `base_code`를 `stocks`에 직접 join하면 해소
+- [x] **신규상장 드롭 갭 해소 (2건)**:
+  - export name join을 `futures_underlyings`(수동시딩) → `stocks` 직접으로 변경 (신규 자동 반영, 274종목 동일)
+  - DB 선물 OHLCV 수집: `sync_stockfut_underlyings` 추가 — 매일 02:00 t8401(LS·무상한)에서 단일선물 유도(shcode[1:3]=underlying_code, basecode[1:]=stock_code)해 `futures_underlyings` upsert. 신규 종목선물 자동 등록+수집. (get_future_codes는 1000행 상한=166종목이라 부적합)
 
 ---
 
