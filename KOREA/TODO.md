@@ -1,7 +1,17 @@
 # 📝 TODO - 작업 목록
 
-> **마지막 업데이트**: 2026-07-06
+> **마지막 업데이트**: 2026-07-09
 > **현재 Phase**: Phase 4 + Phase 5(배당) + KRX 휴장일 + KOSPI200/KOSDAQ150 SCD2 + ETF 일별 스냅샷 + 지수/지수선물/주식선물 일별 + **Phase 6 분봉**: 종목/ETF 30초봉 ✅ / 1분봉 1/2~4/24 ✅ + **Phase 7**: 지수/지수선물/주식선물 30초봉 + 분봉/일별 NEAR/NEXT 통합 view ✅ + **5/15-16 사고 대응** ✅ + **수정주가 시스템 (5/16-17) ✅** + **5/24 운영/문서 정비 ✅**
+
+---
+
+## 🆕 2026-07-09 — futures_master.json HPSP 누락 (SP 문자열 버그) 수정
+
+- **증상**: LENS가 쓰는 `futures_master.json`(daily_update 5:30 export)에 HPSP 종목선물(A1B67000, 202607 근월) 누락 (273종목)
+- **원인**: 스프레드 제외 필터 `"SP" in hname`(부분문자열) → **"HPSP"의 "SP"** 오탐 → HPSP 단일선물(F)이 스프레드로 오인돼 제외. `select_near_next_two`(ls_api.py) + `export_futures_master_json`(daily_update.py) 2곳
+- [x] **수정**: `"SP" in hname.split()`(토큰 매칭). 재export → 274종목, HPSP 정상. 스케줄러 재시작 반영. 영향=HPSP 1종목뿐
+- **LENS 답변**: 유니버스=LS t8401(3083행), 근/차월 2개, 매핑(base_code/front.code) export 포함됨. 금양=만기경과로 라이브 계약 없어 정상 제외
+- [ ] **잠재 갭(선택)**: export가 name join을 `futures_underlyings`(수동 시딩 테이블)에 의존 → 완전 신규 기초종목 첫 상장 시 드롭 가능. 현재 드롭 0. `base_code`를 `stocks`에 직접 join하면 해소
 
 ---
 
