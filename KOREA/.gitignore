@@ -104,3 +104,10 @@ cache/
 
 # Claude Code 작업 파일
 .claude/
+
+# 일별 수집 리포트 (생성물 — 버전관리 불필요)
+reports/*.txt
+
+# 개인 분석 파일 (ad-hoc, 시스템 비참조)
+docs/주식분석_*.xlsx
+scripts/주식분석.py
