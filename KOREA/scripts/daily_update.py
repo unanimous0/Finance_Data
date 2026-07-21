@@ -1554,6 +1554,80 @@ def run_supplement_pipeline() -> dict:
         conn.close()
 
 
+def check_etf_master_completeness(conn, target_date: date,
+                                  etfs: list[tuple[str, str]]) -> dict:
+    """ETF 마스터 스냅샷 완결성 체크 (관측성 확보용, Q4-1).
+
+    활성목록(etfs, KOREA_ETF_SQL 결과) 대비 target_date 에 마스터 행이 없는 ETF를
+    DB 실제 상태로 재조회해 판정한다. 2-pass(today/yesterday) 재실행 시
+    in-memory 카운트는 오탐하므로 반드시 DB 존재 여부로 확인.
+
+    누락을 2등급으로 구분(사용자 요구 — 신규상장 lag 노이즈 제거):
+      - genuine : 과거에 마스터 스냅샷 이력이 있는데 오늘 빠짐 → 진짜 이상, WARN + 영속화
+      - lag     : 마스터 스냅샷 이력이 전무 → 신규상장/미등록(인포맥스 마스터 미준비),
+                  정상 부재로 간주 → INFO만, WARN/알림 제외
+
+    반환: {active_count, loaded_count, missing_total, genuine:[{code,name}], lag:[{code,name}]}
+    """
+    name_by_code = {code: name for code, name in etfs}
+    codes = list(name_by_code.keys())
+
+    with conn.cursor() as cur:
+        # 1) target_date 에 마스터 행이 없는 활성 ETF
+        cur.execute("""
+            SELECT c FROM unnest(%s::text[]) AS c
+            WHERE NOT EXISTS (
+                SELECT 1 FROM etf_master_daily m
+                WHERE m.etf_code = c AND m.snapshot_date = %s
+            )
+        """, (codes, target_date))
+        missing = [r[0] for r in cur.fetchall()]
+
+        # 2) 과거 이력 유무로 genuine vs lag 판정
+        history = set()
+        if missing:
+            cur.execute("""
+                SELECT DISTINCT etf_code FROM etf_master_daily
+                WHERE etf_code = ANY(%s) AND snapshot_date < %s
+            """, (missing, target_date))
+            history = {r[0] for r in cur.fetchall()}
+
+    genuine = [{"code": c, "name": name_by_code.get(c)} for c in missing if c in history]
+    lag = [{"code": c, "name": name_by_code.get(c)} for c in missing if c not in history]
+    result = {
+        "active_count": len(codes),
+        "loaded_count": len(codes) - len(missing),
+        "missing_total": len(missing),
+        "genuine": sorted(genuine, key=lambda x: x["code"]),
+        "lag": sorted(lag, key=lambda x: x["code"]),
+    }
+
+    # 콘솔 출력 (scheduler.log 로 tee)
+    print(f"  [완결성] 활성 {result['active_count']} / 적재 {result['loaded_count']} "
+          f"/ 누락 {result['missing_total']} (genuine {len(genuine)} / lag {len(lag)})")
+    if genuine:
+        print(f"  ⚠️ [마스터 누락-genuine] {len(genuine)}건 — 이력 있는데 {target_date} 빠짐:")
+        for g in result["genuine"]:
+            print(f"      {g['code']}  {g['name']}")
+    if lag:
+        codes_str = ", ".join(g["code"] for g in result["lag"])
+        print(f"  [마스터 누락-lag] {len(lag)}건 (신규상장/미등록, 정상): {codes_str}")
+
+    # 영속화 — data_quality_checks (audit trail, genuine 만 issue_count 로 집계)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO data_quality_checks
+                      (table_name, check_date, check_type, issue_count, details)
+                    VALUES ('etf_master_daily', %s, 'master_completeness', %s, %s)
+                """, (target_date, len(genuine), psycopg2.extras.Json(result)))
+    except Exception as e:
+        print(f"  ⚠️ [완결성] data_quality_checks 기록 실패: {e}")
+
+    return result
+
+
 def run_etf_daily_snapshot_pipeline(target_date: date) -> dict:
     """
     한국 ETF 590개의 PDF + 마스터를 매일 스냅샷으로 적재.
@@ -1654,9 +1728,18 @@ def run_etf_daily_snapshot_pipeline(target_date: date) -> dict:
         print(f"  [완료] ETF {len(etfs)}개")
         print(f"    PDF 적재 {pdf_rows} / 빈응답 {empty_pdf} / 마스터 적재 {master_rows} / 빈응답 {empty_master}")
         print(f"    에러 {len(errors)}")
+
+        # 완결성 체크 (Q4-1) — 활성목록 대비 마스터 누락 관측. 실패해도 파이프라인 비중단.
+        try:
+            completeness = check_etf_master_completeness(conn, target_date, etfs)
+        except Exception as e:
+            print(f"  ⚠️ [완결성] 체크 실패: {e}")
+            completeness = {"active_count": len(etfs), "loaded_count": None,
+                            "missing_total": None, "genuine": [], "lag": []}
+
         return {"etfs": len(etfs), "pdf_rows": pdf_rows, "master_rows": master_rows,
                 "empty_pdf": empty_pdf, "empty_master": empty_master,
-                "errors": len(errors)}
+                "errors": len(errors), "completeness": completeness}
     finally:
         conn.close()
 

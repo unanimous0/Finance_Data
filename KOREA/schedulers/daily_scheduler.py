@@ -521,16 +521,28 @@ def _etf_snapshot_summary(today_date) -> str:
                     "WHERE snapshot_date IN (%s, %s) GROUP BY snapshot_date ORDER BY snapshot_date",
                     (yest, today_date))
                 master_rows = dict(cur.fetchall())
+                # 완결성 체크 결과 (Q4-1) — 날짜별 최신 master_completeness 1건
+                cur.execute(
+                    "SELECT DISTINCT ON (check_date) check_date, issue_count, details "
+                    "FROM data_quality_checks "
+                    "WHERE table_name='etf_master_daily' AND check_type='master_completeness' "
+                    "  AND check_date IN (%s, %s) "
+                    "ORDER BY check_date, created_at DESC",
+                    (yest, today_date))
+                completeness = {d: (cnt, det) for d, cnt, det in cur.fetchall()}
         finally:
             conn.close()
         sections = []
         for d, etfs, rows in pdf_rows:
             m = master_rows.get(d, 0)
-            sections.append(
-                f"📅 {d}\n"
-                f"  • PDF: {etfs}개 ETF / {rows:,}행\n"
-                f"  • 마스터: {m}개"
-            )
+            line = (f"📅 {d}\n"
+                    f"  • PDF: {etfs}개 ETF / {rows:,}행\n"
+                    f"  • 마스터: {m}개")
+            cnt, det = completeness.get(d, (None, None))
+            if cnt:  # genuine 누락 있을 때만 노출 (lag 는 제외 — 정상 부재)
+                codes = ", ".join(f"{g['code']}({g['name']})" for g in (det or {}).get("genuine", []))
+                line += f"\n  • ⚠️ 마스터 누락 {cnt}건: {codes}"
+            sections.append(line)
         return "\n\n".join(sections) if sections else "적재 결과 없음"
     except Exception as e:
         return f"요약 조회 실패: {e}"
