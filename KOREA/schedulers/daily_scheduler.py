@@ -281,6 +281,16 @@ def job_minute_bars_daily():
             try:
                 result = fn(target)
                 logger.info(f"[스케줄러] {label} 분봉 일배치 완료: {result}")
+                # 30초 완결성: 재시도 후에도 남은 genuine 결측이면 알림 (7/20 사고 재발 감지)
+                if label == "종목/ETF" and isinstance(result, dict) and result.get("still_missing", 0) > 0:
+                    comp = result.get("completeness", {})
+                    codes_str = ", ".join(comp.get("still_missing_codes", [])[:20])
+                    notify_job(
+                        "30초 완결성", "fail", datetime.now(KST),
+                        detail=(f"target={target} — daily는 있는데 30초봉 결측 "
+                                f"{result['still_missing']}종목 (재시도 후 잔여). "
+                                f"복구 {comp.get('recovered', 0)} / lag {comp.get('lag', 0)}\n"
+                                f"결측: {codes_str}"))
             except Exception as e:
                 logger.error(f"[스케줄러] {label} 분봉 일배치 실패: {e}")
 

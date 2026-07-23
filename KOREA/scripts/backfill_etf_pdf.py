@@ -16,7 +16,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -69,6 +69,23 @@ def wait_until_midnight():
     print(f"  [LIMIT] 대기 완료, 재개", flush=True)
 
 
+# 08:30 아침 종합 보충(in-process, pgrep 미탐)이 도는 시간창 — 이 구간엔 백필 정지.
+# 잡 = ETF 스냅샷 + 외인/OHLCV 누락보충으로 08:30~약10:00 인포맥스 점유(실측 어제 10:04 완료).
+# --no-wait 로 안전윈도우(10:00)를 우회해도 이 창만은 항상 회피해 스냅샷/보충 완결성 보호.
+SNAPSHOT_WINDOW = (dtime(8, 25), dtime(10, 5))
+
+
+def wait_out_snapshot_window():
+    """현재 시각이 08:25~10:05 KST 사이면 10:05 지날 때까지 60s 폴링 대기.
+    08:30 아침 종합 보충(in-process)은 pgrep 가드로 못 잡으므로 시간창으로 회피."""
+    while True:
+        now = datetime.now(KST)
+        if not (SNAPSHOT_WINDOW[0] <= now.time() < SNAPSHOT_WINDOW[1]):
+            return
+        print(f"  [SNAPSHOT-WINDOW] 08:30 ETF 스냅샷 시간창 ({now:%H:%M}) — 60s 후 재확인", flush=True)
+        time.sleep(60)
+
+
 def maybe_pause_for_daily_update():
     """daily_update.py 또는 etf_snapshot.py 둘 중 하나라도 살아있으면 sleep.
     둘 다 인포맥스 60 RPM 한도 점유 → 동시 호출 시 429/timeout 발생."""
@@ -99,7 +116,7 @@ DOMESTIC_ETF_SQL = """
 SELECT stock_code, stock_name FROM stocks
 WHERE market = 'ETF' AND is_active = TRUE
   AND NOT (
-      stock_name ~ '(미국|나스닥|NASDAQ|S&P|필라델피아|차이나|항셍|일본|베트남|인도|유럽|뉴욕|INDXX|SOLACTIVE|WTI|원유|은선물|천연가스|옥수수|대두|엔비디아|테슬라|구글|팔란티어|마이크로소프트|아마존|애플|메타)'
+      stock_name ~ '(미국|나스닥|NASDAQ|S&P|필라델피아|차이나|항셍|일본|베트남|인도|유럽|뉴욕|INDXX|SOLACTIVE|WTI|원유|은선물|천연가스|옥수수|대두|엔비디아|테슬라|구글|팔란티어|마이크로소프트|아마존|애플|메타(?!버스))'
       OR (stock_name LIKE '%(H)%' AND stock_name NOT LIKE '%KRX%')
       OR (stock_name LIKE '%글로벌%' AND stock_name NOT LIKE '%K-글로벌%' AND stock_name NOT LIKE '%K글로벌%')
       OR stock_name ~ '(채권|리츠|REIT|싱가포르|혼합|커버드콜|금현물|Gold|GOLD)'
@@ -165,11 +182,15 @@ def fetch_existing_pairs(conn, start: date, end: date) -> set[tuple[str, date]]:
         return {(r[0], r[1]) for r in cur.fetchall()}
 
 
-def process_etf_day(client, conn, etf_code, target_date) -> tuple[int, int, str]:
-    """1 ETF × 1 day → PDF + master 적재. 반환: (pdf_rows, master_rows, status)"""
+def process_etf_day(client, conn, etf_code, target_date,
+                    fetch_master: bool = True) -> tuple[int, int, str]:
+    """1 ETF × 1 day → PDF (+ 옵션 master) 적재. 반환: (pdf_rows, master_rows, status).
+
+    fetch_master=False 면 master API 호출 자체를 skip (월1회 샘플링용 — 인포맥스 콜 절감).
+    마스터(creation_unit/listed_shares 등)는 거의 안 변해 월1회로 충분(사용자 결정, C)."""
     try:
         rows = client.get_etf_portfolio(etf_code, target_date)
-        m = client.get_etf_master(etf_code, target_date)
+        m = client.get_etf_master(etf_code, target_date) if fetch_master else None
     except InfomaxDailyLimitError:
         raise  # 호출자(main loop)가 자정 대기 처리
     except Exception as e:
@@ -218,10 +239,17 @@ def main():
     parser.add_argument("--from", dest="start", default="20260102", help="YYYYMMDD")
     parser.add_argument("--to",   dest="end",   default=None,        help="YYYYMMDD (기본: 어제)")
     parser.add_argument("--limit", type=int, default=None, help="상위 N ETF (sanity)")
+    parser.add_argument("--codes", default=None,
+                        help="특정 ETF 코드만 (쉼표구분, 예: 396500,364980,462010). 워치리스트 우선 백필용")
     parser.add_argument("--desc", action="store_true",
                         help="최신 일자부터 옛 일자 순으로 (점진 분석용)")
     parser.add_argument("--max-calls", type=int, default=None,
                         help="일별 최대 API 호출 수 self-limit (옵션). 미지정 시 인포맥스가 한도 초과 응답할 때까지 호출 — 반복 잡 남은 한도 풀로 활용.")
+    parser.add_argument("--master-every-day", action="store_true",
+                        help="마스터를 매 거래일 수집 (기본: 월 첫 거래일만 = 월1회 샘플, 콜 절감)")
+    parser.add_argument("--no-wait", action="store_true",
+                        help="안전윈도우(00:00~10:00 sleep) 무시하고 즉시 가동 — 소량 워치리스트 우선 백필용. "
+                             "daily_update 진행중 PAUSE 가드는 유지.")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -231,10 +259,40 @@ def main():
     client = InfomaxClient()
     conn = _conn()
     try:
-        etfs = fetch_etfs(conn)
+        if args.codes:
+            # 명시 코드는 DOMESTIC_ETF_SQL 국내필터 우회 — stocks에서 활성 ETF 직접 선택
+            # (해외필터 오탐 '메타버스'→'메타' 등, 사용자 명시 의도 우선)
+            want = list(dict.fromkeys(c.strip() for c in args.codes.split(",") if c.strip()))
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT stock_code, stock_name FROM stocks "
+                    "WHERE stock_code = ANY(%s) AND market='ETF' AND is_active=TRUE "
+                    "ORDER BY stock_code", (want,))
+                etfs = cur.fetchall()
+            found = {c for c, _ in etfs}
+            missing = [c for c in want if c not in found]
+            print(f"  [--codes] 지정 {len(want)}개 → 활성 ETF {len(etfs)}개 직접 선택"
+                  + (f" / 미매칭(비활성/비ETF): {missing}" if missing else ""))
+        else:
+            etfs = fetch_etfs(conn)
         if args.limit:
             etfs = etfs[:args.limit]
         biz_days = fetch_biz_days(conn, start, end)
+
+        # 마스터 수집 날짜 = 각 (연,월)의 첫 거래일 (월1회 샘플). --master-every-day면 전체.
+        master_dates: set[date] = set()
+        if args.master_every_day:
+            master_dates = set(biz_days)
+        else:
+            seen_month: set[tuple[int, int]] = set()
+            for d in sorted(biz_days):
+                ym = (d.year, d.month)
+                if ym not in seen_month:
+                    seen_month.add(ym)
+                    master_dates.add(d)
+        print(f"  [마스터] {'매 거래일' if args.master_every_day else '월1회(월 첫 거래일)'} "
+              f"— 마스터 수집일 {len(master_dates)}일")
+
         if args.desc:
             biz_days = list(reversed(biz_days))
 
@@ -269,14 +327,17 @@ def main():
                 print(f"  [MAX-CALLS] 일별 self-limit {args.max_calls}콜 도달 — 09:30 재개 대기", flush=True)
                 wait_until_midnight()
                 daily_calls = 1
-            wait_for_safe_window()           # 00:00~10:00 sleep — 반복 잡에 한도 양보
+            if not args.no_wait:
+                wait_for_safe_window()       # 00:00~10:00 sleep — 반복 잡에 한도 양보
+            wait_out_snapshot_window()       # 08:25~09:45 회피 — 08:30 스냅샷(in-process) 보호 (--no-wait도 적용)
             maybe_pause_for_daily_update()   # daily_update/etf_snapshot 진행 중이면 PAUSE (방어적 이중 가드)
+            fm = d in master_dates
             try:
-                pdf_n, master_n, status = process_etf_day(client, conn, etf_code, d)
+                pdf_n, master_n, status = process_etf_day(client, conn, etf_code, d, fetch_master=fm)
             except InfomaxDailyLimitError:
                 wait_until_midnight()
                 daily_calls = 1
-                pdf_n, master_n, status = process_etf_day(client, conn, etf_code, d)
+                pdf_n, master_n, status = process_etf_day(client, conn, etf_code, d, fetch_master=fm)
             except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
                 print(f"  [DB 재연결] {type(e).__name__}: {e}", flush=True)
                 try:
@@ -284,7 +345,7 @@ def main():
                 except Exception:
                     pass
                 conn = _conn()
-                pdf_n, master_n, status = process_etf_day(client, conn, etf_code, d)
+                pdf_n, master_n, status = process_etf_day(client, conn, etf_code, d, fetch_master=fm)
             if status == "ok":
                 ok += 1
                 total_pdf += pdf_n

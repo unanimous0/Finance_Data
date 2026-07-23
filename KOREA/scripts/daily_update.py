@@ -1628,6 +1628,105 @@ def check_etf_master_completeness(conn, target_date: date,
     return result
 
 
+def check_intraday_completeness(conn, target_date: date, codes: list[str],
+                                client) -> dict:
+    """30초봉 수집 완결성 안전망 (재발방지, 2026-07-22).
+
+    target_date 에 daily OHLCV 는 있는데 해당 interval 봉이 없는 스코프 종목을 탐지.
+    IGW00201(호출초과) 폭주 구간의 콜이 조용히 empty 처리돼 갭이 남는 사고
+    (7/20 82종목 연속밴드 누락) 재발 방지 — 원인(empty/error) 무관하게
+    "daily 있는데 intraday 없음" 으로 100% 포착.
+
+    누락을 2등급 구분(마스터 완결성과 동일 철학):
+      - genuine : 최근 영업일들에 intraday 이력 있음 → 진짜 결측.
+                  **즉시 1회 재시도**, 그래도 남으면 WARN + data_quality_checks 영속화.
+      - lag     : intraday 이력 전무 → 신규상장/LS 미지원. 정상 부재 → INFO 만.
+
+    반환: {scope, missing_before, genuine_before, lag, recovered,
+           still_missing, still_missing_codes}
+    """
+    from collectors.ls_api import select_ncnt, LsApiError
+    from scripts.backfill_30sec_bars import insert_bars
+
+    interval = 30 if select_ncnt(target_date) == 0 else 60
+
+    def _missing(cur, code_list: list[str]) -> list[str]:
+        if not code_list:
+            return []
+        cur.execute("""
+            SELECT d.stock_code
+            FROM (SELECT DISTINCT stock_code FROM ohlcv_daily
+                   WHERE time = %s AND stock_code = ANY(%s)) d
+            WHERE NOT EXISTS (
+                SELECT 1 FROM ohlcv_intraday i
+                 WHERE i.stock_code = d.stock_code
+                   AND i.interval_seconds = %s
+                   AND (i.time AT TIME ZONE 'Asia/Seoul')::date = %s
+            )
+        """, (target_date, code_list, interval, target_date))
+        return [r[0] for r in cur.fetchall()]
+
+    with conn.cursor() as cur:
+        missing = _missing(cur, list(codes))
+        history: set[str] = set()
+        if missing:
+            cur.execute("""
+                SELECT DISTINCT stock_code FROM ohlcv_intraday
+                 WHERE stock_code = ANY(%s)
+                   AND (time AT TIME ZONE 'Asia/Seoul')::date < %s
+                   AND (time AT TIME ZONE 'Asia/Seoul')::date >= %s
+            """, (missing, target_date, target_date - timedelta(days=20)))
+            history = {r[0] for r in cur.fetchall()}
+
+    genuine = [c for c in missing if c in history]
+    lag = [c for c in missing if c not in history]
+
+    # genuine 즉시 1회 재시도 (7/20 사고 = 재시도로 100% 복구된 케이스)
+    recovered = 0
+    for code in genuine:
+        try:
+            bars, itv = client.get_intraday_bars(code, target_date)
+            if bars:
+                insert_bars(conn, code, bars, itv)
+                recovered += 1
+        except (LsApiError, Exception):
+            pass
+    conn.commit()
+
+    with conn.cursor() as cur:
+        still = _missing(cur, genuine)
+
+    result = {
+        "scope": len(codes),
+        "missing_before": len(missing),
+        "genuine_before": len(genuine),
+        "lag": len(lag),
+        "recovered": recovered,
+        "still_missing": len(still),
+        "still_missing_codes": sorted(still)[:30],
+    }
+
+    print(f"  [30초 완결성] 스코프 {len(codes)} / 결측 {len(missing)} "
+          f"(genuine {len(genuine)} / lag {len(lag)}) → 재시도 복구 {recovered} / 잔여 {len(still)}")
+    if lag:
+        print(f"  [30초 결측-lag] {len(lag)}건 (신규/미지원, 정상): {', '.join(sorted(lag)[:20])}")
+    if still:
+        print(f"  ⚠️ [30초 결측-genuine] 재시도 후에도 {len(still)}건: {', '.join(sorted(still)[:20])}")
+
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO data_quality_checks
+                      (table_name, check_date, check_type, issue_count, details)
+                    VALUES ('ohlcv_intraday', %s, 'intraday_completeness', %s, %s)
+                """, (target_date, len(still), psycopg2.extras.Json(result)))
+    except Exception as e:
+        print(f"  ⚠️ [30초 완결성] data_quality_checks 기록 실패: {e}")
+
+    return result
+
+
 def run_etf_daily_snapshot_pipeline(target_date: date) -> dict:
     """
     한국 ETF 590개의 PDF + 마스터를 매일 스냅샷으로 적재.
@@ -2145,8 +2244,18 @@ def run_minute_bars_pipeline(target_date: date) -> dict:
             if errors:
                 from collections import Counter
                 print(f"    에러 카테고리: {dict(Counter(e[2] for e in errors))}")
+
+            # 완결성 안전망 — target_date 결측(daily 있는데 30초 없음) 탐지 + 재시도
+            comp = {}
+            try:
+                comp = check_intraday_completeness(conn, target_date, codes, client)
+            except Exception as ce:
+                print(f"  ⚠️ [30초 완결성] 체크 실패(무시): {ce}")
+
             return {"calls": calls_done, "stocks": len([c for c in codes if gaps.get(c)]),
-                    "rows": total_rows, "empty": empty, "errors": len(errors)}
+                    "rows": total_rows, "empty": empty, "errors": len(errors),
+                    "completeness": comp,
+                    "still_missing": comp.get("still_missing", 0)}
         finally:
             conn.close()
     finally:

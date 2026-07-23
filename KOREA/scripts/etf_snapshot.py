@@ -27,9 +27,11 @@ from scripts.daily_update import run_etf_daily_snapshot_pipeline, get_conn
 
 KST = ZoneInfo("Asia/Seoul")
 
-# etf_portfolio_daily 보존 정책 — 최근 N 영업일치만 FIFO 유지 (PDF는 최신만 의미).
-# etf_master_daily 는 대상 아님(소형·전기간 보존).
-PORTFOLIO_RETENTION_DAYS = 5
+# etf_portfolio_daily 보존 정책.
+# 0 = 영구 보존 (prune 완전 비활성) — 장중 괴리(real_nav) 통계용 PDF 이력 축적 목적, B1 (2026-07-22).
+#     이전엔 5(최근 5영업일 FIFO). 되돌리려면 다시 양수로.
+# etf_master_daily 는 원래 prune 대상 아님(소형·전기간 보존).
+PORTFOLIO_RETENTION_DAYS = 0
 
 
 # 정상 케이스 wait: 60s polling, 최대 4h (daily_update 최장 실측 ~5h 기준 안전선)
@@ -94,7 +96,10 @@ def _prev_biz_day(d: date) -> date:
 
 def prune_portfolio_retention(keep: int = PORTFOLIO_RETENTION_DAYS) -> int:
     """etf_portfolio_daily 를 최근 `keep`개 snapshot_date(=영업일)만 FIFO 유지.
-    삭제 행수 반환. distinct 날짜가 keep 이하면 아무것도 안 지움(안전)."""
+    삭제 행수 반환. distinct 날짜가 keep 이하면 아무것도 안 지움(안전).
+    keep<=0 이면 영구보존 모드 — 아무것도 안 지우고 0 반환(이중 안전장치)."""
+    if keep <= 0:
+        return 0
     conn = get_conn()
     try:
         with conn:
@@ -126,12 +131,15 @@ def main():
         except Exception as e:
             print(f"⚠️ ETF snapshot {tag}({dt}) 단계 오류: {e}")
 
-    # 2-pass 후 FIFO 정리 — etf_portfolio_daily 최근 N영업일만 유지
-    try:
-        deleted = prune_portfolio_retention()
-        print(f"[ETF FIFO] etf_portfolio_daily 최근 {PORTFOLIO_RETENTION_DAYS}영업일 유지 — {deleted:,} 행 삭제")
-    except Exception as e:
-        print(f"⚠️ ETF FIFO prune 오류: {e}")
+    # 2-pass 후 보존 정책 적용 (PORTFOLIO_RETENTION_DAYS=0 이면 영구보존 → prune skip)
+    if PORTFOLIO_RETENTION_DAYS <= 0:
+        print("[ETF 보존] 영구보존 모드 — etf_portfolio_daily prune 비활성 (B1)")
+    else:
+        try:
+            deleted = prune_portfolio_retention()
+            print(f"[ETF FIFO] etf_portfolio_daily 최근 {PORTFOLIO_RETENTION_DAYS}영업일 유지 — {deleted:,} 행 삭제")
+        except Exception as e:
+            print(f"⚠️ ETF FIFO prune 오류: {e}")
 
 
 if __name__ == "__main__":
