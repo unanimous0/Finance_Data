@@ -304,17 +304,46 @@ def job_minute_bars_daily():
         _ls_backfill_resume(paused)
 
 
-def _verify_stockfut_loaded(today, result) -> tuple[bool, str]:
-    """주식선물 당일 적재 검증.
+def _purge_stockfut_day(day) -> int:
+    """LS 휴장일 fallback으로 오염된 하루치 30초봉을 삭제하고 삭제 행수 반환.
+
+    fallback 데이터는 직전 영업일의 완전 복제라 남겨두면
+    (a) 휴장일에 가짜 시세가 존재하고
+    (b) 다음 영업일 검증의 prev_biz 기준이 오염된 날을 가리키게 된다.
+    감지만 하고 두면 안 되므로 즉시 되돌린다 (2026-07-17 제헌절 사례).
+    """
+    from scripts.daily_update import get_conn
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM futures_ohlcv_intraday
+                WHERE interval_seconds = 30
+                  AND time >= %s::date::timestamp AT TIME ZONE 'Asia/Seoul'
+                  AND time <  (%s::date + 1)::timestamp AT TIME ZONE 'Asia/Seoul'
+            """, (day, day))
+            deleted = cur.rowcount
+        conn.commit()
+        return deleted
+    finally:
+        conn.close()
+
+
+def _verify_stockfut_loaded(today, result) -> tuple[bool, str, str]:
+    """주식선물 당일 적재 검증. (ok, 메시지, reason) 반환.
+
     1) actives 중 95% 이상의 contract가 DB에 30초봉 row를 가지는가
     2) 직전 영업일 데이터와 100% 동일하지 않은가 (LS t8406 휴장일 fallback 감지)
        — LS는 휴장일 query 시 직전 영업일 데이터를 반환하는 동작이 있음 (5/25 사례).
+
+    reason: ok / skipped / no_actives / insufficient / fallback_duplicate / error
+    호출부는 reason으로 "재시도해도 소용없는 실패"(fallback_duplicate)를 구분한다.
     """
     if not result or result.get("skipped"):
-        return False, f"skip={result}"
+        return False, f"skip={result}", "skipped"
     actives = result.get("actives", 0)
     if actives == 0:
-        return False, "actives=0"
+        return False, "actives=0", "no_actives"
     try:
         from scripts.daily_update import get_conn
         conn = get_conn()
@@ -362,13 +391,15 @@ def _verify_stockfut_loaded(today, result) -> tuple[bool, str]:
 
         threshold = max(1, int(actives * 0.95))
         if loaded < threshold:
-            return False, f"actives={actives}, loaded={loaded}, threshold={threshold}"
+            return False, f"actives={actives}, loaded={loaded}, threshold={threshold}", "insufficient"
         if duplicate_of_prev:
             return False, (f"actives={actives}, loaded={loaded}, 직전 영업일({prev_biz})과 "
-                           f"100% 동일 — LS 휴장일 fallback 의심")
-        return True, f"actives={actives}, loaded={loaded}, threshold={threshold}, prev_biz={prev_biz} OK"
+                           f"100% 동일 — LS 휴장일 fallback 의심"), "fallback_duplicate"
+        return (True,
+                f"actives={actives}, loaded={loaded}, threshold={threshold}, prev_biz={prev_biz} OK",
+                "ok")
     except Exception as e:
-        return False, f"verify error: {e}"
+        return False, f"verify error: {e}", "error"
 
 
 def job_stockfut_today():
@@ -413,6 +444,8 @@ def job_stockfut_today():
     last_result = None
     last_err = None
     verify_msg = ""
+    reason = ""
+    purged = None
     ok = False
     try:
         for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -425,10 +458,23 @@ def job_stockfut_today():
                 last_result = None
                 logger.error(f"[스케줄러] stockfut attempt {attempt} 예외: {e}")
 
-            ok, verify_msg = _verify_stockfut_loaded(today, last_result)
-            logger.info(f"[스케줄러] stockfut 검증: ok={ok}, {verify_msg}")
+            ok, verify_msg, reason = _verify_stockfut_loaded(today, last_result)
+            logger.info(f"[스케줄러] stockfut 검증: ok={ok}, reason={reason}, {verify_msg}")
             if ok:
                 break
+
+            # LS 휴장일 fallback = 직전 영업일 복제본이 적재된 상태.
+            # 재시도해도 같은 복제본만 다시 받으므로 즉시 되돌리고 중단한다.
+            if reason == "fallback_duplicate":
+                try:
+                    purged = _purge_stockfut_day(today)
+                    logger.warning(f"[스케줄러] stockfut fallback 감지 — {today} 30초봉 "
+                                   f"{purged:,}행 삭제 후 중단 (재시도 무의미)")
+                except Exception as e:
+                    purged = -1
+                    logger.error(f"[스케줄러] stockfut fallback 행 삭제 실패: {e}")
+                break
+
             if attempt < MAX_ATTEMPTS:
                 logger.warning(f"[스케줄러] stockfut 검증 실패 — {RETRY_WAIT_SEC}s 후 재시도")
                 _time.sleep(RETRY_WAIT_SEC)
@@ -446,6 +492,18 @@ def job_stockfut_today():
                   f"• 적재 행: {rows:,}행\n"
                   f"• 빈 응답: {empty}개\n"
                   f"• 에러: {errors}개")
+    elif reason == "fallback_duplicate":
+        status = "fail"
+        purge_str = (f"{purged:,}행 삭제 완료" if purged is not None and purged >= 0
+                     else "⛔ 삭제 실패 — 수동 확인 필요")
+        detail = (f"날짜: {today}\n"
+                  f"LS t8406이 직전 영업일 데이터를 그대로 반환 (휴장일 fallback)\n\n"
+                  f"⚠️ 검증 결과\n  {verify_msg}\n\n"
+                  f"조치\n"
+                  f"  • 오염 30초봉: {purge_str}\n"
+                  f"  • 재시도 중단 (같은 복제본만 재수신)\n\n"
+                  f"{today}가 휴장일이면 정상 동작 (krx_holidays 미등록 상태).\n"
+                  f"거래일이었다면 30초봉 영구 손실 — LS 응답 확인 필요.")
     else:
         status = "fail"
         # 실패 — 자세히 + ⚠️ 강조
