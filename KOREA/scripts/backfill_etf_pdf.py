@@ -156,10 +156,48 @@ def _conn():
     )
 
 
+def _ensure_conn(conn):
+    """살아있는 커넥션을 보장해 반환 (죽었거나 None이면 새로 연결).
+
+    이 백필은 한도 대기(최대 ~21h) / 안전윈도우 대기(최대 ~10h) 동안 커넥션을
+    그대로 붙들고 sleep 한다. 그 사이 서버 재시작·backend 종료로 커넥션이 끊기면
+    깨어난 직후 첫 write에서 죽는다 (2026-07-24 10:00 크래시, 70h 방치).
+    매 항목 직전 ping — 1 TPS라 왕복 1회 비용은 무시 가능."""
+    try:
+        if conn is not None and not conn.closed:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            conn.rollback()          # ping 트랜잭션 종료 (idle in transaction 방지)
+            return conn
+    except (psycopg2.OperationalError, psycopg2.InterfaceError):
+        pass
+    try:
+        if conn is not None:
+            conn.close()
+    except Exception:
+        pass
+    print("  [DB 재연결] 커넥션 끊김 감지 — 재연결", flush=True)
+    return _conn()
+
+
 def fetch_etfs(conn) -> list[tuple[str, str]]:
     with conn.cursor() as cur:
         cur.execute(DOMESTIC_ETF_SQL)
         return cur.fetchall()
+
+
+def fetch_listing_dates(conn, codes: list[str]) -> dict[str, date]:
+    """ETF별 상장일. 상장 전 날짜는 애초에 호출 대상에서 제외하기 위한 것.
+
+    상장 전 조회 시 PDF는 빈 응답이지만 **마스터 API는 날짜를 무시하고 현재 값을
+    반환**한다 → 상장일보다 앞선 snapshot_date로 가짜 마스터 행이 쌓인다
+    (발견 시점 1,719행/71종목). snapshot_date=실측 원칙 위반이라 원천 차단.
+    덤으로 100% 빈 응답이 확정인 콜(잔여의 8.2%)도 아낀다."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT stock_code, listing_date FROM stocks "
+            "WHERE stock_code = ANY(%s) AND listing_date IS NOT NULL", (codes,))
+        return dict(cur.fetchall())
 
 
 def fetch_biz_days(conn, start: date, end: date) -> list[date]:
@@ -298,17 +336,23 @@ def main():
 
         # 이미 적재된 (etf, date) 쌍 제외 (daily etf_snapshot 커버 구간 중복 호출 방지)
         existing = fetch_existing_pairs(conn, start, end)
+        listing = fetch_listing_dates(conn, [c for c, _ in etfs])
         full_total = len(etfs) * len(biz_days)
+        not_existing = [(d, etf_code, etf_name)
+                        for d in biz_days
+                        for etf_code, etf_name in etfs
+                        if (etf_code, d) not in existing]
         work_list = [(d, etf_code, etf_name)
-                     for d in biz_days
-                     for etf_code, etf_name in etfs
-                     if (etf_code, d) not in existing]
+                     for d, etf_code, etf_name in not_existing
+                     if not (etf_code in listing and d < listing[etf_code])]
         total = len(work_list)
-        skipped_existing = full_total - total
+        skipped_existing = full_total - len(not_existing)
+        skipped_prelist = len(not_existing) - total
 
         order = "desc (최신→옛)" if args.desc else "asc (옛→최신)"
         print(f"[ETF PDF 백필 {order}] {start}~{end} 거래일 {len(biz_days)}일 × ETF {len(etfs)}개")
-        print(f"  전체 {full_total:,} 중 이미 적재 {skipped_existing:,} 건 skip → 실제 호출 {total:,}")
+        print(f"  전체 {full_total:,} 중 이미 적재 {skipped_existing:,} 건 skip"
+              f" + 상장 전 {skipped_prelist:,} 건 skip → 실제 호출 {total:,}")
         print(f"  TPS 1 (60 RPM 기준) → 예상 ~{total/60:.0f}분 = ~{total/3600:.1f}시간")
 
         if args.dry_run:
@@ -332,20 +376,27 @@ def main():
             wait_out_snapshot_window()       # 08:25~09:45 회피 — 08:30 스냅샷(in-process) 보호 (--no-wait도 적용)
             maybe_pause_for_daily_update()   # daily_update/etf_snapshot 진행 중이면 PAUSE (방어적 이중 가드)
             fm = d in master_dates
-            try:
-                pdf_n, master_n, status = process_etf_day(client, conn, etf_code, d, fetch_master=fm)
-            except InfomaxDailyLimitError:
-                wait_until_midnight()
-                daily_calls = 1
-                pdf_n, master_n, status = process_etf_day(client, conn, etf_code, d, fetch_master=fm)
-            except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
-                print(f"  [DB 재연결] {type(e).__name__}: {e}", flush=True)
+            # 재시도 루프 — 각 시도 직전에 커넥션을 보장한다.
+            # (구버전은 한도 대기 후 재시도를 except 블록 *안*에서 했다. 같은 try의
+            #  sibling except는 다른 except 안의 예외를 못 잡으므로, 20h sleep 뒤
+            #  죽은 커넥션을 만나면 그대로 프로세스가 종료됐다 — 7/24 크래시 원인.)
+            pdf_n = master_n = 0
+            status = "err:RetryExhausted"
+            for attempt in range(1, 4):
+                conn = _ensure_conn(conn)
                 try:
-                    conn.close()
-                except Exception:
-                    pass
-                conn = _conn()
-                pdf_n, master_n, status = process_etf_day(client, conn, etf_code, d, fetch_master=fm)
+                    pdf_n, master_n, status = process_etf_day(client, conn, etf_code, d, fetch_master=fm)
+                    break
+                except InfomaxDailyLimitError:
+                    wait_until_midnight()
+                    daily_calls = 1
+                except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+                    print(f"  [DB 재연결] {type(e).__name__}: {e}", flush=True)
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    conn = None      # 다음 시도의 _ensure_conn이 새로 연결
             if status == "ok":
                 ok += 1
                 total_pdf += pdf_n
@@ -363,7 +414,11 @@ def main():
         elapsed = time.time() - t0
         print(f"\n[완료] 소요 {elapsed/60:.1f}분 / ok {ok} / 빈 {empty} / 에러 {err} / PDF {total_pdf:,} / 마스터 {total_master:,}")
     finally:
-        conn.close()
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

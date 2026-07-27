@@ -1,7 +1,25 @@
 # 📝 TODO - 작업 목록
 
-> **마지막 업데이트**: 2026-07-26
+> **마지막 업데이트**: 2026-07-28
 > **현재 Phase**: Phase 4 + Phase 5(배당) + KRX 휴장일 + KOSPI200/KOSDAQ150 SCD2 + ETF 일별 스냅샷 + 지수/지수선물/주식선물 일별 + **Phase 6 분봉**: 종목/ETF 30초봉 ✅ / 1분봉 1/2~4/24 ✅ + **Phase 7**: 지수/지수선물/주식선물 30초봉 + 분봉/일별 NEAR/NEXT 통합 view ✅ + **5/15-16 사고 대응** ✅ + **수정주가 시스템 (5/16-17) ✅** + **5/24 운영/문서 정비 ✅**
+
+---
+
+## 🆕 2026-07-28 — ETF PDF 백필 크래시(70h 방치) fix + 상장 전 마스터 행 정리
+
+### (1) 백필 크래시 — 긴 sleep 중 DB 커넥션 사망
+- **증상**: `backfill_etf_pdf.py`가 **2026-07-24 10:00에 크래시 후 70시간 방치**. 9,000/64,095(14.0%)에서 정지, 아무도 모름(백필은 알림 대상 아님)
+- **원인**: 한도 초과 → `wait_until_midnight()` ~20h sleep → 그 사이 커넥션 끊김 → 깨어나 재시도 시 `OperationalError`. **재시도가 `except InfomaxDailyLimitError:` 블록 *안*에 있어 형제 `except (OperationalError, InterfaceError)`가 못 잡음** → 프로세스 종료. (같은 try의 sibling except는 다른 except 안의 예외를 잡지 못함)
+- [x] **`_ensure_conn(conn)` 신설** — `SELECT 1` ping + 죽었으면 재연결, ping 후 `rollback()`(idle in transaction 방지). 1 TPS라 왕복 비용 무시 가능
+- [x] **재시도를 except 블록 밖 루프로 이동** — 매 시도 직전 `_ensure_conn` 호출(최대 3회). `finally: conn.close()`도 None 가드
+- [x] **검증**: `pg_terminate_backend`로 7/24 상황 재현 → 구버전 `OperationalError`로 사망, 신버전 재연결 후 정상
+
+### (2) 상장 전 마스터 행 — 인포맥스 마스터 API가 날짜를 무시
+- **증상**: `etf_master_daily`에 `snapshot_date < listing_date`인 행 **1,750건 / 71종목** (예: HANARO K휴머노이드테마TOP10 상장 2/26인데 1/2 행에 순자산 254억)
+- **원인**: 미상장 종목 조회 시 **PDF는 빈 응답이지만 마스터 API는 날짜 무시하고 현재 값 반환** → 백필이 요청 날짜로 stamp
+- [x] **`fetch_listing_dates()` 신설 + work_list에서 `d < listing_date` 페어 제외** — 신규 발생 원천 차단. 덤으로 100% 빈 응답 확정 콜 4,592건(잔여의 8.2%) 절감 → 15.6h→11.8h
+- [x] **기존 1,750행 삭제** (백업 후). 삭제 전 안전 검증 2종: ①71종목 전부 상장 후 행 보유(종목 소멸 없음 → LENS kr_name 룩업 안전) ②71종목 전부 상장 전 OHLCV 0건(listing_date 신뢰성 확인). PDF 오염은 0건, 의존 view 없음
+- **원칙**: `snapshot_date=실측` — 7/21 마스터 완결성 때 carry-forward를 거부한 것과 같은 기준
 
 ---
 
