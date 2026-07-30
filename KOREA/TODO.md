@@ -25,7 +25,9 @@
   - 지속형 장애 방어: 긴 대기는 **프로세스 전역 예산 900s**(`_conn_wait_left`, 클래스 lock)에서 차감, 소진 시 fail-fast. workers=4 × 3,900종목이 각자 6.4분 기다리면 배치가 며칠이 되는 문제 회피
   - 검증 4종: 계속 실패→5회 재시도 후 전파 / 3번째 성공→복구 / ReadTimeout→즉시 전파 / 예산0→즉시 포기
 - [ ] **DNS 이중화 (미착수)** — 근본 처방이나 `/etc/resolv.conf`·Tailscale DNS는 서버 전역 + LENS 영향 범위라 별도 판단
-- [ ] **`verify_scheduler_sync.sh` PID 오인 (미착수)** — 파이프라인 부모 PID를 잡아 실제 python PID(`pgrep -af daily_scheduler`)와 어긋남. "프로세스 죽은 줄" 오판 유발
+- [x] **`verify_scheduler_sync.sh` PID 오인 fix** — `pgrep -f`가 **명령줄에 문자열이 든 셸까지** 잡는 게 원인(파이프라인 부모가 아니었음). 재시작+검증을 한 줄에서 돌리면 래퍼 셸 cmdline에 `python schedulers/daily_scheduler.py …`가 통째로 들어가고, 셸이 python보다 먼저 떠 PID가 작으므로 `head -1`이 그걸 집어 시작 시각을 오판(실측: 스크립트 3853175 vs 진짜 3853260)
+  - `/proc/<pid>/cmdline` 파싱으로 교체 — **argv[0]에 python 포함 + 인자에 스크립트 경로**인 것만 인정. 자기 자신($$) 제외. 2개 이상이면 중복 가동 경고 후 가장 오래된 것(상주 데몬) 기준
+  - 검증: pgrep에 실제로 잡히는 미끼 셸(`bash -c '… python schedulers/daily_scheduler.py …'`)을 띄워 배제 확인 + 진짜 python 인식 확인
 
 ### 후속 (같은 날 오후) — 외인 부분 수집 발견 + B/C 조치
 - **증상**: 08:30 보충이 7/28 외인 2,645건은 완벽히 채웠는데 **7/29는 1,415건만** 채우고 "완료"로 끝남 (알림엔 `foreign: 4060`만)

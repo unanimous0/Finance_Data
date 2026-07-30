@@ -11,14 +11,52 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."   # 프로젝트 루트 (KOREA/)
 
-PID=$(pgrep -f "schedulers/daily_scheduler.py" | head -1 || true)
-if [ -z "${PID:-}" ]; then
+# ── scheduler 프로세스 찾기 ──────────────────────────────────────────────
+# `pgrep -f` 단독은 위험하다: 명령줄에 그 문자열이 들어간 **아무 프로세스나** 잡는다.
+# 특히 재시작+검증을 한 줄에서 돌리면 래퍼 셸의 cmdline에
+#   `python schedulers/daily_scheduler.py 2>&1 | tee ...`
+# 가 통째로 들어가 셸이 매칭되고, 셸이 python보다 먼저 떠서 PID가 작으므로
+# `head -1`이 그걸 집는다 → 시작 시각이 엉뚱해져 "죽었다/반영됐다"를 오판한다.
+# (2026-07-30 실제 오판: 스크립트는 PID 3853175를 봤지만 진짜 python은 3853260)
+# → argv[0]이 python이고, 인자에 스크립트 경로가 있는 프로세스만 인정한다.
+is_scheduler_proc() {
+  local p="$1" args argv0 a
+  [ -r "/proc/$p/cmdline" ] || return 1
+  mapfile -d '' -t args < "/proc/$p/cmdline" 2>/dev/null || return 1
+  argv0="${args[0]:-}"
+  case "$argv0" in *python*) ;; *) return 1 ;; esac
+  for a in "${args[@]:1}"; do
+    case "$a" in *schedulers/daily_scheduler.py) return 0 ;; esac
+  done
+  return 1
+}
+
+PIDS=()
+while IFS= read -r p; do
+  [ "$p" = "$$" ] && continue
+  is_scheduler_proc "$p" && PIDS+=("$p")
+done < <(pgrep -f "schedulers/daily_scheduler\.py" 2>/dev/null || true)
+
+if [ "${#PIDS[@]}" -eq 0 ]; then
   echo "⛔ daily_scheduler 프로세스 없음 — scheduler 미가동"
   exit 2
 fi
+if [ "${#PIDS[@]}" -gt 1 ]; then
+  echo "⚠️  daily_scheduler 프로세스가 ${#PIDS[@]}개 — 중복 가동 의심 (가장 오래된 것 기준으로 검사)"
+  for p in "${PIDS[@]}"; do
+    echo "     PID $p  시작=$(ps -o lstart= --pid "$p" 2>/dev/null | sed 's/^ *//')"
+  done
+fi
 
-# 프로세스 시작 epoch
-START_EPOCH=$(date -d "$(ps -o lstart= --pid "$PID")" +%s)
+# 여러 개면 가장 오래된 것 = 상주 데몬
+PID=""
+START_EPOCH=""
+for p in "${PIDS[@]}"; do
+  e=$(date -d "$(ps -o lstart= --pid "$p")" +%s)
+  if [ -z "$START_EPOCH" ] || [ "$e" -lt "$START_EPOCH" ]; then
+    START_EPOCH="$e"; PID="$p"
+  fi
+done
 START_HUMAN=$(date -d "@$START_EPOCH" '+%Y-%m-%d %H:%M:%S')
 echo "scheduler PID=$PID 시작=$START_HUMAN"
 echo "────────────────────────────────────────────"
