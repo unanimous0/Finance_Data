@@ -39,6 +39,20 @@ APP_SECRET = settings.LS_APP_SECRET
 REQ_DELAY = 1.05         # TPS 1 + 마진
 MAX_RETRY = 3
 RETRY_WAIT = 10.0        # LS 부하 케이스 retry 간격 (이전 5초는 너무 짧음)
+
+# ── 네트워크/DNS 계층 실패 전용 재시도 (MAX_RETRY/RETRY_WAIT와 별도 예산) ──
+# 배경: 2026-07-29 02:02 KST Tailscale MagicDNS(100.100.100.100) 플래핑으로
+#   openapi.ls-sec.co.kr 이름 해석이 ~1.5분간 실패 → daily_update가 죽어
+#   7/28 데이터가 통째로 결손됐다(익일 자동 복구됨). 기존 RequestException
+#   재시도는 3회 × 10s ≈ 30s라 분 단위 DNS 장애를 못 넘긴다.
+# ConnectionError는 "요청이 아직 나가지도 못한" 상태 = LS 서버는 무죄이므로
+#   길게 기다려 재시도하는 게 맞다. 5xx/429/timeout 정책은 건드리지 않는다.
+CONN_ERR_MAX_RETRY = 5
+CONN_ERR_WAITS = (15.0, 30.0, 60.0, 120.0, 180.0)   # 호출당 누적 최대 ~6.4분
+# 장애가 blip이 아니라 지속형일 때의 안전장치: 긴 대기는 프로세스 전체에서
+# 이 예산(초)만 쓴다. 소진되면 즉시 기존 짧은 retry 정책으로 fail-fast.
+# (workers=4 × 3,900종목이 각자 6.4분씩 기다리면 배치가 며칠이 된다)
+CONN_ERR_TOTAL_BUDGET_SEC = 900.0                   # 15분
 TOKEN_TTL = 23 * 3600    # 23h (다음날 07:00 KST 만료라 마진 1h)
 TOKEN_CALL_LIMIT = 5000  # 한 token 5000회 호출 후 자동 갱신 (LS token-level 한도 회피)
 
@@ -102,6 +116,10 @@ class LsApiClient:
     _token_expires  = 0.0      # epoch seconds
     _token_call_cnt = 0        # 토큰 사용 호출 카운트 (TOKEN_CALL_LIMIT 도달 시 갱신)
 
+    # 연결 실패(DNS/네트워크) 긴 재시도의 전역 대기 예산 (프로세스 단위)
+    _conn_budget_lock = threading.Lock()
+    _conn_wait_left   = CONN_ERR_TOTAL_BUDGET_SEC
+
     def __init__(self):
         # session은 매 호출마다 _new_session()으로 새로 생성 (CLOSE_WAIT 누적 방지)
         self.session = self._new_session()
@@ -123,6 +141,49 @@ class LsApiClient:
             pass
         self.session = self._new_session()
 
+    def _claim_conn_wait(self, seconds: float) -> bool:
+        """긴 연결-재시도 대기를 전역 예산에서 차감. 남았으면 True.
+        worker 스레드 여럿이 동시에 호출하므로 클래스 lock으로 보호."""
+        with LsApiClient._conn_budget_lock:
+            if LsApiClient._conn_wait_left < seconds:
+                return False
+            LsApiClient._conn_wait_left -= seconds
+            return True
+
+    def _post_resilient(self, url: str, *, hard_sec: int, timeout,
+                        headers: dict, json=None, data=None):
+        """session.post + **ConnectionError만** 긴 백오프로 재시도.
+
+        DNS/네트워크 계층 실패는 요청이 나가지도 못한 상태라 LS 서버 부하와
+        무관하다 → 짧은 retry로 포기하지 말고 분 단위로 기다린다.
+        (2026-07-29 DNS 플래핑 사고 대응. 상수 주석 참조)
+
+        - sleep은 hard_timeout 컨텍스트 **밖**에서 수행 (안에서 자면 즉사)
+        - _HardTimeout / 그 외 RequestException은 그대로 상위로 전파 →
+          기존 5xx/429/timeout 재시도 정책 그대로 유지
+        - 전역 예산 소진 시 즉시 raise → 지속형 장애에서 배치가 늘어지지 않음
+        """
+        last_err = None
+        for i in range(CONN_ERR_MAX_RETRY + 1):
+            try:
+                with hard_timeout(hard_sec):
+                    return self.session.post(url, json=json, data=data,
+                                             headers=headers, timeout=timeout)
+            except requests.ConnectionError as e:
+                last_err = e
+                if i >= CONN_ERR_MAX_RETRY:
+                    break
+                wait = CONN_ERR_WAITS[min(i, len(CONN_ERR_WAITS) - 1)]
+                if not self._claim_conn_wait(wait):
+                    print(f"    [연결 실패] 전역 대기 예산 소진 — 긴 재시도 중단 "
+                          f"(지속형 장애 의심)", flush=True)
+                    break
+                print(f"    [연결 실패] {type(e).__name__} — {wait:.0f}s 후 재시도 "
+                      f"({i + 1}/{CONN_ERR_MAX_RETRY})", flush=True)
+                time.sleep(wait)
+                self._refresh_session()   # 끊긴 소켓/스테일 커넥션 정리
+        raise last_err
+
     # ── 토큰 ──────────────────────────────────────────
     def _fetch_token(self) -> str:
         url = f"{BASE_URL}/oauth2/token"
@@ -133,8 +194,8 @@ class LsApiClient:
             "scope":      "oob",
         }
         headers = {"content-type": "application/x-www-form-urlencoded"}
-        with hard_timeout(15):
-            r = self.session.post(url, data=payload, headers=headers, timeout=(10, 30))
+        r = self._post_resilient(url, hard_sec=15, timeout=(10, 30),
+                                 headers=headers, data=payload)
         r.raise_for_status()
         data = r.json()
         if "access_token" not in data:
@@ -204,8 +265,8 @@ class LsApiClient:
             self._throttle()
             self._refresh_session()  # 매 호출마다 새 TCP — CLOSE_WAIT 누적 방지
             try:
-                with hard_timeout(10):  # OS-level kill switch (5xx 빠른 fail → retry로 다음 호출로)
-                    r = self.session.post(url, json=body, headers=headers, timeout=(5, 15))
+                r = self._post_resilient(url, hard_sec=10, timeout=(5, 15),
+                                         headers=headers, json=body)  # OS-level kill switch (5xx 빠른 fail → retry로 다음 호출로)
                 if r.status_code >= 500:
                     # 5xx 본문 로깅 + IGW00121(token invalid) 자동 처리
                     body_snippet = (r.text or "")[:200].replace("\n", " ")
@@ -288,8 +349,8 @@ class LsApiClient:
             self._throttle()
             self._refresh_session()
             try:
-                with hard_timeout(10):
-                    r = self.session.post(url, json=body, headers=headers, timeout=(5, 15))
+                r = self._post_resilient(url, hard_sec=10, timeout=(5, 15),
+                                         headers=headers, json=body)
                 if r.status_code == 401:
                     # 다른 프로세스가 토큰 발급해서 무효화된 케이스 — 재발급 후 retry
                     self._invalidate_token()
@@ -359,8 +420,8 @@ class LsApiClient:
             self._throttle()
             self._refresh_session()
             try:
-                with hard_timeout(10):
-                    r = self.session.post(url, json=body, headers=headers, timeout=(5, 15))
+                r = self._post_resilient(url, hard_sec=10, timeout=(5, 15),
+                                         headers=headers, json=body)
                 if r.status_code == 401:
                     self._invalidate_token()
                     if attempt < MAX_RETRY:
@@ -862,8 +923,8 @@ class _DeprecatedT8412:
             self._throttle()
             self._refresh_session()  # 매 호출마다 새 TCP — CLOSE_WAIT 누적 방지
             try:
-                with hard_timeout(10):  # OS-level kill switch (5xx 빠른 fail → retry로 다음 호출로)
-                    r = self.session.post(url, json=body, headers=headers, timeout=(5, 15))
+                r = self._post_resilient(url, hard_sec=10, timeout=(5, 15),
+                                         headers=headers, json=body)  # OS-level kill switch (5xx 빠른 fail → retry로 다음 호출로)
                 if r.status_code >= 500:
                     # 5xx 본문 로깅 + IGW00121(token invalid) 자동 처리
                     body_snippet = (r.text or "")[:200].replace("\n", " ")

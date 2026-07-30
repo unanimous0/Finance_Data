@@ -170,9 +170,21 @@ def job_daily_update():
     logger.info("="*60)
 
     # daily_update 본체 (외인 STEP skip — 08:30 종합 보충에서 수집)
+    #
+    # SystemExit도 반드시 잡는다: daily_update.main()은 실패 시 sys.exit(1)로 끝난다
+    # (CLI 계약상 정상). SystemExit은 Exception이 아니라 BaseException 상속이라
+    # `except Exception`으로는 안 잡히고, 그대로 APScheduler까지 올라가면 아래
+    # notify_job에 도달하지 못해 **실패 알림이 통째로 유실된다**.
+    # 2026-07-29 02:00 DNS 장애 때 실제로 무알림 실패 발생 (7/28 데이터 결손을
+    # 사용자가 하루 뒤 질문으로 알게 됨).
     main_status, main_err = "ok", None
     try:
         run_daily(collect_foreign=False)
+    except SystemExit as e:
+        if e.code not in (0, None):
+            main_status = "fail"
+            main_err = f"daily_update sys.exit({e.code}) — 상세는 reports/*_ERROR.txt"
+            logger.error(f"[스케줄러] daily_update 본체 실패: sys.exit({e.code})")
     except Exception as e:
         main_status, main_err = "fail", str(e)
         logger.error(f"[스케줄러] daily_update 본체 실패: {e}")
@@ -692,7 +704,21 @@ def on_job_executed(event):
 
 
 def on_job_error(event):
+    """잡에서 처리되지 않은 예외가 올라온 경우 — 최후 안전망.
+
+    각 job 함수는 자체적으로 예외를 잡아 notify_job을 호출하지만, 그 그물을
+    빠져나가는 경우(BaseException 계열, 알림 코드 자체의 버그 등)엔 여기까지 온다.
+    로그만 남기면 **조용한 실패**가 되므로 반드시 알림을 보낸다.
+    (2026-07-29 daily_update SystemExit 무알림 실패 재발 방지)"""
     logger.error(f"[스케줄러] 작업 오류: {event.job_id} → {event.exception}")
+    try:
+        started = getattr(event, "scheduled_run_time", None) or datetime.now(KST)
+        tb = (getattr(event, "traceback", "") or "")[-1200:]
+        notify_job(f"{event.job_id} (미처리 예외)", "fail", started,
+                   detail=(f"⚠️ 잡 내부 핸들러를 빠져나온 예외 — 데이터 결손 가능\n\n"
+                           f"{type(event.exception).__name__}: {event.exception}\n\n{tb}"))
+    except Exception as notify_err:
+        logger.error(f"[스케줄러] 작업 오류 알림 실패: {notify_err}")
 
 
 def startup_catchup():

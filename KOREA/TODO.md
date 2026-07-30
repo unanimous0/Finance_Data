@@ -1,7 +1,35 @@
 # 📝 TODO - 작업 목록
 
-> **마지막 업데이트**: 2026-07-28
+> **마지막 업데이트**: 2026-07-30
 > **현재 Phase**: Phase 4 + Phase 5(배당) + KRX 휴장일 + KOSPI200/KOSDAQ150 SCD2 + ETF 일별 스냅샷 + 지수/지수선물/주식선물 일별 + **Phase 6 분봉**: 종목/ETF 30초봉 ✅ / 1분봉 1/2~4/24 ✅ + **Phase 7**: 지수/지수선물/주식선물 30초봉 + 분봉/일별 NEAR/NEXT 통합 view ✅ + **5/15-16 사고 대응** ✅ + **수정주가 시스템 (5/16-17) ✅** + **5/24 운영/문서 정비 ✅**
+
+---
+
+## 🆕 2026-07-30 — DNS 플래핑으로 daily_update 사망 + 무알림 실패 3종 정리
+
+### 사고 경과 (2026-07-29 02:00)
+- **02:02~02:03 KST Tailscale MagicDNS(100.100.100.100) 플래핑** → `openapi.ls-sec.co.kr` 이름 해석 ~1.5분 실패
+  - `journalctl -u systemd-resolved`: `Using degraded feature set UDP instead of UDP+EDNS0` → `Flushed all caches` ×2
+  - `/etc/resolv.conf` = `nameserver 127.0.0.53` + `search tail5eb786.ts.net` → **DNS 경로가 Tailscale 단일**
+- LS t8451 호출이 `socket.gaierror [Errno -3]` → `daily_update.main()`이 `sys.exit(1)` → 7/28 데이터 통째 결손
+- **알림이 안 갔다**: `job_daily_update`의 핸들러가 `except Exception`인데 `SystemExit`은 `BaseException` 상속 → 미포착 → APScheduler까지 올라가 `on_job_error`가 **로그만** 남김. 사용자가 하루 뒤 질문으로 발견
+- 데이터는 익일 자동 복구됨(분봉 일배치 갭 채움 3,148,645행 = 2일치 + 08:30 종합 보충). **실제 손실 0**
+
+### 조치
+- [x] **`job_daily_update`가 `SystemExit` 포착** — `e.code not in (0, None)`이면 fail 처리 후 알림. `sys.exit(0)`은 정상 통과
+- [x] **`on_job_error`에 알림 추가** — 잡 자체 핸들러를 빠져나온 예외는 무엇이든 텔레그램으로. 최후 안전망(어떤 잡도 조용히 죽지 못하게)
+- [x] **LS 클라이언트 `ConnectionError` 전용 긴 재시도** (`collectors/ls_api.py`)
+  - `_post_resilient()` 신설 — 5회 × (15/30/60/120/180s) = 호출당 최대 ~6.4분. `session.post` 5개 호출부(토큰 발급 포함) 전부 경유
+  - **ConnectionError만** 대상. `_HardTimeout`/`ReadTimeout`/5xx/429는 기존 정책 그대로 전파 (요청이 나가지도 못한 실패 = LS 무죄라 길게 기다리는 게 맞음)
+  - `sleep`은 `hard_timeout` 컨텍스트 **밖**에서 (안에서 자면 alarm에 즉사)
+  - 지속형 장애 방어: 긴 대기는 **프로세스 전역 예산 900s**(`_conn_wait_left`, 클래스 lock)에서 차감, 소진 시 fail-fast. workers=4 × 3,900종목이 각자 6.4분 기다리면 배치가 며칠이 되는 문제 회피
+  - 검증 4종: 계속 실패→5회 재시도 후 전파 / 3번째 성공→복구 / ReadTimeout→즉시 전파 / 예산0→즉시 포기
+- [ ] **DNS 이중화 (미착수)** — 근본 처방이나 `/etc/resolv.conf`·Tailscale DNS는 서버 전역 + LENS 영향 범위라 별도 판단
+- [ ] **`verify_scheduler_sync.sh` PID 오인 (미착수)** — 파이프라인 부모 PID를 잡아 실제 python PID(`pgrep -af daily_scheduler`)와 어긋남. "프로세스 죽은 줄" 오판 유발
+
+### 참고 — 조사 중 헛짚은 것 (재발 방지)
+- **`tee` 파이프 통과 시 Python stdout이 블록 버퍼링** → 로그가 40분 멈춘 것처럼 보임. 살아있는지는 로그가 아니라 `/proc/<pid>/stat` CPU 증가 + `ss -tnp` 연결로 판정
+- **외인 수집 속도** = 종목당 1콜 × 60 RPM → 2,645종목 ≈ **44분**. 커밋이 500건 단위라 "500건/분"으로 오독 금지
 
 ---
 
