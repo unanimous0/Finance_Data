@@ -87,25 +87,36 @@ def wait_out_snapshot_window():
 
 
 def maybe_pause_for_daily_update():
-    """daily_update.py 또는 etf_snapshot.py 둘 중 하나라도 살아있으면 sleep.
-    둘 다 인포맥스 60 RPM 한도 점유 → 동시 호출 시 429/timeout 발생."""
+    """인포맥스 한도를 쓰는 스케줄러 잡이 도는 동안 sleep (60 RPM 경합 회피).
+
+    두 경로로 확인한다:
+      1) **잡 마커 파일** (`schedulers.job_state`) — 02:00 daily_update / 08:30 종합 보충은
+         스케줄러 안에서 in-process로 돌아 pgrep에 **절대 안 잡힌다**. 마커가 유일한 신호.
+      2) pgrep — 사용자가 손으로 `python scripts/daily_update.py` 등을 돌린 경우 대비.
+    마커는 PID를 포함해, 스케줄러가 비정상 종료해 마커가 남아도 stale로 무시된다
+    (백필이 영원히 멈추지 않음)."""
     import subprocess
+    from schedulers.job_state import active_job
     targets = ["scripts/daily_update.py", "scripts/etf_snapshot.py"]
     while True:
         busy = None
-        try:
-            for t in targets:
-                r = subprocess.run(
-                    ["pgrep", "-f", t],
-                    capture_output=True, text=True, timeout=5,
-                )
-                if r.returncode == 0:
-                    busy = t
-                    break
-            if busy is None:
-                return  # 모두 미실행 → 즉시 진행
-        except Exception:
-            return  # pgrep 실패 시 진행 (안전 측)
+        job = active_job()
+        if job:
+            busy = f"{job.get('job')} (pid={job.get('pid')}, since {job.get('started')})"
+        else:
+            try:
+                for t in targets:
+                    r = subprocess.run(
+                        ["pgrep", "-f", t],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    if r.returncode == 0:
+                        busy = t
+                        break
+            except Exception:
+                return  # pgrep 실패 시 진행 (안전 측)
+        if busy is None:
+            return  # 모두 미실행 → 즉시 진행
         now = datetime.now(KST)
         print(f"  [PAUSE] {busy} 진행 중 ({now:%H:%M}) — 60s 후 재확인", flush=True)
         time.sleep(60)

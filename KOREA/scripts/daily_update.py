@@ -1485,7 +1485,12 @@ def run_supplement_pipeline() -> dict:
     print("  🌐 아침 종합 누락 보충 (OHLCV/수급/외인)")
     print("=" * 70)
     conn = get_conn()
-    summary = {"days_processed": 0, "ohlcv": 0, "investor": 0, "foreign": 0, "target_days": 0}
+    # *_fail = 호출은 했는데 빈 응답이라 적재 못 한 종목 수 (per-day 집계).
+    # 적재 행수만 보고하면 "일부만 채워졌는데 완료로 보이는" 사고가 난다
+    # (2026-07-30: 7/29 외인이 2,645 중 1,415만 등록돼 1,230종목 누락됐는데
+    #  알림엔 'foreign: 4060'만 나가 사용자가 못 알아챔).
+    summary = {"days_processed": 0, "ohlcv": 0, "investor": 0, "foreign": 0,
+               "target_days": 0, "foreign_fail": 0, "foreign_fail_days": []}
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT MAX(time) FROM ohlcv_daily")
@@ -1543,12 +1548,17 @@ def run_supplement_pipeline() -> dict:
             o = r.get("ohlcv", {}).get("rows", 0)
             i = r.get("investor", {}).get("rows", 0)
             f = r.get("foreign", {}).get("rows", 0)
+            f_fail = r.get("foreign", {}).get("fail", 0)
             summary["ohlcv"] += o
             summary["investor"] += i
             summary["foreign"] += f
+            if f_fail:
+                summary["foreign_fail"] += f_fail
+                summary["foreign_fail_days"].append({"date": str(d), "fail": f_fail})
             if o or i or f:
                 summary["days_processed"] += 1
-            print(f"  {d}: OHLCV {o:,} / 수급 {i:,} / 외인 {f:,} 보충")
+            fail_str = f" / ⚠️ 외인 빈응답 {f_fail:,}종목" if f_fail else ""
+            print(f"  {d}: OHLCV {o:,} / 수급 {i:,} / 외인 {f:,} 보충{fail_str}")
         return summary
     finally:
         conn.close()

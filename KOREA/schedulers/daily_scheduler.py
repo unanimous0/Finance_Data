@@ -36,6 +36,7 @@ sys.path.insert(0, str(project_root))
 KST = ZoneInfo("Asia/Seoul")
 
 from schedulers.notifier import notify_job
+from schedulers.job_state import infomax_busy
 
 
 def _read_report_tail(report_path: Path, max_chars: int = 1500) -> str:
@@ -179,7 +180,9 @@ def job_daily_update():
     # 사용자가 하루 뒤 질문으로 알게 됨).
     main_status, main_err = "ok", None
     try:
-        run_daily(collect_foreign=False)
+        # 인포맥스(수급/지수·선물 등) 한도를 쓰는 구간 — 백필에 마커로 알림
+        with infomax_busy("daily_update 본체"):
+            run_daily(collect_foreign=False)
     except SystemExit as e:
         if e.code not in (0, None):
             main_status = "fail"
@@ -548,32 +551,44 @@ def job_etf_snapshot():
     status = "ok"
     parts = []
 
-    # 1) ETF 스냅샷
-    try:
-        etf_main()
-        logger.info(f"[스케줄러] ETF 스냅샷 완료: {datetime.now(KST)}")
-        parts.append("[ETF]\n" + _etf_snapshot_summary(started.date()))
-    except Exception as e:
-        logger.error(f"[스케줄러] ETF 스냅샷 실패: {e}")
-        status = "fail"
-        parts.append(f"[ETF] 에러: {e}")
+    # 이 잡 전체가 인포맥스 한도를 쓴다 → 마커로 외부 프로세스(백필)에 알림.
+    # in-process라 pgrep으로는 안 보이므로 파일 마커가 유일한 신호다.
+    with infomax_busy("아침 종합 보충 (ETF + 누락 보충)"):
+        # 1) ETF 스냅샷
+        try:
+            etf_main()
+            logger.info(f"[스케줄러] ETF 스냅샷 완료: {datetime.now(KST)}")
+            parts.append("[ETF]\n" + _etf_snapshot_summary(started.date()))
+        except Exception as e:
+            logger.error(f"[스케줄러] ETF 스냅샷 실패: {e}")
+            status = "fail"
+            parts.append(f"[ETF] 에러: {e}")
 
-    # 2) 종합 누락 보충 (OHLCV/수급/외인)
-    try:
-        sup = run_supplement_pipeline()
-        logger.info(f"[스케줄러] 종합 누락 보충 완료: {sup}")
-        if sup.get("target_days", 0) == 0:
-            parts.append("[누락 보충] 없음 (최신)")
-        else:
-            line = (f"[누락 보충] {sup['days_processed']}일\n"
-                    f"• OHLCV {sup['ohlcv']:,}개\n"
-                    f"• 수급 {sup['investor']:,}개\n"
-                    f"• 외인 {sup['foreign']:,}개")
-            parts.append(line)
-    except Exception as e:
-        logger.error(f"[스케줄러] 종합 누락 보충 실패: {e}")
-        status = "fail"
-        parts.append(f"[누락 보충] 에러: {e}")
+        # 2) 종합 누락 보충 (OHLCV/수급/외인)
+        try:
+            sup = run_supplement_pipeline()
+            logger.info(f"[스케줄러] 종합 누락 보충 완료: {sup}")
+            if sup.get("target_days", 0) == 0:
+                parts.append("[누락 보충] 없음 (최신)")
+            else:
+                line = (f"[누락 보충] {sup['days_processed']}일\n"
+                        f"• OHLCV {sup['ohlcv']:,}개\n"
+                        f"• 수급 {sup['investor']:,}개\n"
+                        f"• 외인 {sup['foreign']:,}개")
+                # 빈 응답으로 못 채운 종목이 있으면 반드시 노출.
+                # 적재 행수만 보면 "부분 수집인데 완료"로 읽힌다
+                # (2026-07-30: 7/29 외인 1,230종목 누락인데 'foreign: 4060'만 통보됨).
+                f_fail = sup.get("foreign_fail", 0)
+                if f_fail:
+                    days = ", ".join(f"{x['date']}:{x['fail']:,}"
+                                     for x in sup.get("foreign_fail_days", []))
+                    line += (f"\n⚠️ 외인 빈응답 {f_fail:,}종목 ({days})\n"
+                             f"   인포맥스 등록 지연 가능 — 다음 보충에서 재시도됨")
+                parts.append(line)
+        except Exception as e:
+            logger.error(f"[스케줄러] 종합 누락 보충 실패: {e}")
+            status = "fail"
+            parts.append(f"[누락 보충] 에러: {e}")
 
     notify_job("아침 종합 보충", status, started, detail="\n\n".join(parts))
 
