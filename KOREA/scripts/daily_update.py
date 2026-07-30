@@ -1314,6 +1314,114 @@ def run_index_components_pipeline(target_date: date) -> dict:
     return summary
 
 
+ADJ_LOOKBACK_DAYS = 15   # adj 미적재 행을 되짚어 채우는 범위 (일). 수집 지연/백필분 회수용
+
+
+def backfill_missing_adj(conn, start: date, end: date) -> dict:
+    """[start, end] 구간에서 adj_close가 NULL인 행을 'raw × 직전 factor'로 채운다.
+
+    LS 호출 0 — DB 안에서만 계산한다.
+
+    왜 필요한가 (2026-07-30 LENS 문의로 발견):
+      기존 STEP 1은 **target_date 하루만** 갱신했다. 그래서 나중에 백필·보충으로
+      들어온 행은 파이프라인이 다시 방문하지 않아 영원히 NULL로 남았다.
+        - 2026-06-02~09: ghost_delist 오비활성 → OHLCV 사후 백필 (205종목/1,008행)
+        - 2026-07-28   : DNS 장애로 02:00 daily_update 사망 → 08:30 보충으로 뒤늦게
+                         적재 → adj 미적용 (3,855종목 = 전 종목)
+      수집이 하루라도 밀리면 그날 adj가 통째로 비는 구조적 결함이었다.
+
+    부트스트랩 (COALESCE(..., 1.0)):
+      직전 factor가 아예 없는 종목(신규 상장 첫날)은 기존 로직에서 INNER JOIN에
+      걸리지 못해 **영구히 NULL에 갇혔다** — 둘째 날의 '직전'인 첫날도 NULL이라
+      연쇄적으로 계속 실패. 실측 83종목이 adj를 한 번도 받지 못한 상태였다.
+      수정주가 관례상 "이벤트 없음 = adj와 raw가 동일"이므로 1.0이 올바른 시작값이고,
+      이후 실제 이벤트는 STEP 2/3(gap>15% 감지 → LS 전체 history 재호출)이
+      history를 다시 써서 교정한다.
+
+    날짜 오름차순으로 하루씩 처리한다 — 앞 날짜에서 채운 factor가 뒷 날짜의
+    '직전 factor'가 되어야 하므로 순서가 의미를 갖는다.
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT DISTINCT time FROM ohlcv_daily
+            WHERE time BETWEEN %s AND %s AND adj_close IS NULL
+            ORDER BY time
+        """, (start, end))
+        days = [r[0] for r in cur.fetchall()]
+
+    filled_rows = 0
+    for d in days:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    WITH tgt AS (
+                        SELECT a.stock_code, a.time,
+                               COALESCE((
+                                   SELECT o.adj_factor FROM ohlcv_daily o
+                                   WHERE o.stock_code = a.stock_code
+                                     AND o.time < a.time
+                                     AND o.adj_factor IS NOT NULL
+                                   ORDER BY o.time DESC LIMIT 1
+                               ), 1.0) AS factor
+                        FROM ohlcv_daily a
+                        WHERE a.time = %s AND a.adj_close IS NULL
+                    )
+                    UPDATE ohlcv_daily a SET
+                      adj_open       = (a.open_price  * t.factor)::numeric(12,2),
+                      adj_high       = (a.high_price  * t.factor)::numeric(12,2),
+                      adj_low        = (a.low_price   * t.factor)::numeric(12,2),
+                      adj_close      = (a.close_price * t.factor)::numeric(12,2),
+                      adj_factor     = t.factor,
+                      adj_updated_at = NOW()
+                    FROM tgt t
+                    WHERE a.stock_code = t.stock_code AND a.time = t.time
+                """, (d,))
+                filled_rows += cur.rowcount
+    return {"days": len(days), "rows": filled_rows}
+
+
+def check_adj_completeness(conn, target_date: date) -> dict:
+    """adj_close 완결성 체크 (LENS 요청 — 조용히 비는 걸 막는다).
+
+    close_price는 있는데 adj_close가 NULL인 행을 센다. 정상은 0이어야 한다
+    (backfill_missing_adj가 부트스트랩 포함 전부 채우므로).
+    issue가 있으면 data_quality_checks에 영속화하고 호출부가 알림에 노출한다."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT COUNT(*), COUNT(DISTINCT stock_code)
+            FROM ohlcv_daily
+            WHERE time = %s AND close_price IS NOT NULL AND adj_close IS NULL
+        """, (target_date,))
+        rows, codes = cur.fetchone()
+
+        # 최근 구간에 남아있는 총 미적재 (지연 회수 여부까지 보여줌)
+        cur.execute("""
+            SELECT COUNT(*) FROM ohlcv_daily
+            WHERE time > %s - INTERVAL '%s days'
+              AND close_price IS NOT NULL AND adj_close IS NULL
+        """, (target_date, ADJ_LOOKBACK_DAYS))
+        recent_rows = cur.fetchone()[0]
+
+    result = {"target_date": str(target_date), "missing_rows": rows,
+              "missing_codes": codes, "recent_missing_rows": recent_rows}
+    if rows or recent_rows:
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO data_quality_checks
+                          (table_name, check_date, check_type, issue_count, details)
+                        VALUES ('ohlcv_daily', %s, 'adj_close_completeness', %s, %s)
+                    """, (target_date, rows, psycopg2.extras.Json(result)))
+        except Exception as e:
+            print(f"  ⚠️ [완결성] data_quality_checks 기록 실패: {e}")
+        print(f"  ⚠️  [완결성] adj_close 미적재 — 당일 {rows:,}행 / {codes:,}종목, "
+              f"최근 {ADJ_LOOKBACK_DAYS}일 누적 {recent_rows:,}행")
+    else:
+        print(f"  ✅ [완결성] adj_close 미적재 0")
+    return result
+
+
 def run_adjusted_price_pipeline(target_date: date) -> dict:
     """일봉 수정주가(adj_*) 적재 + corporate action 감지.
 
@@ -1330,29 +1438,15 @@ def run_adjusted_price_pipeline(target_date: date) -> dict:
     print("=" * 70)
     conn = get_conn()
     try:
-        # STEP 1: 평상시 — adj_close = raw * 이전일 factor (LS 호출 0)
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    UPDATE ohlcv_daily a SET
-                      adj_open       = (a.open_price  * COALESCE(p.adj_factor, 1.0))::numeric(12,2),
-                      adj_high       = (a.high_price  * COALESCE(p.adj_factor, 1.0))::numeric(12,2),
-                      adj_low        = (a.low_price   * COALESCE(p.adj_factor, 1.0))::numeric(12,2),
-                      adj_close      = (a.close_price * COALESCE(p.adj_factor, 1.0))::numeric(12,2),
-                      adj_factor     = COALESCE(p.adj_factor, 1.0),
-                      adj_updated_at = NOW()
-                    FROM (
-                        SELECT DISTINCT ON (stock_code) stock_code, adj_factor
-                        FROM ohlcv_daily
-                        WHERE time < %s AND adj_factor IS NOT NULL
-                        ORDER BY stock_code, time DESC
-                    ) p
-                    WHERE a.time = %s
-                      AND a.stock_code = p.stock_code
-                      AND a.adj_close IS NULL
-                """, (target_date, target_date))
-                inserted = cur.rowcount
-        print(f"  [STEP 1] adj_* 적재 (raw × prev factor): {inserted:,} 종목")
+        # STEP 1: 평상시 — adj_close = raw * 직전 factor (LS 호출 0)
+        # target_date 하루가 아니라 최근 ADJ_LOOKBACK_DAYS일을 훑는다:
+        # 수집이 밀려 뒤늦게 적재된 행(백필/보충분)도 함께 회수하기 위함.
+        # 직전 factor가 없는 신규 상장은 1.0으로 부트스트랩 (backfill_missing_adj 참조).
+        lookback_start = target_date - timedelta(days=ADJ_LOOKBACK_DAYS)
+        bf = backfill_missing_adj(conn, lookback_start, target_date)
+        inserted = bf["rows"]
+        print(f"  [STEP 1] adj_* 적재 (raw × 직전 factor): {inserted:,} 행 / {bf['days']} 일자"
+              f" (범위 {lookback_start} ~ {target_date})")
 
         # STEP 2: gap > 15% 의심 종목 추출 (전일 close vs 당일 open)
         with conn.cursor() as cur:
@@ -1378,7 +1472,9 @@ def run_adjusted_price_pipeline(target_date: date) -> dict:
 
         if not suspects:
             print("  ✅ 이벤트 0 — LS 호출 없이 완료")
-            return {"updated": inserted, "suspects": 0, "ls_calls": 0}
+            comp = check_adj_completeness(conn, target_date)
+            return {"updated": inserted, "suspects": 0, "ls_calls": 0,
+                    "completeness": comp}
 
         # STEP 3: 의심 종목 sujung=Y 전체 history 재호출 + UPDATE
         from collectors.ls_api import LsApiClient
@@ -1459,8 +1555,10 @@ def run_adjusted_price_pipeline(target_date: date) -> dict:
                     n_intraday = cur.rowcount
             print(f"  [STEP 4] corporate_actions UPSERT: {n_corp} / 분봉 adj_factor UPDATE: {n_intraday:,}")
 
+        comp = check_adj_completeness(conn, target_date)
         return {"updated": inserted, "suspects": len(suspects),
-                "ls_calls": ls_calls, "full_updates": full_updates}
+                "ls_calls": ls_calls, "full_updates": full_updates,
+                "completeness": comp}
     finally:
         conn.close()
 

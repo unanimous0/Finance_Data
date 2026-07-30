@@ -5,6 +5,44 @@
 
 ---
 
+## 🆕 2026-07-30 — LENS 문의: ohlcv_daily.adj_close 대량 결측 (원인 3종 + 전면 수정)
+
+LENS 통계차익 엔진 왜곡 추적 중 발견. 최근 3년 2,553,933행 중 604,971행(23.7%) NULL.
+
+### NULL 구조 (조사 결과)
+| 구분 | NULL 행 | 종목 | 원인 |
+|---|---|---|---|
+| A. 2024-04-22 이전 | 1,689,043 | 3,264 | **LS t8451 500봉 상한** |
+| B. 2026-06-02~09 | 1,008 | 205 | ghost_delist 사후 백필분 |
+| C. **2026-07-28** | 3,855 | 3,855 | DNS 사고 → 파이프라인 미실행 |
+| D. 상시 | 27,193 | 177 | **부트스트랩 트랩** |
+
+### 원인 1 — LS t8451 500봉 상한 (A)
+- `2024-04-23 ~ 2026-05-16 = 정확히 500 거래일`, adj 채워진 행 종목당 평균 508행. 2026-05-16 백필이 4년치를 요청했으나 LS가 최근 500봉만 반환
+- **cts_date 페이징은 동작하지 않는다**: 응답 `cts_date='20240705'`를 정상 반환하지만 그 값으로 재호출하면 **1회차와 완전히 동일한 500봉**이 다시 온다(실측). 기존 루프는 `nd in seen_cts`로 탈출 → 500봉이 상한
+- [x] **`get_daily_bars` 페이징을 edate 스텝 방식으로 교체** — `edate = 직전 청크 최오래된날 - 1일`. 검증: 005930/069500 모두 **1,117봉(2022-01-03~2026-07-29)** 확보, 1일 조회 회귀 정상(1봉). MAX_CHUNKS=40 + 진전없음 탈출로 무한루프 방지
+
+### 원인 2 — 파이프라인이 target_date 하루만 처리 (B, C)
+- `run_adjusted_price_pipeline` STEP 1이 `WHERE a.time = target_date`만 갱신 → **나중에 백필·보충으로 들어온 행은 영영 NULL**. 수집이 하루라도 밀리면 그날 adj가 통째로 빔(구조적)
+- [x] **`backfill_missing_adj(conn, start, end)` 신설** — 구간 내 NULL 행을 날짜 오름차순으로 하루씩 `raw × 직전 factor` 적용. STEP 1이 이걸 최근 `ADJ_LOOKBACK_DAYS=15`일에 대해 호출하도록 교체
+
+### 원인 3 — 부트스트랩 트랩 (D)
+- 기존 STEP 1은 INNER JOIN이라 **직전에 factor가 있는 종목만** 갱신. 신규 상장은 첫날 직전 행이 없어 NULL → 둘째 날의 '직전'인 첫날도 NULL → **영구히 갇힘**. 실측 83종목이 adj를 한 번도 못 받음
+- [x] **`COALESCE(prior_factor, 1.0)`으로 부트스트랩** — 수정주가 관례상 "이벤트 없음 = adj와 raw 동일". 실제 이벤트는 STEP 2/3(gap>15% → LS 전체 history 재호출)이 교정
+- 검증: 6/2~6/9 복구 시 **59종목 288행이 1.0이 아닌 실제 factor를 승계** → 부트스트랩이 실제 값을 덮어쓰지 않음 확인
+
+### Q4 — 완결성 체크 (LENS 요청)
+- [x] **`check_adj_completeness(conn, target_date)`** — `close_price`는 있는데 `adj_close`가 NULL인 행 집계. 당일 + 최근 15일 누적. issue 시 `data_quality_checks(table_name='ohlcv_daily', check_type='adj_close_completeness')` 영속화. `run_adjusted_price_pipeline` 반환값에 `completeness` 포함
+- 이번 7/28 건은 이 체크가 있었으면 다음 날 아침에 잡혔다
+
+### 실행
+- 복구(SQL, LS 호출 0): tmux `adj_repair`, `scripts/_adj_repair_run.py 20240423 20260729`. 멱등 — 일자별 커밋이라 중단/재실행 안전
+- 과거 백필(LS): tmux `adj_backfill`, `backfill_adjusted_daily.py --from 20220103 --to 20240422`. 종목당 4콜(raw/adj × 2청크)
+- **주의**: `fetch_scope`가 `is_active=TRUE`만 → A구분 3,264종목 중 **비활성 46종목은 백필 범위 밖**. 필요 시 `--codes`로 별도 처리
+- **확인 필요**: 복구가 쓴 부트스트랩 1.0과 과거 백필이 쓴 LS 실제 factor의 경계 정합성 (양쪽 완료 후 factor 불연속 점검)
+
+---
+
 ## 🆕 2026-07-30 — DNS 플래핑으로 daily_update 사망 + 무알림 실패 3종 정리
 
 ### 사고 경과 (2026-07-29 02:00)

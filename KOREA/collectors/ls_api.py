@@ -565,14 +565,23 @@ class LsApiClient:
         sdate_s = sdate.strftime("%Y%m%d") if sdate else ""
         edate_s = edate.strftime("%Y%m%d") if edate else "99999999"
         all_bars: list[dict] = []
-        cts_date = ""
-        seen_cts: set[str] = set()
 
-        while True:
+        # ── 페이징: edate를 뒤로 물리는 방식 ────────────────────────────────
+        # t8451의 서버측 연속조회(cts_date)는 **동작하지 않는다**. 응답 cts_date는
+        # 정상적으로 내려오지만, 그 값을 넣어 재호출하면 1회차와 완전히 동일한
+        # 500봉이 다시 온다 (2026-07-30 실측: 005930, cts_date='20240705' →
+        # 2회차도 20240708~20260729 그대로).
+        # 그 결과 한 호출당 최근 ~500봉이 상한이 되어, 2026-05-16 수정주가 백필이
+        # 2024-04-23까지만 채워지고 그 이전이 통째로 NULL로 남았다 (1,689,043행).
+        # → edate를 "직전 청크의 가장 오래된 날 - 1일"로 물려 재호출하면 정상적으로
+        #   더 과거가 온다. 청크 간 중복/누락 없음(경계가 하루 단위로 이어짐).
+        MAX_CHUNKS = 40            # 무한루프 방지 (500봉 × 40 = 20년치)
+        cur_edate = edate_s
+        for _ in range(MAX_CHUNKS):
             in_block = {
                 "shcode": shcode, "gubun": "2", "qrycnt": 2000,
-                "sdate": sdate_s, "edate": edate_s,
-                "cts_date": cts_date, "comp_yn": "N",
+                "sdate": sdate_s, "edate": cur_edate,
+                "cts_date": "", "comp_yn": "N",
                 "sujung": sujung, "exchgubun": exchgubun,
             }
             data = self._post_generic("t8451", url, "t8451InBlock", in_block)
@@ -582,14 +591,14 @@ class LsApiClient:
             if not bars:
                 break
             all_bars.extend(bars)
-            out = data.get("t8451OutBlock", {}) or {}
-            nd = (out.get("cts_date", "") or "").strip()
-            if not nd or nd in seen_cts:
-                break
-            seen_cts.add(nd)
-            cts_date = nd
-            if sdate_s and nd <= sdate_s:
-                break
+            oldest = min(str(b["date"]) for b in bars if b.get("date"))
+            if not sdate_s or oldest <= sdate_s:
+                break              # 요청 시작일까지 도달
+            nxt = (datetime.strptime(oldest, "%Y%m%d")
+                   - timedelta(days=1)).strftime("%Y%m%d")
+            if nxt >= cur_edate:
+                break              # 진전 없음 (서버가 같은 구간 반복) — 안전 탈출
+            cur_edate = nxt
 
         # dedup by date, sort ascending
         dedup = {b["date"]: b for b in all_bars if b.get("date")}
