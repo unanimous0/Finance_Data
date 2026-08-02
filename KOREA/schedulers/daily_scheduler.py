@@ -718,6 +718,21 @@ def on_job_executed(event):
                 f"(실행시각: {event.scheduled_run_time})")
 
 
+def job_daily_digest():
+    """매일 11:30 KST — 최근 24h 잡 결과를 한 통으로 요약 전송.
+
+    알림 정책(3단계)상 깨끗한 성공은 즉시 알림을 보내지 않는다. 이 요약이
+    유일한 생존 신호이므로 이상이 없어도 매일 보낸다 — 요약이 안 오는 것
+    자체가 이상 신호가 되게 하려는 의도."""
+    from schedulers.notifier import send_daily_digest
+    logger.info("[스케줄러] 일일 요약 전송")
+    try:
+        ok = send_daily_digest(hours=24)
+        logger.info(f"[스케줄러] 일일 요약 전송 결과: {ok}")
+    except Exception as e:
+        logger.error(f"[스케줄러] 일일 요약 실패: {e}")
+
+
 def on_job_error(event):
     """잡에서 처리되지 않은 예외가 올라온 경우 — 최후 안전망.
 
@@ -905,6 +920,20 @@ def main():
         trigger=CronTrigger(day_of_week="sun", hour=3, minute=30, timezone=KST),
         id="update_listed_shares",
         name="상장주식수 갱신 (LS t1102)",
+        misfire_grace_time=3600,
+        coalesce=True,
+        max_instances=1,
+    )
+
+    # 잡 7: 매일 11:30 KST — 일일 요약 (최근 24h 잡 결과 한 통)
+    # 깨끗한 성공은 즉시 알림이 없으므로 이게 유일한 '살아있음' 신호다.
+    # 11:30인 이유: 08:30 아침 종합 보충이 늦으면 10:50까지 가므로(실측) 여유를 둔다.
+    # 24h 창이라 전날 23:30 stockfut / 02:00 daily_update / 03:00~04:00 주간·분기 잡까지 포함.
+    scheduler.add_job(
+        job_daily_digest,
+        trigger=CronTrigger(hour=11, minute=30, timezone=KST),
+        id="daily_digest",
+        name="일일 요약 알림 (최근 24h)",
         misfire_grace_time=3600,
         coalesce=True,
         max_instances=1,
