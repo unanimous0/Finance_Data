@@ -1380,6 +1380,69 @@ def backfill_missing_adj(conn, start: date, end: date) -> dict:
     return {"days": len(days), "rows": filled_rows}
 
 
+MKTCAP_LOOKBACK_DAYS = 15   # market_cap 미생성분을 되짚어 채우는 범위 (일)
+
+
+def backfill_missing_market_cap(conn, start: date, end: date) -> dict:
+    """[start, end] 구간에서 ohlcv는 있는데 market_cap이 없는 행을 채운다 (외부 호출 0).
+
+    market_cap = close_price × floating_shares.total_shares 인데, 상장주식수는
+    **주 1회(일요일 03:30)** 갱신이다. 그래서 신규 상장 종목은 상장 직후 최대
+    ~4거래일간 total_shares가 없어 market_cap이 만들어지지 않고, 수집 파이프라인이
+    지나간 날짜를 다시 방문하지 않아 **영구 결손**이 된다.
+    (2026-08-03 점검: 최근 1년 217행 / 63종목. 예 — 7/28 상장 ETF 6종의 7/28~7/31)
+
+    adj_close 결측과 정확히 같은 구조라 해법도 같다: 나중에 total_shares가 생기면
+    그때 소급해 계산한다.
+
+    주식수 선택: **해당일 이전 base_date 중 가장 가까운 값**, 없으면 **이후 중 가장
+    가까운 값**으로 폴백한다. 누락 구간은 예외 없이 '상장일 ~ 첫 주간 스냅샷' 사이라
+    이전 값이 존재할 수 없어서(실측: 모든 누락 종목의 gap이 첫 base_date 직전),
+    엄격한 시점 조회만 쓰면 영원히 못 채운다.
+    폴백이 근사이긴 하나 **기존 수집 경로가 이미 시점 무관하게 최신 total_shares를
+    쓰고 있어**(`DISTINCT ON (stock_code) ORDER BY base_date DESC`) 오히려 이쪽이
+    기존 의미론과 일치한다 — market_cap은 애초에 주 1회 갱신값에 기대는 파생값이다."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT DISTINCT o.time
+            FROM ohlcv_daily o
+            LEFT JOIN market_cap_daily m
+                   ON m.stock_code = o.stock_code AND m.time = o.time
+            WHERE o.time BETWEEN %s AND %s AND m.stock_code IS NULL
+              AND o.close_price IS NOT NULL
+            ORDER BY o.time
+        """, (start, end))
+        days = [r[0] for r in cur.fetchall()]
+
+    filled = 0
+    for d in days:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO market_cap_daily (time, stock_code, market_cap)
+                    SELECT o.time, o.stock_code,
+                           (o.close_price::bigint * f.total_shares)
+                    FROM ohlcv_daily o
+                    LEFT JOIN market_cap_daily m
+                           ON m.stock_code = o.stock_code AND m.time = o.time
+                    CROSS JOIN LATERAL (
+                        SELECT total_shares FROM floating_shares fs
+                        WHERE fs.stock_code = o.stock_code
+                          AND fs.total_shares IS NOT NULL
+                        -- 해당일 이전 값 우선, 그중 가장 가까운 것.
+                        -- 이전 값이 없으면(신규 상장) 이후 중 가장 가까운 값으로 폴백.
+                        ORDER BY (fs.base_date <= o.time) DESC,
+                                 ABS(fs.base_date - o.time)
+                        LIMIT 1
+                    ) f
+                    WHERE o.time = %s AND m.stock_code IS NULL
+                      AND o.close_price IS NOT NULL
+                    ON CONFLICT (time, stock_code) DO NOTHING
+                """, (d,))
+                filled += cur.rowcount
+    return {"days": len(days), "rows": filled}
+
+
 def check_adj_completeness(conn, target_date: date) -> dict:
     """adj_close 완결성 체크 (LENS 요청 — 조용히 비는 걸 막는다).
 
@@ -2775,6 +2838,20 @@ def main(target_date: date = None, missing_only: bool = False,
             run_adjusted_price_pipeline(result["end_date"])
         except Exception as adj_err:
             print(f"\n⚠️  수정주가 단계 오류 (업데이트 결과에는 영향 없음): {adj_err}")
+
+        # 신규 상장 등으로 빠진 market_cap 소급 생성 (DB 내부 계산, 외부 호출 0)
+        try:
+            _c = get_conn()
+            try:
+                _end = result["end_date"]
+                mc = backfill_missing_market_cap(
+                    _c, _end - timedelta(days=MKTCAP_LOOKBACK_DAYS), _end)
+                if mc["rows"]:
+                    print(f"\n  📊 market_cap 소급 생성: {mc['rows']:,}건 / {mc['days']}일자")
+            finally:
+                _c.close()
+        except Exception as mc_err:
+            print(f"\n⚠️  market_cap 소급 단계 오류 (업데이트 결과에는 영향 없음): {mc_err}")
 
         # 분봉 일배치는 04:00 KST 별도 cron (job_minute_bars_daily)으로 분리됨
         # 주식선물 30초봉은 22:30 KST 별도 cron (job_stockfut_today, t8406 당일만)으로 분리됨

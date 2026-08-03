@@ -29,10 +29,19 @@
 - `data_quality_checks`: intraday_completeness 0 / master_completeness 0 / **adj_close_completeness 기록 없음**(= 문제 0, 신규 체크가 조용히 통과 중)
 - adj_close NULL 16,700행 = 상폐 44종목 (LS 미제공, 복구 불가 — 기지의 한계)
 
-### ⚠️ 미결 2건 (사소·기존 문제, 이번 변경과 무관)
-1. **`etf_master_daily`에 비거래일 행** — 주말/휴장일에도 마스터 행이 생성됨 (**17,552행 / 27일자 / 2026-05-16~08-02**). PDF는 주말에 정상적으로 비는데 마스터만 생긴다. 원인은 기지의 "**인포맥스 마스터 API가 날짜를 무시하고 현재 값 반환**"(2026-07-28 상장 전 행 건과 동일). `snapshot_date=실측` 원칙 위반이고, 사실상 직전 영업일 값의 재stamp. LENS의 kr_name 룩업엔 무해하나 creation_unit/listed_shares 시계열엔 중복
-2. **신규 상장 종목 market_cap 영구 누락** — 최근 1년 **217행 / 63종목**. `market_cap = close × floating_shares.total_shares`인데 상장주식수는 **주 1회(일 03:30)** 갱신이라, 신규 상장 후 최대 ~4거래일간 total_shares가 없어 market_cap 미생성. 이후 지나간 날짜는 재방문하지 않아 영구 결손 (예: 0214M0 등 6종, 7/28~7/31). **adj_close와 정확히 같은 구조** — "늦게 들어온 데이터를 파이프라인이 다시 방문하지 않음"
-   - 해결책도 동일: 최근 N일 중 market_cap 없는 (종목,일자)를 재계산하는 회수 로직
+### 미결 2건 → 2026-08-04 둘 다 해결
+
+**1. `etf_master_daily` 비거래일 행 (17,552행 / 27일자 / 2026-05-16~08-02)**
+- 주말·휴장일에도 마스터 행이 생성됨. PDF는 정상적으로 비는데 마스터만 생긴다. 원인은 기지의 "**인포맥스 마스터 API가 날짜를 무시하고 현재 값 반환**"(2026-07-28 상장 전 행 건과 같은 뿌리). `snapshot_date=실측` 위반이고 사실상 직전 영업일 값의 재stamp
+- [x] **기존 17,552행 삭제** (백업 후). 안전 검증: 대상 691개 ETF **전부** 거래일 마스터 행 보유 → 종목 소멸 없음(LENS kr_name 룩업 안전). 삭제 후 87,332행 / 691종목 / 최신 2026-08-03(월)
+- [x] **재발 차단**: `etf_snapshot.main()`이 today/yesterday 각각에 `is_market_closed()` 검사 후 비거래일이면 skip. 기존엔 오늘 날짜를 **검사 없이** 처리했다
+
+**2. 신규 상장 종목 market_cap 영구 누락 (최근 1년 217행 / 63종목)**
+- `market_cap = close × floating_shares.total_shares`인데 상장주식수는 **주 1회(일 03:30)** 갱신 → 신규 상장 후 첫 주간 스냅샷까지 total_shares가 없어 미생성. 파이프라인이 지나간 날짜를 재방문하지 않아 영구 결손. **adj_close와 정확히 같은 구조**
+- [x] **`backfill_missing_market_cap(conn, start, end)` 신설** + `main()`에서 최근 `MKTCAP_LOOKBACK_DAYS=15`일 회수. DB 내부 계산이라 외부 호출 0
+- [x] **소급 실행**: 42일자 / **217행 회수 → 최근 1년 누락 0**
+- **주식수 선택 로직 정정**: 처음엔 `base_date <= 해당일`로 엄격히 짰는데 **회수 0건**이었다. 누락 구간이 예외 없이 '상장일 ~ 첫 주간 스냅샷' 사이라 이전 값이 존재할 수 없기 때문(실측: 모든 누락 종목의 gap이 첫 base_date 직전). → 이전 값 우선, 없으면 **이후 중 가장 가까운 값 폴백**으로 변경.
+  근사이긴 하나 **기존 수집 경로가 이미 시점 무관하게 최신 total_shares를 쓰고 있어**(`DISTINCT ON (stock_code) ORDER BY base_date DESC`) 오히려 이쪽이 기존 의미론과 일치한다 — market_cap은 애초에 주 1회 갱신값에 기대는 파생값
 
 ---
 

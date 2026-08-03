@@ -125,7 +125,25 @@ def main():
     yesterday = _prev_biz_day(today_kst)
     print(f"[ETF snapshot 08:30] today={today_kst}, yesterday={yesterday}")
 
-    for tag, dt in [("today", today_kst), ("yesterday", yesterday)]:
+    # 비거래일(주말·공휴일)은 skip.
+    # PDF는 비거래일에 빈 응답이라 원래 안 쌓이지만, **마스터 API는 날짜를 무시하고
+    # 현재 값을 반환**해서 토/일 날짜로 마스터 행이 그대로 생성돼 왔다
+    # (2026-08-03 점검: 17,552행 / 27일자 / 2026-05-16~08-02).
+    # snapshot_date=실측 원칙 위반이고 사실상 직전 영업일 값의 재stamp라 원천 차단한다.
+    # 상장 전 마스터 행(2026-07-28 건)과 같은 뿌리의 문제.
+    from scripts.daily_update import is_market_closed
+    conn = get_conn()
+    try:
+        targets = []
+        for tag, dt in [("today", today_kst), ("yesterday", yesterday)]:
+            if is_market_closed(conn, dt):
+                print(f"[ETF snapshot] {tag}({dt}) 비거래일 — skip")
+                continue
+            targets.append((tag, dt))
+    finally:
+        conn.close()
+
+    for tag, dt in targets:
         try:
             run_etf_daily_snapshot_pipeline(dt)
         except Exception as e:
