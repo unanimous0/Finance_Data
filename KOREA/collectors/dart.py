@@ -43,6 +43,63 @@ RETRY_WAIT = 5.0
 TIMEOUT    = 30
 
 
+# DART status 코드 중 **호출자가 계속 진행하면 안 되는** 것들.
+# 013(데이터 없음)·014(파일 없음)·100(필드 부적절)은 정상 흐름의 일부라 제외 —
+# 여기 든 것은 키·권한·한도·시스템 문제라 재시도해도 같은 결과이고, 조용히 넘기면
+# "0건 수집"으로 위장돼 장애가 묻힌다.
+_RAISE_STATUSES = {
+    "010": "등록되지 않은 인증키",
+    "011": "사용할 수 없는 인증키 (활동중지/폐기)",
+    "012": "접근할 수 없는 IP",
+    "020": "요청 제한 초과 (일일 한도)",
+    "021": "조회 가능한 회사 개수 초과",
+    "101": "부적절한 접근",
+    "800": "DART 시스템 점검 중",
+    "900": "정의되지 않은 오류",
+    "901": "사용자 계정의 개인정보 보유기간 만료 — opendart.fss.or.kr에서 재동의/키 재발급 필요",
+}
+
+
+class DartApiError(RuntimeError):
+    """DART가 명시적 오류 status를 반환. `.status`로 코드 분기 가능."""
+
+    def __init__(self, status: str, message: str = "", endpoint: str = ""):
+        self.status = status
+        self.dart_message = (message or "").strip()
+        hint = _RAISE_STATUSES.get(status, "")
+        where = f" [{endpoint}]" if endpoint else ""
+        super().__init__(
+            f"DART API 오류 status={status}{where}"
+            + (f" — {hint}" if hint else "")
+            + (f" | 응답: {self.dart_message}" if self.dart_message else "")
+        )
+
+
+def _raise_for_dart_status(status, message, endpoint: str = "") -> None:
+    """치명적 status면 DartApiError를 올린다. 그 외(None/000/013 등)는 통과."""
+    if status in _RAISE_STATUSES:
+        raise DartApiError(status, message, endpoint)
+
+
+def _peek_error_status(content: bytes) -> tuple[Optional[str], str]:
+    """zip을 기대한 응답이 실은 오류 XML/JSON인지 훑어본다.
+
+    정상 zip은 'PK'로 시작하므로 그 경우 즉시 빠진다 (수 MB 파싱 회피).
+    반환: (status, message). 오류가 아니면 (None, "").
+    """
+    if not content or content[:2] == b"PK":
+        return None, ""
+    head = content[:2048]
+    if not (head.lstrip()[:1] in (b"<", b"{")):
+        return None, ""
+    text = head.decode("utf-8", errors="replace")
+    m_status = re.search(r'[<"]status[>"]\s*:?\s*"?([0-9]{3})', text)
+    if not m_status:
+        return None, ""
+    m_msg = re.search(r'[<"]message[>"]\s*:?\s*"?([^<"]*)', text)
+    return m_status.group(1), (m_msg.group(1) if m_msg else "")
+
+
 # 배당결정 공시명 패턴 (DART 공시명에서 매칭)
 # - "현금ㆍ현물배당결정", "현금배당결정" 등 변형 흡수
 DIVIDEND_DECISION_PATTERN = re.compile(r"(현금[·ㆍ・]?(현물)?배당결정)")
@@ -116,6 +173,11 @@ class DartClient:
         """
         DART API GET 요청 (rate limit + 재시도).
         expect: 'json' | 'bytes'
+
+        키/권한/한도/시스템 계열 status는 `DartApiError`로 올린다 (`_RAISE_STATUSES`).
+        조용히 None을 반환하면 "0건 수집"과 구분이 안 돼 장애가 며칠씩 묻힌다 —
+        2026-08-01~08-10 배당 파이프라인 10일 정지가 정확히 그 사례
+        (901 만료 키인데 zip 파서까지 흘러가 "File is not a zip file"로만 보였음).
         """
         url = f"{BASE_URL}{endpoint}"
         params = {**params, "crtfc_key": API_KEY}
@@ -127,11 +189,17 @@ class DartClient:
                 if r.status_code == 200:
                     if expect == "json":
                         data = r.json()
+                        _raise_for_dart_status(
+                            data.get("status"), data.get("message"), endpoint)
                         # DART status: '000'=정상, '013'=조회된 데이터 없음 (정상)
                         if data.get("status") in ("000", "013"):
                             return data
                         return None
                     else:
+                        # zip/xml 원본 경로. 오류 응답은 zip이 아니라 작은 XML/JSON으로 오므로
+                        # 파서에 넘기기 전에 여기서 걸러 원인을 그대로 드러낸다.
+                        status, message = _peek_error_status(r.content)
+                        _raise_for_dart_status(status, message, endpoint)
                         return r.content
                 if r.status_code == 429:
                     time.sleep(RETRY_WAIT * attempt)
