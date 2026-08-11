@@ -74,8 +74,30 @@ def _extract_price_events(text: str, max_lines: int = 15) -> str:
     return head + "\n" + body
 
 
+def _extract_step_errors(text: str, max_lines: int = 8) -> str:
+    """보고서 끝의 부가 단계 오류 블록 추출 (daily_update가 덧붙임).
+
+    형식: "⚠️  부가 단계 오류 N건" 헤더 + "  • 배당: DartApiError: ..." 라인.
+    헤더 문자열은 `scripts/daily_update.py`의 `STEP_ERROR_HEADER`와 짝 — 한쪽만 바꾸면
+    조용히 감지가 끊긴다.
+    """
+    import re
+    hm = re.search(r"부가 단계 오류\s*([\d,]+)\s*건", text)
+    if not hm:
+        return ""
+    lines = re.findall(r"^\s*•\s*(\S[^\n]*)$", text[hm.end():], re.MULTILINE)
+    head = f"⛔ 부가 단계 오류 {hm.group(1)}건 (수집 본체와 별개 — 하위 파이프라인 실패)"
+    if not lines:
+        return head
+    shown = [l.strip()[:180] for l in lines[:max_lines]]
+    body = "\n".join("• " + l for l in shown)
+    if len(lines) > max_lines:
+        body += f"\n… 외 {len(lines) - max_lines}건"
+    return head + "\n" + body
+
+
 def _compact_daily_update_summary(report_path: Path) -> tuple[str, bool]:
-    """daily_update 보고서에서 성공용 요약 + 주가이벤트의심 항목 추출.
+    """daily_update 보고서에서 성공용 요약 + 주가이벤트의심 + 부가 단계 오류 추출.
 
     반환: (요약 텍스트, 이상 감지 여부)
     """
@@ -84,10 +106,17 @@ def _compact_daily_update_summary(report_path: Path) -> tuple[str, bool]:
     except Exception as e:
         return f"(보고서 읽기 실패: {e})", True
 
+    # 부가 단계(배당·휴장일·수정주가 등) 오류 — daily_update가 보고서 끝에 덧붙인 블록.
+    # 휴장일에도 이 단계들은 도니 skip 보고서보다 **먼저** 뽑는다.
+    step_error_block = _extract_step_errors(text)
+
     # skip 보고서는 한 줄 (파일명에 _skip 명시된 경우만)
     if "_skip.txt" in str(report_path):
         first = text.strip().splitlines()[0] if text.strip() else ""
-        return f"건너뜀: {first[:200]}", False
+        line = f"건너뜀: {first[:200]}"
+        if step_error_block:
+            return f"{line}\n\n{step_error_block}", True
+        return line, False
 
     # "수집 요약" 섹션 파싱. 항목별 컬럼 구조가 다름:
     #   OHLCV/수급/외인: "라벨  성공  실패  전체  신규/변경  스킵"
@@ -135,6 +164,13 @@ def _compact_daily_update_summary(report_path: Path) -> tuple[str, bool]:
         bullet_lines.append("")
         bullet_lines.append(event_block)
 
+    # 부가 단계 오류 → 무조건 이상으로 승격. 수집 자체는 성공했어도 배당/휴장일 같은
+    # 하위 파이프라인이 죽어 있으면 알려야 한다 (10일 무증상 사고 재발 방지).
+    if step_error_block:
+        anomaly = True
+        bullet_lines.append("")
+        bullet_lines.append(step_error_block)
+
     if not bullet_lines:
         return "(요약 추출 실패 — 보고서 형식 변경 의심)", True
 
@@ -179,10 +215,11 @@ def job_daily_update():
     # 2026-07-29 02:00 DNS 장애 때 실제로 무알림 실패 발생 (7/28 데이터 결손을
     # 사용자가 하루 뒤 질문으로 알게 됨).
     main_status, main_err = "ok", None
+    report_path = None
     try:
         # 인포맥스(수급/지수·선물 등) 한도를 쓰는 구간 — 백필에 마커로 알림
         with infomax_busy("daily_update 본체"):
-            run_daily(collect_foreign=False)
+            report_path = run_daily(collect_foreign=False)
     except SystemExit as e:
         if e.code not in (0, None):
             main_status = "fail"
@@ -192,24 +229,36 @@ def job_daily_update():
         main_status, main_err = "fail", str(e)
         logger.error(f"[스케줄러] daily_update 본체 실패: {e}")
 
-    # 본체 결과를 보고서 파일에서 추출해서 알림
-    today_kst = datetime.now(KST).date()
-    yesterday = today_kst - __import__("datetime").timedelta(days=1)
-    reports_dir = project_root / "reports"
+    # 본체 결과를 보고서 파일에서 추출해서 알림.
+    #
+    # 보고서 경로는 daily_update가 **직접 알려준다** (반환값 / 실패 시 모듈 전역).
+    # 이전엔 `daily_update_{어제|오늘|그저께}.txt` 로 파일명을 추측했는데, 보고서 이름은
+    # 실행일이 아니라 **마지막 거래일** 기준이라 월요일 02:00처럼 마지막 거래일이 사흘 전
+    # (금)이면 후보에서 빠져 detail이 빈 채로 알림이 나갔다 (2026-08-10 실측, 매주 월요일 재현).
+    # 이름 규칙에 기대는 대신 실제 경로를 받아 쓰면 요일·휴장 길이와 무관하게 맞는다.
     detail = ""
     status = main_status
     found_report = None
     found_suffix = ""
-    # 보고서 후보: 영업일 정식 / 휴장 skip
-    for d in (yesterday, today_kst, yesterday - __import__("datetime").timedelta(days=1)):
-        for suffix in ("", "_skip"):
-            p = reports_dir / f"daily_update_{d:%Y%m%d}{suffix}.txt"
-            if p.exists() and (datetime.now().timestamp() - p.stat().st_mtime) < 7200:
-                found_report = p
-                found_suffix = suffix
-                break
-        if found_report:
-            break
+    if report_path is None:
+        # 실패 경로(sys.exit)는 반환값이 없다 — 전역에서 회수. 보고서를 쓰기 전에 죽었으면 None.
+        try:
+            from scripts import daily_update as _daily_update_mod
+            report_path = _daily_update_mod.LAST_REPORT_PATH
+        except Exception as e:
+            logger.warning(f"[스케줄러] 보고서 경로 회수 실패: {e}")
+
+    if report_path is not None:
+        p = Path(report_path)
+        if p.exists():
+            found_report = p
+            # 접미사로 분기 (정식 "" / 휴장·영업일없음 "_skip" / 실패 "_ERROR")
+            for suffix in ("_skip", "_ERROR"):
+                if p.stem.endswith(suffix):
+                    found_suffix = suffix
+                    break
+        else:
+            logger.warning(f"[스케줄러] 보고서 경로가 가리키는 파일 없음: {p}")
 
     if found_report:
         if found_suffix == "_skip":

@@ -29,6 +29,13 @@ from validators.quality_checks import run_quality_checks
 
 KST = ZoneInfo("Asia/Seoul")
 REPORTS_DIR = project_root / "reports"
+
+# 이번 실행이 저장한 보고서 경로. 스케줄러가 알림 본문을 만들 때 **파일명을 추측하지 않도록** 노출.
+#   - 정상 종료: main()의 반환값으로도 같은 값을 준다
+#   - sys.exit(1)로 끝나는 실패 경로: 반환값을 받을 수 없으므로 이 전역에서 회수
+# main() 진입 시 None으로 초기화 — 보고서를 쓰기 전에 죽으면 이전 실행 경로가 남아
+# "엉뚱한 날짜 보고서로 알림" 이 나가는 것을 막는다.
+LAST_REPORT_PATH: Path | None = None
 REPORTS_DIR.mkdir(exist_ok=True)
 
 # 병렬 처리 설정
@@ -2777,8 +2784,46 @@ def run_krx_holidays_pipeline() -> dict:
     return result
 
 
+# 보고서에 붙는 부가 단계 오류 블록의 머리말. 스케줄러가 이 문자열로 블록을 찾아
+# 알림 요약에 싣는다 — 양쪽을 같이 바꿔야 한다 (schedulers/daily_scheduler.py).
+STEP_ERROR_HEADER = "⚠️  부가 단계 오류"
+
+
+def _record_step_error(bucket: list[str], step: str, err: Exception) -> None:
+    """배당·휴장일·수정주가 등 부가 단계의 실패를 기록.
+
+    예전엔 print만 하고 넘어갔는데, 그 출력은 보고서 파일 밖(stdout)이라 알림 요약이
+    보지 못했다. 그 결과 DART 키 만료(status 901)로 배당 수집이 **10일간(2026-08-01~08-10)**
+    죽어 있는데도 매일 "ok"로 보고됐다. 이제 여기 모아 두었다가 보고서 끝에 덧붙여
+    스케줄러의 이상 감지에 태운다.
+    """
+    msg = f"{step}: {type(err).__name__}: {err}"
+    bucket.append(msg)
+    print(f"\n⚠️  {msg} (업데이트 결과에는 영향 없음)")
+
+
+def _append_step_errors(report_path: Path | None, step_errors: list[str]) -> None:
+    """수집한 부가 단계 오류를 보고서 끝에 덧붙인다. 오류가 없으면 아무것도 안 한다."""
+    if not report_path or not step_errors:
+        return
+    try:
+        block = ["", "=" * 70,
+                 f"{STEP_ERROR_HEADER} {len(step_errors)}건", "=" * 70]
+        block += [f"  • {m}" for m in step_errors]
+        with report_path.open("a", encoding="utf-8") as f:
+            f.write("\n".join(block) + "\n")
+    except Exception as e:
+        # 보고서 append 실패가 수집 결과를 무르게 하면 안 된다 — 로그만 남긴다.
+        print(f"\n⚠️  부가 단계 오류 기록 실패: {e}")
+
+
 def main(target_date: date = None, missing_only: bool = False,
-         collect_foreign: bool = True):
+         collect_foreign: bool = True) -> Path | None:
+    """일별 수집 본체. 저장한 보고서 경로를 반환한다 (실패 시 sys.exit(1) —
+    그 경우 경로는 모듈 전역 `LAST_REPORT_PATH`에서 읽으면 된다)."""
+    global LAST_REPORT_PATH
+    LAST_REPORT_PATH = None
+    step_errors: list[str] = []
     try:
         result = run_update(target_date, missing_only, collect_foreign=collect_foreign)
 
@@ -2791,37 +2836,39 @@ def main(target_date: date = None, missing_only: bool = False,
             print("\n" + mini)
             fpath = REPORTS_DIR / f"daily_update_{end_date.strftime('%Y%m%d')}_skip.txt"
             fpath.write_text(mini, encoding="utf-8")
+            LAST_REPORT_PATH = fpath
             print(f"📁 보고서 저장: {fpath}")
         else:
             report = generate_report(result)
             print("\n" + report)
             end_date = result["end_date"]
             fpath = save_report(report, end_date)
+            LAST_REPORT_PATH = fpath
             print(f"\n📁 보고서 저장: {fpath}")
 
             # 품질 체크 (수집한 경우만)
             try:
                 run_quality_checks(end_date)
             except Exception as qc_err:
-                print(f"\n⚠️  품질 체크 중 오류 (업데이트 결과에는 영향 없음): {qc_err}")
+                _record_step_error(step_errors, "품질 체크", qc_err)
 
         # 배당 공시 수집 + LENS export (휴장일에도 진행 — DART는 휴일에도 공시 등록 가능)
         try:
             run_dividend_pipeline(result["end_date"])
         except Exception as div_err:
-            print(f"\n⚠️  배당 단계 오류 (업데이트 결과에는 영향 없음): {div_err}")
+            _record_step_error(step_errors, "배당", div_err)
 
         # KRX 휴장일 SSoT 갱신 + LENS export
         try:
             run_krx_holidays_pipeline()
         except Exception as hol_err:
-            print(f"\n⚠️  KRX 휴장일 단계 오류 (업데이트 결과에는 영향 없음): {hol_err}")
+            _record_step_error(step_errors, "KRX 휴장일", hol_err)
 
         # KOSPI200/KOSDAQ150 구성종목 SCD2 갱신 (휴장일이면 자체 skip)
         try:
             run_index_components_pipeline(result["end_date"])
         except Exception as idx_err:
-            print(f"\n⚠️  지수 구성종목 단계 오류 (업데이트 결과에는 영향 없음): {idx_err}")
+            _record_step_error(step_errors, "지수 구성종목", idx_err)
 
         # ETF 일별 스냅샷은 별도 08:30 cron(`etf_snapshot` job → `scripts/etf_snapshot.py`)으로 이관.
         # 이유: 04:30엔 인포맥스가 당일 PDF 데이터 아직 ingest 안 함 (KODEX 200 등 빈 응답).
@@ -2831,13 +2878,13 @@ def main(target_date: date = None, missing_only: bool = False,
         try:
             run_indices_futures_daily_pipeline(result["end_date"])
         except Exception as idx_err:
-            print(f"\n⚠️  지수+선물 단계 오류 (업데이트 결과에는 영향 없음): {idx_err}")
+            _record_step_error(step_errors, "지수+선물", idx_err)
 
         # 수정주가 적재 + corporate action 자동 감지 (gap > 15% 의심 종목만 LS sujung=Y 호출)
         try:
             run_adjusted_price_pipeline(result["end_date"])
         except Exception as adj_err:
-            print(f"\n⚠️  수정주가 단계 오류 (업데이트 결과에는 영향 없음): {adj_err}")
+            _record_step_error(step_errors, "수정주가", adj_err)
 
         # 신규 상장 등으로 빠진 market_cap 소급 생성 (DB 내부 계산, 외부 호출 0)
         try:
@@ -2851,12 +2898,17 @@ def main(target_date: date = None, missing_only: bool = False,
             finally:
                 _c.close()
         except Exception as mc_err:
-            print(f"\n⚠️  market_cap 소급 단계 오류 (업데이트 결과에는 영향 없음): {mc_err}")
+            _record_step_error(step_errors, "market_cap 소급", mc_err)
 
         # 분봉 일배치는 04:00 KST 별도 cron (job_minute_bars_daily)으로 분리됨
         # 주식선물 30초봉은 22:30 KST 별도 cron (job_stockfut_today, t8406 당일만)으로 분리됨
         # futures_master.json export도 분봉 일배치 끝에서 호출 — daily_update는 LS API 호출 0건
         # (이전 위치에서 04:00 일배치와 LS hit 동시 발생해 5xx 빈발)
+
+        # 부가 단계 오류를 보고서 끝에 덧붙임 — 알림 요약이 읽어 이상으로 올린다.
+        _append_step_errors(LAST_REPORT_PATH, step_errors)
+
+        return LAST_REPORT_PATH
 
     except Exception as e:
         err_msg = traceback.format_exc()
@@ -2866,6 +2918,7 @@ def main(target_date: date = None, missing_only: bool = False,
         err_report = f"업데이트 실패\n실행시각: {datetime.now(KST)}\n\n{err_msg}"
         fpath = REPORTS_DIR / f"daily_update_{today.strftime('%Y%m%d')}_ERROR.txt"
         fpath.write_text(err_report, encoding="utf-8")
+        LAST_REPORT_PATH = fpath
         sys.exit(1)
 
 
