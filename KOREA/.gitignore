@@ -40,6 +40,9 @@ venv.bak/
 .env
 .env.local
 .env.*.local
+# 키 교체 시 남기는 백업 (.env.bak.YYYYMMDD 등) — 실키가 그대로 들어 있다
+.env.bak*
+.env.backup*
 
 # Database
 *.db
