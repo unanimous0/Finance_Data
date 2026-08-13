@@ -66,6 +66,71 @@ JOB_EVENTS_PATH = Path(__file__).parent.parent / "logs" / "job_events.jsonl"
 EVENT_RETENTION_DAYS = 30
 
 
+def _probe_dividends_since(ts: datetime) -> bool:
+    """`ts` 이후 배당 데이터가 실제로 적재됐는지 — DART 배당 단계의 해소 증거.
+
+    created_at은 **UTC 저장**(서버 TimeZone=Etc/UTC)이라 KST aware 값을 그대로 비교하면
+    9시간 어긋난다. psycopg2가 aware datetime을 넘길 때 서버가 알아서 맞추도록
+    `created_at AT TIME ZONE 'UTC' > %s AT TIME ZONE 'Asia/Seoul'` 대신
+    timestamptz로 캐스팅해 비교한다.
+    """
+    import psycopg2
+    from config.settings import settings
+    conn = psycopg2.connect(
+        host=settings.DB_HOST, dbname=settings.DB_NAME, user=settings.DB_USER)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT EXISTS (SELECT 1 FROM dividends "
+                "WHERE created_at AT TIME ZONE 'UTC' > %s)", (ts,))
+            return bool(cur.fetchone()[0])
+    finally:
+        conn.close()
+
+
+# 부가 단계별 "그 뒤로 정상화됐나" 판정기. 단계 이름은 daily_update의
+# `_record_step_error(step=...)`와 같은 문자열이어야 한다.
+#
+# 없는 단계는 조용히 건너뛴다 — 근거 없이 "해소됨"을 붙이면 진짜 장애를 덮는다.
+# (증거는 "오류 이후 그 파이프라인의 산출물이 갱신됨". 잡이 다시 돌기를 기다리면
+#  daily_update는 24h 주기라 요약 창에서 이미 빠져나간 뒤다 — 2026-08-12 사례)
+_STEP_RESOLUTION_PROBES = {
+    "배당": _probe_dividends_since,
+}
+
+
+def _resolution_note(event: dict, later_events: list[dict]) -> str:
+    """이 문제 이벤트가 요약 시점엔 이미 해소됐는지 판정해 꼬리표를 만든다.
+
+    두 가지 증거만 인정한다:
+      1) 같은 잡이 그 뒤에 깨끗하게 한 번 더 돌았다
+      2) 실패한 부가 단계의 산출물이 그 뒤에 갱신됐다 (_STEP_RESOLUTION_PROBES)
+    """
+    import re
+    for nxt in later_events:
+        if nxt["job"] == event["job"] and not nxt.get("warned") and nxt["status"] != "fail":
+            en = datetime.fromisoformat(nxt["ended"])
+            return f" (해소됨 — {en:%m-%d %H:%M} 같은 잡 정상 완료)"
+
+    steps = re.findall(r"^\s*•\s*([^:\n]+):", event.get("detail") or "", re.MULTILINE)
+    ended = datetime.fromisoformat(event["ended"])
+    checked, resolved = [], []
+    for step in steps:
+        probe = _STEP_RESOLUTION_PROBES.get(step.strip())
+        if not probe:
+            continue
+        checked.append(step.strip())
+        try:
+            if probe(ended):
+                resolved.append(step.strip())
+        except Exception as e:
+            logger.warning(f"해소 판정 실패({step.strip()}): {e}")
+            return ""
+    if checked and len(resolved) == len(checked):
+        return f" (해소됨 — {'/'.join(resolved)} 이후 정상 적재 확인)"
+    return ""
+
+
 def _record_event(job_name: str, status: str, started: datetime,
                   ended: datetime, duration: float, detail: str,
                   warned: bool, sent: bool) -> None:
@@ -179,15 +244,31 @@ def send_daily_digest(hours: int = 24) -> bool:
             lines.append(f"{mark} {e['job']}  {st:%H:%M}~{en:%H:%M} "
                          f"({_fmt_duration(e['duration'])})")
         problems = [e for e in events if e["status"] == "fail" or e.get("warned")]
+        # 요약 시점엔 이미 고쳐진 건과 지금도 살아있는 건을 갈라서 보여준다.
+        # 요약 창이 24h라 "새벽에 터지고 낮에 고친" 사고가 한 번은 실리는데,
+        # 표시가 없으면 새 사고인지 지난 사고인지 메시지만 봐선 알 수 없다.
+        notes = {}
+        for idx, e in enumerate(problems):
+            later = [x for x in events
+                     if datetime.fromisoformat(x["ended"]) > datetime.fromisoformat(e["ended"])]
+            notes[idx] = _resolution_note(e, later)
+        open_count = sum(1 for idx in notes if not notes[idx])
         lines.append("")
         if problems:
-            lines.append(f"확인 필요 {len(problems)}건:")
-            for e in problems:
+            done = len(problems) - open_count
+            if open_count == 0:
+                head = f"확인 필요 없음 — 해소된 이력 {done}건"
+            elif done:
+                head = f"확인 필요 {open_count}건 (+ 해소 {done}건)"
+            else:
+                head = f"확인 필요 {open_count}건"
+            lines.append(head + ":")
+            for idx, e in enumerate(problems):
                 body = [ln.strip() for ln in (e.get("detail") or "").splitlines() if ln.strip()]
                 # 경고문이 있으면 그걸 보여준다. 첫 줄은 보통 정상 요약이라
                 # (예: '외인 4,060개') 정작 봐야 할 '⚠️ 빈응답 1,230종목'이 묻힌다.
                 marked = [ln for ln in body if "⚠️" in ln or "⛔" in ln or ln.startswith("에러")]
-                lines.append(f"  • {e['job']}: {(marked or body or [e['status']])[0]}")
+                lines.append(f"  • {e['job']}: {(marked or body or [e['status']])[0]}{notes[idx]}")
         else:
             lines.append("이상 없음")
     return send("\n".join(lines), silent=True)
