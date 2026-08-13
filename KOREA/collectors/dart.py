@@ -36,7 +36,28 @@ from config.settings import settings
 
 
 BASE_URL   = settings.DART_BASE_URL
+# 모듈 로드 시점의 키 — 폴백용. 실제 호출은 아래 _current_api_key()가 매번 .env를 다시 읽는다.
 API_KEY    = settings.DART_API_KEY
+
+
+def _current_api_key() -> str:
+    """호출 시점의 .env DART_API_KEY를 읽는다.
+
+    모듈 로드 시점 상수로 굳히면 **키를 교체해도 장수명 프로세스가 옛 키를 계속 쓴다**.
+    2026-08-12에 만료 키를 새 키로 바꿨는데 스케줄러(8/11 기동)가 옛 키를 물고 있어
+    8/13 02:00 배당 수집이 같은 901로 또 죽었다 — 재시작해야만 반영되는 걸 아무도
+    모르는 상태였다. 이제 DartClient를 새로 만들 때마다 현재 값을 읽으므로
+    .env만 고치면 다음 실행부터 먹는다.
+
+    env_file이 상대경로('.env')라 CWD에 좌우되지 않도록 절대경로를 명시한다.
+    """
+    try:
+        from config.settings import Settings
+        return (Settings(_env_file=str(project_root / ".env")).DART_API_KEY or "").strip()
+    except Exception as e:
+        # .env 재읽기 실패는 치명적이지 않다 — 모듈 로드 시점 값으로 계속 간다.
+        print(f"⚠️  DART 키 재읽기 실패, 기존 값 사용: {e}")
+        return (API_KEY or "").strip()
 REQ_DELAY  = 1.05   # 초 (분당 60회 제한)
 MAX_RETRY  = 3
 RETRY_WAIT = 5.0
@@ -153,7 +174,9 @@ class DartClient:
     _rate_last_call = 0.0
 
     def __init__(self):
-        if not API_KEY:
+        # 인스턴스 생성 시점의 .env 값 — 프로세스가 오래 살아도 키 교체가 반영된다.
+        self.api_key = _current_api_key()
+        if not self.api_key:
             raise RuntimeError(
                 "DART_API_KEY가 설정되지 않았습니다. "
                 "https://opendart.fss.or.kr 에서 키 발급 후 .env에 등록하세요."
@@ -180,7 +203,7 @@ class DartClient:
         (901 만료 키인데 zip 파서까지 흘러가 "File is not a zip file"로만 보였음).
         """
         url = f"{BASE_URL}{endpoint}"
-        params = {**params, "crtfc_key": API_KEY}
+        params = {**params, "crtfc_key": self.api_key}
 
         for attempt in range(1, MAX_RETRY + 1):
             self._throttle()
@@ -525,7 +548,7 @@ def _infer_period(dividend_class: Optional[str],
 
 if __name__ == "__main__":
     # 모듈 동작 확인 (API 키 있을 때만)
-    if not API_KEY:
+    if not _current_api_key():
         print("DART_API_KEY 미설정 → 실제 호출 불가. 모듈 import는 정상.")
         sys.exit(0)
 
