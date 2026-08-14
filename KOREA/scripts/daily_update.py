@@ -1657,8 +1657,11 @@ def run_supplement_pipeline() -> dict:
     # 적재 행수만 보고하면 "일부만 채워졌는데 완료로 보이는" 사고가 난다
     # (2026-07-30: 7/29 외인이 2,645 중 1,415만 등록돼 1,230종목 누락됐는데
     #  알림엔 'foreign: 4060'만 나가 사용자가 못 알아챔).
+    # foreign_fail* = genuine(진짜 결측)만 집계 → 알림 대상.
+    # foreign_lag*  = 상장 전 날짜 등 정상 부재 → INFO만, 알림 제외 (2026-08-14)
     summary = {"days_processed": 0, "ohlcv": 0, "investor": 0, "foreign": 0,
-               "target_days": 0, "foreign_fail": 0, "foreign_fail_days": []}
+               "target_days": 0, "foreign_fail": 0, "foreign_fail_days": [],
+               "foreign_lag": 0, "foreign_lag_days": []}
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT MAX(time) FROM ohlcv_daily")
@@ -1720,16 +1723,89 @@ def run_supplement_pipeline() -> dict:
             summary["ohlcv"] += o
             summary["investor"] += i
             summary["foreign"] += f
+            # 빈 응답을 genuine(진짜 결측) / lag(상장 전 등 정상 부재)로 분리.
+            # 신규 상장 종목이 3영업일 창에 걸려 내는 가짜 ⚠️를 걷어낸다.
+            gen_list, lag_list = [], []
             if f_fail:
-                summary["foreign_fail"] += f_fail
-                summary["foreign_fail_days"].append({"date": str(d), "fail": f_fail})
+                cls = classify_foreign_gaps(
+                    conn, d, r.get("foreign", {}).get("fail_codes", []))
+                gen_list, lag_list = cls["genuine"], cls["lag"]
+                if gen_list:
+                    summary["foreign_fail"] += len(gen_list)
+                    summary["foreign_fail_days"].append(
+                        {"date": str(d), "fail": len(gen_list)})
+                if lag_list:
+                    summary["foreign_lag"] += len(lag_list)
+                    summary["foreign_lag_days"].append(
+                        {"date": str(d), "fail": len(lag_list)})
             if o or i or f:
                 summary["days_processed"] += 1
-            fail_str = f" / ⚠️ 외인 빈응답 {f_fail:,}종목" if f_fail else ""
+            fail_str = f" / ⚠️ 외인 빈응답 {len(gen_list):,}종목" if gen_list else ""
+            if lag_list:
+                fail_str += (f" / 외인 미상장-lag {len(lag_list):,}종목 "
+                             f"({', '.join(x['code'] for x in lag_list[:5])})")
             print(f"  {d}: OHLCV {o:,} / 수급 {i:,} / 외인 {f:,} 보충{fail_str}")
+            for g in gen_list[:20]:
+                print(f"      ⚠️ 외인 결측 {g['code']} {g['name'] or ''}")
         return summary
     finally:
         conn.close()
+
+
+def classify_foreign_gaps(conn, target_date: date,
+                          fail_codes: list[str]) -> dict:
+    """외인 지분율 빈 응답을 genuine / lag 2등급으로 구분 (2026-08-14).
+
+    배경: 08:30 보충은 최근 3영업일을 훑는데, 그 창에 **상장 전 날짜**가 걸리는
+    신규 상장 종목은 인포맥스에 데이터가 존재할 수 없어 항상 빈 응답이 된다.
+    (8/12 상장 딜리셔스 483350, 8/13 상장 케이앤에스아이앤씨 487400 → 3건 ⚠️)
+    상장할 때마다 며칠씩 가짜 경고가 뜨면 진짜 결측이 묻힌다. ETF 마스터
+    완결성(check_etf_master_completeness)과 동일한 철학으로 등급을 나눈다.
+
+      - lag     : 그날 데이터가 존재할 수 없음 → 정상 부재. INFO만, 알림 제외
+      - genuine : 상장 후인데 빠짐 → 진짜 결측. ⚠️ + 알림
+
+    판정 (stocks.listing_date 우선, NULL이면 이력으로 추정):
+      listing_date > target_date            → lag      (상장 전, 존재 불가)
+      listing_date <= target_date           → genuine  (상장 후 결측)
+      listing_date NULL + 이전 이력 있음    → genuine
+      listing_date NULL + 이전 이력 전무    → lag      (신규상장 추정)
+
+    listing_date는 활성 3,879종목 중 1,197개만 채워져 있어(신규 상장분 위주)
+    단독으로는 못 쓴다. 그래서 이력 fallback을 함께 둔다.
+
+    반환: {"genuine": [{code,name}], "lag": [{code,name}]}
+    """
+    if not fail_codes:
+        return {"genuine": [], "lag": []}
+
+    codes = sorted(set(fail_codes))
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT s.stock_code, s.stock_name, s.listing_date,
+                   EXISTS (SELECT 1 FROM foreign_ownership f
+                           WHERE f.stock_code = s.stock_code AND f.time < %s)
+            FROM stocks s
+            WHERE s.stock_code = ANY(%s)
+        """, (target_date, codes))
+        rows = cur.fetchall()
+
+    genuine, lag = [], []
+    known = set()
+    for code, name, listing_date, has_history in rows:
+        known.add(code)
+        item = {"code": code, "name": name}
+        if listing_date is not None:
+            (lag if listing_date > target_date else genuine).append(item)
+        else:
+            (genuine if has_history else lag).append(item)
+    # stocks에 없는 코드(있어선 안 되지만)는 판단 불가 → 안전하게 genuine
+    for code in codes:
+        if code not in known:
+            genuine.append({"code": code, "name": None})
+
+    return {"genuine": sorted(genuine, key=lambda x: x["code"]),
+            "lag": sorted(lag, key=lambda x: x["code"])}
 
 
 def check_etf_master_completeness(conn, target_date: date,

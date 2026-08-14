@@ -23,6 +23,11 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 logger = logging.getLogger(__name__)
 
+# detail 본문에 이 마커가 있으면 '이상 있는 성공'으로 승격 → 즉시(무음) 전송.
+# 호출부가 warn=True를 안 넘겨도 동작하도록 문자열로 감지한다.
+#   ⚠️ 경고(외인 빈응답, 마스터 완결성 등) / ⛔ 부가 단계 오류 / 🚨 주가이벤트의심
+WARN_MARKERS = ("⚠️", "⛔", "🚨")
+
 
 def is_configured() -> bool:
     return bool(BOT_TOKEN and CHAT_ID)
@@ -174,10 +179,16 @@ def notify_job(
 
     warn 자동 감지: 기존 호출부들이 이미 detail에 '⚠️'를 넣고 있어(외인 빈응답,
     마스터 완결성 등) 그것도 이상으로 간주한다. 호출부 일괄 수정 없이 동작.
+
+    마커에 '🚨'(주가이벤트의심) 추가 — 2026-08-14. daily_update 요약의 급등락
+    블록은 🚨만 쓰는데 마커에 없어 **단독 발생 시 알림이 안 나갔다**.
+    실제로 8/13 시스웍(269620) 889→27원(-97%)이 보고서에만 남고 전송 0.
+    수정주가 확인이 필요한 건이라 침묵하면 안 된다.
     """
     ended = datetime.now(KST)
     duration = (ended - started).total_seconds()
-    warned = bool(warn) or ("⚠️" in (detail or "")) or ("⛔" in (detail or ""))
+    warned = (bool(warn)
+              or any(m in (detail or "") for m in WARN_MARKERS))
 
     tag = {"ok": "성공", "fail": "실패", "noop": "건너뜀"}.get(status, status)
     if warned and status != "fail":

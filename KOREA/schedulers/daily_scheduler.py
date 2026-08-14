@@ -50,10 +50,66 @@ def _read_report_tail(report_path: Path, max_chars: int = 1500) -> str:
         return f"(보고서 읽기 실패: {e})"
 
 
+def _adj_applied(events: list[tuple[str, str]]) -> dict:
+    """주가이벤트 (날짜, 종목코드) 각각에 수정계수가 반영됐는지 DB로 확인.
+
+    판정: adj_factor(이벤트일) != adj_factor(직전 거래일) → 그 날짜에 자본변동이
+    반영된 것. 같으면 미반영.
+
+    "adj_factor == 1.0 이면 미반영"이 아니라 **직전일과의 변화**로 보는 이유:
+    factor는 최신가 기준 정규화라 최신 행이 항상 1.0이고(reference_adj_close_semantics),
+    이벤트 이후 또 다른 이벤트가 생기면 이벤트일 factor도 1.0이 아니게 된다.
+    그때 '==1.0' 기준은 미반영 건을 반영됨으로 잘못 읽는다. 변화량 기준은 안 흔들린다.
+
+    호출 시점 주의: run_adjusted_price_pipeline(daily_update 후반, gap>15% 종목만
+    LS sujung=Y 재호출)이 끝난 뒤라야 factor가 확정된다. 이 함수는 daily_update
+    완료 후 알림 조립 단계에서만 부른다.
+
+    반환: {(date, code): True(반영)/False(미반영)}. DB 실패 시 {} — 호출부가
+    전건을 미반영으로 취급해 알림을 잃지 않는다.
+    """
+    if not events:
+        return {}
+    try:
+        from scripts.daily_update import get_conn
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT e.d, e.code,
+                           o.adj_factor,
+                           (SELECT p.adj_factor FROM ohlcv_daily p
+                             WHERE p.stock_code = e.code AND p.time < e.d::date
+                             ORDER BY p.time DESC LIMIT 1)
+                    FROM unnest(%s::text[], %s::text[]) AS e(d, code)
+                    LEFT JOIN ohlcv_daily o
+                      ON o.stock_code = e.code AND o.time = e.d::date
+                """, ([d for d, _ in events], [c for _, c in events]))
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning(f"[스케줄러] 수정계수 확인 실패 — 전건 미반영 취급: {e}")
+        return {}
+
+    out = {}
+    for d, code, cur_f, prev_f in rows:
+        # 직전 행이 없으면(신규상장 등) 판단 불가 → 미반영으로 두고 사람이 본다
+        out[(d, code)] = (cur_f is not None and prev_f is not None
+                          and abs(cur_f - prev_f) > 0.001)
+    return out
+
+
 def _extract_price_events(text: str, max_lines: int = 15) -> str:
-    """보고서에서 주가이벤트의심(±30% 초과 — 수정주가 확인 필요) 항목만 추출.
+    """보고서에서 주가이벤트의심(±30% 초과) 항목만 추출 — 수정계수 반영 여부로 분리.
 
     형식: "🚨 [주가이벤트의심] N건" 헤더 + "날짜 종목코드 종목명 상승/하락 XX% ... [...의심]" 라인.
+
+    ±30% 초과의 대부분(8/4~8/13 실측 15건 중 12건)은 액면병합·분할이고 수정계수가
+    이미 붙어 처리가 끝난 건이다. 전건을 🚨로 올리면 정작 손봐야 할 미반영 건이
+    그 사이에 묻힌다 — 실제로 미반영 3건(씨씨에스·더테크놀로지·시스웍)이 모두
+    묻혀 있었다. 그래서 **미반영 건만 🚨**로 올리고 반영된 건은 마커 없는 정보
+    줄로 내린다(마커가 없으면 notifier가 전송하지 않음 → 반영 건만 있는 날은 침묵).
     """
     import re
     hm = re.search(r"\[주가이벤트의심\]\s*([\d,]+)\s*건", text)
@@ -64,14 +120,36 @@ def _extract_price_events(text: str, max_lines: int = 15) -> str:
     lines = re.findall(
         r"^\s*(\d{4}-\d{2}-\d{2}\s+\S+\s+.*?(?:상승|하락)\s+[\d.]+%.*?\[[^\]]*의심\])\s*$",
         text, re.MULTILINE)
-    head = f"🚨 주가이벤트의심 {count}건 (±30% 초과 — 수정주가 확인)"
     if not lines:
-        return head
-    shown = lines[:max_lines]
-    body = "\n".join("• " + " ".join(l.split()) for l in shown)
-    if len(lines) > max_lines:
-        body += f"\n… 외 {len(lines) - max_lines}건"
-    return head + "\n" + body
+        # 라인 파싱 실패 = 내용을 모른다 → 종전대로 🚨 (놓치는 것보다 낫다)
+        return f"🚨 주가이벤트의심 {count}건 (±30% 초과 — 수정주가 확인)"
+
+    parsed = []
+    for l in lines:
+        flat = " ".join(l.split())
+        m = re.match(r"^(\d{4}-\d{2}-\d{2})\s+(\S+)", flat)
+        parsed.append((m.group(1) if m else None, m.group(2) if m else None, flat))
+
+    applied = _adj_applied([(d, c) for d, c, _ in parsed if d and c])
+    pending = [p for p in parsed if not applied.get((p[0], p[1]), False)]
+    done = [p for p in parsed if applied.get((p[0], p[1]), False)]
+
+    blocks = []
+    if pending:
+        head = (f"🚨 주가이벤트의심 {len(pending)}건 "
+                f"— 수정계수 미반영 (확인 필요)")
+        body = "\n".join("• " + p[2] for p in pending[:max_lines])
+        if len(pending) > max_lines:
+            body += f"\n… 외 {len(pending) - max_lines}건"
+        blocks.append(head + "\n" + body)
+    if done:
+        # 마커 없음 — 이 블록만 있는 날은 '깨끗한 성공'으로 침묵
+        head = f"· 주가이벤트 {len(done)}건 — 수정계수 반영됨 (조치 불필요)"
+        body = "\n".join("  " + p[2] for p in done[:max_lines])
+        if len(done) > max_lines:
+            body += f"\n  … 외 {len(done) - max_lines}건"
+        blocks.append(head + "\n" + body)
+    return "\n\n".join(blocks)
 
 
 def _extract_step_errors(text: str, max_lines: int = 8) -> str:
@@ -627,12 +705,20 @@ def job_etf_snapshot():
                 # 빈 응답으로 못 채운 종목이 있으면 반드시 노출.
                 # 적재 행수만 보면 "부분 수집인데 완료"로 읽힌다
                 # (2026-07-30: 7/29 외인 1,230종목 누락인데 'foreign: 4060'만 통보됨).
+                # 단 상장 전 날짜(lag)는 데이터가 존재할 수 없어 ⚠️ 대상이 아니다
+                # — 신규 상장 때마다 뜨던 가짜 경고 제거 (2026-08-14).
                 f_fail = sup.get("foreign_fail", 0)
                 if f_fail:
                     days = ", ".join(f"{x['date']}:{x['fail']:,}"
                                      for x in sup.get("foreign_fail_days", []))
                     line += (f"\n⚠️ 외인 빈응답 {f_fail:,}종목 ({days})\n"
                              f"   인포맥스 등록 지연 가능 — 다음 보충에서 재시도됨")
+                f_lag = sup.get("foreign_lag", 0)
+                if f_lag:
+                    days = ", ".join(f"{x['date']}:{x['fail']:,}"
+                                     for x in sup.get("foreign_lag_days", []))
+                    line += (f"\n· 외인 미상장 구간 {f_lag:,}종목 ({days}) — "
+                             f"상장 전 날짜, 정상")
                 parts.append(line)
         except Exception as e:
             logger.error(f"[스케줄러] 종합 누락 보충 실패: {e}")
