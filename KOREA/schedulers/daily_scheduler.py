@@ -391,13 +391,14 @@ def job_weekly_backup():
 
 
 def job_minute_bars_daily():
-    """매일 23:00 KST — 분봉 일배치 (종목/ETF + 지수 + 지수선물).
+    """daily_update 후속 — 분봉 일배치 (종목/ETF + 지수선물).
     LS 백필 진행 중이면 SIGSTOP → 일배치 → SIGCONT (사용자 정책).
-    주식선물(t8406)은 historical 불가 → 별도 cron(job_stockfut_today) 22:30 KST."""
+    당일만 가능한 두 종류는 별도 cron:
+      주식선물(t8406) → job_stockfut_today 23:30
+      지수(t8418)     → job_index_minute_bars_today 15:40 (직전 1세션만 제공)"""
     from datetime import timedelta as _td
     from scripts.daily_update import (
         run_minute_bars_pipeline,
-        run_index_minute_bars_pipeline,
         run_futures_minute_bars_pipeline,
         export_futures_master_json,
         _ls_backfill_pause, _ls_backfill_resume,
@@ -415,9 +416,11 @@ def job_minute_bars_daily():
     # outer pause: 모든 파이프라인 동안 백필 STOP
     paused = _ls_backfill_pause()
     try:
+        # 지수(t8418)는 여기서 빠졌다 — job_index_minute_bars_today(15:40)로 이관.
+        # t8418이 직전 1세션만 주므로 다음날 새벽 호출은 **항상 빈 응답**이고,
+        # 갭이 누적돼 매일 지나간 날짜를 헛되이 재요청했다(empty 2→4→6→8…).
         for fn, label in [
             (run_minute_bars_pipeline,         "종목/ETF"),
-            (run_index_minute_bars_pipeline,   "지수"),
             (run_futures_minute_bars_pipeline, "지수선물"),
         ]:
             try:
@@ -444,6 +447,124 @@ def job_minute_bars_daily():
             logger.error(f"[스케줄러] futures_master.json export 실패: {fm_err}")
     finally:
         _ls_backfill_resume(paused)
+
+    # 봉수 완결성 — 세 소스(종목/지수/선물)를 target 하루치로 한 번에 검사.
+    # 주식선물은 전날 23:30에 이미 적재되므로 이 시점이면 네 경로가 모두 관측 가능하다.
+    # "존재하지만 잘려 있음"은 기존 완결성 체크로 원리적으로 안 보여서
+    # 지수/지수선물이 8개월간 무증상이었다 (tr_cont 페이징 사고, 2026-08-30).
+    try:
+        from scripts.daily_update import check_intraday_bar_counts, get_conn
+        conn = get_conn()
+        try:
+            bc = check_intraday_bar_counts(conn, target)
+        finally:
+            conn.close()
+        logger.info(f"[스케줄러] 봉수 완결성: issue={bc['issue_count']} "
+                    f"genuine={bc['genuine_sources']} short_codes={bc['short_code_total']}")
+        if bc["issue_count"] > 0:
+            lines = [f"target={target}"]
+            for name, s in bc["sources"].items():
+                if not s.get("present"):
+                    lines.append(f"• {name}: 데이터 없음")
+                    continue
+                lines.append(f"• {name}: {s['codes']}코드 / median {s['median']:.0f}봉 "
+                             f"(기대 {s['expected']}, {s['ratio']*100:.0f}%)")
+            if bc["genuine_sources"]:
+                lines.append(f"\n⚠️ 소스 통째 절단 의심: {', '.join(bc['genuine_sources'])}")
+            if bc["short_code_total"]:
+                sample = ", ".join(f"{c['code']}({c['bars']}봉)"
+                                   for c in bc["short_codes"][:10])
+                lines.append(f"\n⚠️ 개별 코드 미달 {bc['short_code_total']}건: {sample}")
+            notify_job("30초봉 봉수 완결성", "ok", datetime.now(KST),
+                       detail="\n".join(lines), warn=True)
+    except Exception as e:
+        logger.error(f"[스케줄러] 봉수 완결성 체크 실패: {e}")
+
+
+INDEX_BARS_EXPECTED = 761      # 09:00:30~15:30 30초봉 (페이징 완주 실측)
+INDEX_BARS_MIN = 700           # 이 아래면 미완성으로 보고 재시도
+INDEX_RETRY_DELAYS = (600, 900, 1800)   # 15:50 / 16:05 / 16:35 무렵
+
+
+def job_index_minute_bars_today():
+    """평일 15:40 KST — 지수(KOSPI200/KOSDAQ150) 30초봉 **당일** 수집.
+
+    왜 당일 마감 직후인가:
+      t8418은 직전 1세션만 제공한다(2026-08-30 실측 — 8/27·8/26 요청 0봉,
+      nday/sdate 변형도 무효). 기존엔 다음날 새벽 배치가 '어제'를 요청해서
+      평일엔 늘 빈 응답이었고, 토요일 실행분만 타깃(금요일)과 API 보유 세션이
+      맞아떨어져 **금요일치만** 쌓였다(7/6 이후 영업일 30일 누락).
+      장 마감(15:30) 직후가 유일하게 데이터가 오는 타이밍이다.
+
+    미완성 대비 재시도: 마감 직후엔 아직 봉이 덜 찼을 수 있어
+    INDEX_BARS_MIN 미만이면 지연을 두고 재요청한다. UPSERT라 재호출은 안전.
+    """
+    import time as _time
+    from datetime import timedelta as _td
+    from scripts.daily_update import (run_index_minute_bars_pipeline, get_conn,
+                                      is_market_closed, _ls_backfill_pause,
+                                      _ls_backfill_resume)
+    started = datetime.now(KST)
+    today = started.date()
+
+    conn = get_conn()
+    try:
+        if is_market_closed(conn, today):
+            logger.info(f"[스케줄러] 지수 30초봉 — {today} 휴장일, skip")
+            return
+    finally:
+        conn.close()
+
+    logger.info("=" * 60)
+    logger.info(f"[스케줄러] 지수 30초봉 당일 수집 시작: {started} (target={today})")
+    logger.info("=" * 60)
+
+    def _bars_today() -> dict:
+        c = get_conn()
+        try:
+            with c.cursor() as cur:
+                lo = datetime(today.year, today.month, today.day, tzinfo=KST)
+                cur.execute("""
+                    SELECT index_code, count(*) FROM index_ohlcv_intraday
+                    WHERE interval_seconds = 30 AND time >= %s AND time < %s
+                    GROUP BY 1
+                """, (lo, lo + _td(days=1)))
+                return {r[0]: r[1] for r in cur.fetchall()}
+        finally:
+            c.close()
+
+    attempts, result = 0, {}
+    paused = _ls_backfill_pause()
+    try:
+        for delay in (0,) + INDEX_RETRY_DELAYS:
+            if delay:
+                logger.info(f"[스케줄러] 지수 30초봉 미완성 — {delay}s 후 재시도")
+                _time.sleep(delay)
+            attempts += 1
+            try:
+                result = run_index_minute_bars_pipeline(today, only_days=[today])
+            except Exception as e:
+                logger.error(f"[스케줄러] 지수 30초봉 수집 실패({attempts}회): {e}")
+                result = {"error": str(e)}
+            counts = _bars_today()
+            logger.info(f"[스케줄러] 지수 30초봉 {attempts}회차: {result} / 봉수={counts}")
+            if counts and min(counts.values()) >= INDEX_BARS_MIN and len(counts) == 2:
+                break
+    finally:
+        _ls_backfill_resume(paused)
+
+    counts = _bars_today()
+    ok = bool(counts) and len(counts) == 2 and min(counts.values()) >= INDEX_BARS_MIN
+    detail = (f"target={today} / 시도 {attempts}회\n"
+              + "\n".join(f"• {c}: {n:,}봉 (기대 {INDEX_BARS_EXPECTED})"
+                          for c, n in sorted(counts.items()))
+              if counts else f"target={today} / 시도 {attempts}회\n• 적재 0")
+    if not ok:
+        notify_job("지수 30초봉", "fail", started,
+                   detail=detail + "\n\n⚠️ 당일 확보 실패 — t8418은 과거를 주지 않아 "
+                                   "이 날짜는 소급 불가")
+    else:
+        logger.info(f"[스케줄러] 지수 30초봉 완료: {counts}")
 
 
 def _purge_stockfut_day(day) -> int:
@@ -997,6 +1118,18 @@ def main():
         id="etf_snapshot",
         name="ETF PDF/마스터 스냅샷 (today + yesterday)",
         misfire_grace_time=1800,
+        coalesce=True,
+        max_instances=1,
+    )
+
+    # 잡 5-1: 평일 15:40 KST — 지수 30초봉 당일 적재 (t8418은 직전 1세션만 제공)
+    # 마감 15:30 직후가 유일한 수집 창. 미완성이면 잡 안에서 최대 3회 재시도(~16:35).
+    scheduler.add_job(
+        job_index_minute_bars_today,
+        trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=40, timezone=KST),
+        id="index_minute_bars_today",
+        name="지수 30초봉 당일 (LS t8418, 과거 조회 불가)",
+        misfire_grace_time=3600,
         coalesce=True,
         max_instances=1,
     )

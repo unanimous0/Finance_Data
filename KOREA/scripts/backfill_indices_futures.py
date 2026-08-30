@@ -159,7 +159,9 @@ def backfill_indices_ohlcv(conn, client: InfomaxClient, start: date, end: date) 
 
 def backfill_futures_ohlcv(conn, client: InfomaxClient, start: date, end: date,
                            underlying_types: tuple = ('F', 'L'),
-                           skip_codes: set = None, on_complete=None) -> dict:
+                           skip_codes: set = None, on_complete=None,
+                           only_codes: list = None,
+                           classes: tuple = ('NEAR', 'NEXT')) -> dict:
     """선물 NEAR/NEXT 시계열 백필. underlying_types로 F(지수선물)/L(주식선물) 선택.
 
     재개 지원:
@@ -167,6 +169,11 @@ def backfill_futures_ohlcv(conn, client: InfomaxClient, start: date, end: date,
       on_complete: 한 underlying의 전 청크 성공 시 호출되는 콜백(uc). 진행상태 저장용.
     InfomaxDailyLimitError 발생 시 현재 underlying은 미완료로 두고 즉시 깨끗이 중단
     (남은 청크 헛호출 방지). 반환 dict로 재개 여부 판단.
+
+    부분 보정용 (2026-08-30 추가):
+      only_codes : 이 underlying_code 들만. 특정 종목 갭만 메울 때.
+      classes    : ('NEAR',) 처럼 한쪽만. 최초 백필이 NEAR를 통째로 빠뜨린
+                   10개 underlying(06 코스닥150 등)을 NEXT 건드리지 않고 채우려고 씀.
 
     반환: {"total": int, "completed": [uc...], "stopped_by_limit": bool}
     """
@@ -176,8 +183,15 @@ def backfill_futures_ohlcv(conn, client: InfomaxClient, start: date, end: date,
             "SELECT underlying_code FROM futures_underlyings WHERE underlying_type = ANY(%s) ORDER BY underlying_code",
             (list(underlying_types),))
         underlyings = [r[0] for r in cur.fetchall()]
+    if only_codes:
+        want = set(only_codes)
+        missing = want - set(underlyings)
+        if missing:
+            print(f"  [warn] futures_underlyings 에 없는 코드 무시: {sorted(missing)}")
+        underlyings = [u for u in underlyings if u in want]
     todo = [u for u in underlyings if u not in skip_codes]
-    print(f"  futures underlying {len(underlyings)}개({','.join(underlying_types)}) — "
+    print(f"  futures underlying {len(underlyings)}개({','.join(underlying_types)}) "
+          f"class={','.join(classes)} — "
           f"완료 {len(underlyings) - len(todo)} / 잔여 {len(todo)}", flush=True)
 
     total = 0
@@ -185,7 +199,7 @@ def backfill_futures_ohlcv(conn, client: InfomaxClient, start: date, end: date,
     stopped_by_limit = False
     for i, uc in enumerate(todo, 1):
         try:
-            for klass in ['NEAR', 'NEXT']:
+            for klass in classes:
                 rows = []
                 # NEXT(2active)는 날짜마다 원월물 여러 개(~6~10행/일) 반환 + API 1000행 한도.
                 # 700일 청크면 truncate되어 과거가 잘림 → NEXT는 90일 청크(≤~990행)로 분할.
@@ -258,31 +272,44 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("start", help="YYYYMMDD")
     p.add_argument("end", help="YYYYMMDD")
+    p.add_argument("--codes", default=None,
+                   help="선물 underlying_code 콤마 구분 (기본: 전체). 갭 보정용")
+    p.add_argument("--class", dest="klass", default="both",
+                   choices=["NEAR", "NEXT", "both"], help="선물 contract_class 한정")
+    p.add_argument("--futures-only", action="store_true",
+                   help="마스터/지수 단계 skip — 선물만 (갭 보정용)")
     args = p.parse_args()
     start = datetime.strptime(args.start, "%Y%m%d").date()
     end   = datetime.strptime(args.end,   "%Y%m%d").date()
+    only_codes = [c.strip() for c in args.codes.split(",") if c.strip()] if args.codes else None
+    classes = ("NEAR", "NEXT") if args.klass == "both" else (args.klass,)
 
     print("=" * 70)
     print(f"지수+선물 일별 OHLCV 백필: {start} ~ {end}")
+    if only_codes or args.klass != "both" or args.futures_only:
+        print(f"  (부분 보정 모드) codes={only_codes or '전체'} class={classes} "
+              f"futures_only={args.futures_only}")
     print("=" * 70)
 
     client = InfomaxClient()
     conn = _conn()
     try:
         t0 = time.time()
-        print("\n[1/4] indices 마스터 적재...")
-        n = seed_indices_master(conn, client)
-        print(f"  → {n}개")
+        if not args.futures_only:
+            print("\n[1/4] indices 마스터 적재...")
+            n = seed_indices_master(conn, client)
+            print(f"  → {n}개")
 
-        print("\n[2/4] futures_underlyings 마스터 적재...")
-        n = seed_futures_underlyings(conn, client)
-        print(f"  → {n}개")
+            print("\n[2/4] futures_underlyings 마스터 적재...")
+            n = seed_futures_underlyings(conn, client)
+            print(f"  → {n}개")
 
-        print("\n[3/4] 지수 일별 OHLCV 백필...")
-        backfill_indices_ohlcv(conn, client, start, end)
+            print("\n[3/4] 지수 일별 OHLCV 백필...")
+            backfill_indices_ohlcv(conn, client, start, end)
 
         print("\n[4/4] 선물 일별 OHLCV 백필...")
-        backfill_futures_ohlcv(conn, client, start, end)
+        backfill_futures_ohlcv(conn, client, start, end,
+                               only_codes=only_codes, classes=classes)
 
         print(f"\n전체 소요: {(time.time()-t0)/60:.1f}분")
     finally:

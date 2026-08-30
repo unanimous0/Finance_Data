@@ -1,70 +1,75 @@
--- Phase 7 분봉 NEAR/NEXT 매핑 view (v2 — self-join 만기 정렬)
+-- Phase 7 분봉 NEAR/NEXT 매핑 view (v3 — 인포맥스 일봉 contract_code 조인)
 --
--- 문제: 인포맥스 NEXT 정의 ≠ LS NEXT 정의 (인포맥스는 long-dated annual을 NEXT로,
---       LS는 차월물을 NEXT로). 일별 contract_class를 그대로 매핑 join하면 view NEXT 비어있음.
+-- ── v2(dense_rank)를 버린 이유 ──────────────────────────────────────────
+-- v2는 "분봉 테이블에 있는 contract들을 만기순 정렬해 1=NEAR, 2=NEXT"였다.
+-- 전제: 분봉에 적재된 게 곧 LS의 진짜 NEAR+NEXT.
+-- 실제로는 **진짜 근월물이 분봉에 없으면 차근월을 NEAR로 잘못 찍는다**.
+--   2026-01-02~03-12: 진짜 NEAR = 3월물(A0163000)인데 만기(3/12) 뒤에 백필이
+--   돌아 아예 미수집 → 뷰가 6월물(당시 NEXT)을 NEAR로 라벨링.
+--   2026-06-11: 진짜 NEAR = 6월물인데 그날 분봉 미수집 → 9월물이 NEAR로.
+-- 검증 결과 KOSPI200 161 영업일 중 **47일(29%)이 오태깅**이었다.
+-- 거래량 400k짜리 근월물 자리에 거래량 300짜리 원월물이 앉는 형태라
+-- 그대로 쓰면 시세가 아니라 잡음을 분석하게 된다.
 --
--- 해결: 분봉에 적재된 contracts (= LS의 진짜 NEAR+NEXT)를 self-join 정렬.
---       각 (date, underlying)에 대해 만기 빠른 순 1=NEAR, 2=NEXT.
+-- ── v3 방식 ────────────────────────────────────────────────────────────
+-- 날짜별 NEAR/NEXT를 추측하지 않고 **인포맥스가 확정한 값**을 그대로 쓴다.
+-- futures_ohlcv_daily(underlying_code, contract_class, time, contract_code)가
+-- 벤더 기준 날짜별 근월/차근월 매핑이고, contract_code 형식이 분봉
+-- futures_ohlcv_intraday.futures_code와 동일하다(2026-08-28 552/552 매칭 확인).
 --
--- 만기 정렬 키: contract_code의 chars 4-5 (year, month)
---   A0166000 → ('6','6') = 2026 June
---   A0169000 → ('6','9') = 2026 Sep
---   A016C000 → ('6','C') = 2026 Dec
---   A0173000 → ('7','3') = 2027 March
---   ASCII alphabetical sort 가능 (월 코드: 1-9 → '1'-'9', 10-12 → 'A','B','C')
+-- v2 헤더에 적혀 있던 "인포맥스 NEXT는 long-dated annual이라 조인하면 NEXT가
+-- 빈다"는 제약은 collectors/infomax.pick_nearest_deferred() 도입으로 해소됐다
+-- (날짜별 만기 최소 1건만 남김). 지금은 일봉 NEXT도 진짜 차근월이다.
 --
--- 한계: 2030년대 wraparound (year='0') 시 정렬 깨짐. 그때 수정 필요.
+-- 부수 효과(의도된 것): 진짜 근월물의 분봉이 없는 날은 NEAR 행이 **비어 있다**.
+-- 잘못된 계약을 NEAR로 채우는 것보다 없는 게 낫다 — 소비 측에서 갭이 보인다.
 
+DROP VIEW IF EXISTS futures_daily_with_class;
 DROP VIEW IF EXISTS futures_intraday_near;
 DROP VIEW IF EXISTS futures_intraday_next;
 DROP VIEW IF EXISTS futures_intraday_with_class;
 
 CREATE VIEW futures_intraday_with_class AS
-WITH intraday_with_und AS (
-    -- 일별 매핑 의존성 제거 — futures_code chars 2-3에서 underlying 직접 추출
-    --   A0166000 → '01' (KP200)
-    --   A0A65000 → '0A' (주식선물 종목)
-    --   ABS61000 → 'BS' (주식선물 종목)
-    -- WHERE: 단일선물(A로 시작)만, 스프레드(D로 시작) 옵션(C,P) 제외
-    SELECT
-        i.futures_code,
-        i.time,
-        i.interval_seconds,
-        i.open, i.high, i.low, i.close,
-        i.volume, i.trading_value, i.open_interest,
-        substring(i.futures_code FROM 2 FOR 2) AS underlying_code,
-        (i.time AT TIME ZONE 'Asia/Seoul')::date AS trade_date
-    FROM futures_ohlcv_intraday i
-    WHERE substring(i.futures_code FROM 1 FOR 1) = 'A'
-),
-ranked AS (
-    SELECT *,
-           DENSE_RANK() OVER (
-               PARTITION BY underlying_code, trade_date
-               ORDER BY substring(futures_code FROM 4 FOR 1),  -- year char
-                        substring(futures_code FROM 5 FOR 1)   -- month char
-           ) AS class_rank
-    FROM intraday_with_und
-)
 SELECT
-    futures_code, time, interval_seconds, underlying_code,
-    open, high, low, close, volume, trading_value, open_interest,
-    CASE class_rank WHEN 1 THEN 'NEAR' WHEN 2 THEN 'NEXT' ELSE 'OTHER' END AS contract_class
-FROM ranked;
+    i.futures_code,
+    i.time,
+    i.interval_seconds,
+    d.underlying_code::text AS underlying_code,
+    i.open, i.high, i.low, i.close,
+    i.volume, i.trading_value, i.open_interest,
+    d.contract_class::text AS contract_class
+FROM futures_ohlcv_intraday i
+JOIN futures_ohlcv_daily d
+  ON d.contract_code = i.futures_code
+ AND d.time = (i.time AT TIME ZONE 'Asia/Seoul')::date;
 
-CREATE OR REPLACE VIEW futures_intraday_near AS
+CREATE VIEW futures_intraday_near AS
 SELECT futures_code, time, interval_seconds, underlying_code,
        open, high, low, close, volume, trading_value, open_interest
 FROM futures_intraday_with_class WHERE contract_class = 'NEAR';
 
-CREATE OR REPLACE VIEW futures_intraday_next AS
+CREATE VIEW futures_intraday_next AS
 SELECT futures_code, time, interval_seconds, underlying_code,
        open, high, low, close, volume, trading_value, open_interest
 FROM futures_intraday_with_class WHERE contract_class = 'NEXT';
 
+-- 일별 연결 선물 — NEAR/NEXT 둘 다 인포맥스 일봉 테이블 하나에서 (TODO 완료분).
+-- 이전엔 NEXT를 30초봉 집계로 유도했는데, 그 30초봉의 NEAR/NEXT 태깅이 위
+-- v2 버그를 타고 있었고 2026+ 구간만 존재했다. 일봉 기반으로 바꾸면
+-- 2022+ 전체이력 + NEAR/NEXT 소스 일관 + settle/이론가/베이시스까지 채워진다.
+CREATE VIEW futures_daily_with_class AS
+SELECT underlying_code, time, contract_class, contract_code,
+       open, high, low, close, settle_price,
+       volume, trading_value, open_interest,
+       theoretical_price, underlying_basis, theoretical_basis,
+       'infomax'::text AS source
+FROM futures_ohlcv_daily;
+
 COMMENT ON VIEW futures_intraday_with_class IS
-  'Phase 7 v2: 분봉 self-join 만기 정렬로 (date, underlying)별 NEAR/NEXT 자동 결정';
+  'Phase 7 v3: 인포맥스 일봉 contract_code 조인으로 날짜별 NEAR/NEXT 확정 (추측 없음)';
 COMMENT ON VIEW futures_intraday_near IS
-  'Phase 7: 각 (date, underlying)의 NEAR contract 30초봉';
+  'Phase 7: 각 (date, underlying)의 NEAR contract 30초봉. 근월물 분봉이 없는 날은 빈다';
 COMMENT ON VIEW futures_intraday_next IS
   'Phase 7: 각 (date, underlying)의 NEXT contract 30초봉';
+COMMENT ON VIEW futures_daily_with_class IS
+  '일별 연결 선물 (NEAR/NEXT). 전부 인포맥스 일봉 기반 — 2022+ 전체이력';

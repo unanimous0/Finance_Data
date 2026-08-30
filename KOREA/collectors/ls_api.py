@@ -402,16 +402,31 @@ class LsApiClient:
 
     # ── 공통 helper: TR 호출 (401 자동 refresh + retry) ────────────────────
     def _post_generic(self, tr_cd: str, url: str, in_block_name: str,
-                      in_block: dict) -> dict:
+                      in_block: dict, tr_cont: str = "N",
+                      tr_cont_key: str = "") -> dict:
         """t8418/t8465/t8406/t8401 등 새 TR용 일반화 POST.
-        401 시 자동 token refresh + retry. 5xx/429/timeout 동일 정책."""
+        401 시 자동 token refresh + retry. 5xx/429/timeout 동일 정책.
+
+        tr_cont/tr_cont_key: 연속조회(다음 페이지) 헤더. 2026-08-30 추가.
+          LS는 응답 1건을 qrycnt(최대 500)로 자르고 body OutBlock에 cts_date/cts_time
+          커서를 준다. 그런데 **커서를 body InBlock에 넣는 것만으로는 부족**하고
+          헤더 tr_cont='Y' + tr_cont_key=f"{cts_date}{cts_time}"이 함께 가야
+          서버가 연속조회로 처리한다.
+          이전엔 "N"/""로 하드코딩돼 있어 t8418(지수)·t8465(지수선물)이 2페이지를
+          요청해도 서버가 첫 페이지를 재전송 → 코드가 중복 감지하고 루프 종료
+          → **매일 정확히 500봉만 적재**(지수 11:11~, 지수선물 11:26~ 오전장 통째 결손).
+          지수 8개월(131일×2코드) / 지수선물 8개월(161일) 전량이 이 상태였다.
+          rate limit이 아니라 헤더 누락이라 키를 늘려도 해결되지 않는 종류였다.
+          t8452(종목)는 _post_t8452가 이미 제대로 넘기고 있어 무사했고,
+          t8406(주식선물)은 cnt=900 단발이라 페이징 자체가 불필요했다.
+        """
         token = self._get_token()
         headers = {
             "content-type":  "application/json; charset=utf-8",
             "authorization": f"Bearer {token}",
             "tr_cd":         tr_cd,
-            "tr_cont":       "N",
-            "tr_cont_key":   "",
+            "tr_cont":       tr_cont,
+            "tr_cont_key":   tr_cont_key,
             "mac_address":   "",
             "Connection":    "close",
         }
@@ -480,6 +495,7 @@ class LsApiClient:
         ymd = target_date.strftime("%Y%m%d")
         all_bars: list[dict] = []
         cts_date, cts_time = "", ""
+        tr_cont, tr_cont_key = "N", ""
         seen_keys: set[tuple] = set()
 
         while True:
@@ -488,7 +504,8 @@ class LsApiClient:
                 "sdate": "", "stime": "", "edate": ymd, "etime": "",
                 "cts_date": cts_date, "cts_time": cts_time, "comp_yn": "N"
             }
-            data = self._post_generic("t8418", url, "t8418InBlock", in_block)
+            data = self._post_generic("t8418", url, "t8418InBlock", in_block,
+                                      tr_cont=tr_cont, tr_cont_key=tr_cont_key)
             if data.get("_no_data"):
                 break
             bars = data.get("t8418OutBlock1", []) or []
@@ -508,6 +525,7 @@ class LsApiClient:
                 break
             seen_keys.add(key)
             cts_date, cts_time = nd, nt
+            tr_cont, tr_cont_key = "Y", f"{nd}{nt}"
 
         target_bars = [b for b in all_bars if b.get("date") == ymd and b.get("time")]
         dedup = {b["time"]: b for b in target_bars}
@@ -522,6 +540,7 @@ class LsApiClient:
         ymd = target_date.strftime("%Y%m%d")
         all_bars: list[dict] = []
         cts_date, cts_time = "", ""
+        tr_cont, tr_cont_key = "N", ""
         seen_keys: set[tuple] = set()
 
         while True:
@@ -530,7 +549,8 @@ class LsApiClient:
                 "sdate": "", "stime": "", "edate": ymd, "etime": "",
                 "cts_date": cts_date, "cts_time": cts_time, "comp_yn": "N"
             }
-            data = self._post_generic("t8465", url, "t8465InBlock", in_block)
+            data = self._post_generic("t8465", url, "t8465InBlock", in_block,
+                                      tr_cont=tr_cont, tr_cont_key=tr_cont_key)
             if data.get("_no_data"):
                 break
             bars = data.get("t8465OutBlock1", []) or []
@@ -550,6 +570,7 @@ class LsApiClient:
                 break
             seen_keys.add(key)
             cts_date, cts_time = nd, nt
+            tr_cont, tr_cont_key = "Y", f"{nd}{nt}"
 
         target_bars = [b for b in all_bars if b.get("date") == ymd and b.get("time")]
         dedup = {b["time"]: b for b in target_bars}

@@ -1882,6 +1882,124 @@ def check_etf_master_completeness(conn, target_date: date,
     return result
 
 
+# 30초봉 하루 정상 봉수 (페이징 완주 실측, 2026-08-28 기준)
+#   종목/ETF  760~761봉  09:00:30~15:30
+#   지수      761봉      09:00:30~15:30   (종목과 같은 세션)
+#   선물      821봉      08:45:30~15:45   (지수선물/주식선물 동일 — 개장 전 단일가 포함)
+INTRADAY_BAR_SOURCES = {
+    "종목/ETF": ("ohlcv_intraday",        "stock_code",   760),
+    "지수":     ("index_ohlcv_intraday",  "index_code",   761),
+    "선물":     ("futures_ohlcv_intraday", "futures_code", 821),
+}
+INTRADAY_BAR_MIN_RATIO = 0.9
+
+
+def check_intraday_bar_counts(conn, target_date: date,
+                              min_ratio: float = INTRADAY_BAR_MIN_RATIO) -> dict:
+    """30초봉 **봉 개수** 완결성 체크 (재발방지, 2026-08-30).
+
+    배경: check_intraday_completeness 는 "daily 있는데 intraday **없음**"만 본다.
+    tr_cont 페이징 누락 사고(2026-08-30 발견)는 하루 761/821봉이어야 할 것이
+    **정확히 500봉만** 적재된 형태라 "존재는 함" → 완결성 체크를 그대로 통과했고,
+    지수 8개월(131일)·지수선물 8개월(161일) 전량이 잘린 채 무증상으로 쌓였다.
+    존재 여부만으로는 절단이 원리적으로 안 보인다. 그래서 개수를 센다.
+
+    2단 판정:
+      (1) 소스 내 개별 코드 — 같은 날 동료 코드들의 median 대비 min_ratio 미만.
+          한 종목만 잘린 경우를 잡는다 (실측 43 code-day가 이 형태).
+      (2) 소스 전체 — median 자체가 기대 봉수 대비 min_ratio 미만.
+          이번처럼 그 소스가 통째로 잘린 경우. median 기준만 쓰면 전원이 같이
+          잘렸을 때 median도 같이 내려가 아무것도 안 잡히므로 **절대 기준 병행**이 필수.
+
+    단축장 오탐 방지 — genuine vs session_short:
+      실제로 장이 짧았던 날(신년 개장일 10시 개장 등)은 **모든 소스가 같이** 짧다.
+      버그는 한 소스만 짧다. 그래서 "짧은 소스가 있는데 정상인 소스도 있으면"
+      genuine(WARN+알림), "있는 소스 전부 짧으면" session_short(INFO만)로 가른다.
+      ETF 마스터/외인 완결성과 같은 등급 철학.
+
+    반환: {target_date, sources:{name:{...}}, genuine_sources:[], short_codes:[],
+           session_short:bool, issue_count:int}
+    """
+    import statistics
+
+    # KST 하루 경계를 파이썬에서 timestamptz로 만들어 넘긴다.
+    # SQL에서 `'날짜'::date AT TIME ZONE 'Asia/Seoul'`을 쓰면 timestamptz 오버로드가
+    # 잡혀 **반대 방향으로** 변환되고(= 9시간 밀림), 게다가 `(time AT TIME ZONE ...)::date`
+    # 형태는 인덱스를 못 타 1억행 풀스캔이 된다. 경계값 파라미터가 정확하고 빠르다.
+    lo = datetime(target_date.year, target_date.month, target_date.day, tzinfo=KST)
+    hi = lo + timedelta(days=1)
+
+    sources: dict[str, dict] = {}
+    for name, (tbl, col, expected) in INTRADAY_BAR_SOURCES.items():
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT {col}, count(*) AS bars
+                FROM {tbl}
+                WHERE interval_seconds = 30
+                  AND time >= %s AND time < %s
+                GROUP BY 1
+            """, (lo, hi))
+            rows = cur.fetchall()
+        if not rows:
+            # 그날 그 소스가 통째로 없음 — 존재 여부는 다른 체크 담당, 여기선 skip
+            sources[name] = {"present": False}
+            continue
+        counts = {c: n for c, n in rows}
+        med = statistics.median(counts.values())
+        short = sorted([{"code": c, "bars": n} for c, n in counts.items()
+                        if n < med * min_ratio], key=lambda x: x["bars"])
+        sources[name] = {
+            "present": True, "codes": len(counts), "median": med,
+            "expected": expected, "ratio": round(med / expected, 3),
+            "source_short": med < expected * min_ratio,
+            "short_codes": short,
+        }
+
+    live = {n: s for n, s in sources.items() if s.get("present")}
+    short_srcs = [n for n, s in live.items() if s["source_short"]]
+    # 있는 소스가 전부 짧으면 장 자체가 짧았던 날로 본다 (신년 개장일 등)
+    session_short = bool(live) and len(short_srcs) == len(live)
+    genuine_sources = [] if session_short else short_srcs
+    short_codes = [dict(source=n, **c) for n, s in live.items() for c in s["short_codes"]]
+
+    issue_count = len(genuine_sources) + len(short_codes)
+    result = {
+        "target_date": str(target_date), "sources": sources,
+        "genuine_sources": genuine_sources, "short_codes": short_codes[:100],
+        "short_code_total": len(short_codes),
+        "session_short": session_short, "issue_count": issue_count,
+    }
+
+    print(f"\n  [봉수 완결성] {target_date}")
+    for name, s in sources.items():
+        if not s.get("present"):
+            print(f"    {name:<8} — 데이터 없음 (skip)")
+            continue
+        mark = "⚠️" if name in genuine_sources else ("·" if s["source_short"] else "✅")
+        print(f"    {mark} {name:<8} {s['codes']:>4}코드 / median {s['median']:.0f}봉 "
+              f"(기대 {s['expected']}, {s['ratio']*100:.0f}%)"
+              + (f" / 개별 미달 {len(s['short_codes'])}건" if s["short_codes"] else ""))
+    if session_short:
+        print("    → 모든 소스가 함께 짧음 = 단축장으로 판단 (INFO, 알림 제외)")
+    if genuine_sources:
+        print(f"    ⚠️ 절단 의심 소스: {', '.join(genuine_sources)}")
+    for c in short_codes[:20]:
+        print(f"       ⚠️ {c['source']} {c['code']} {c['bars']}봉")
+
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO data_quality_checks
+                      (table_name, check_date, check_type, issue_count, details)
+                    VALUES ('ohlcv_intraday', %s, 'intraday_bar_completeness', %s, %s)
+                """, (target_date, issue_count, psycopg2.extras.Json(result)))
+    except Exception as e:
+        print(f"  ⚠️ [봉수 완결성] data_quality_checks 기록 실패: {e}")
+
+    return result
+
+
 def check_intraday_completeness(conn, target_date: date, codes: list[str],
                                 client) -> dict:
     """30초봉 수집 완결성 안전망 (재발방지, 2026-07-22).
@@ -2242,11 +2360,13 @@ def _parse_ymd_daily(v) -> date:
 
 
 def _backfill_pids() -> list[int]:
-    """LS 백필 프로세스 PID list. (backfill_30sec_bars / backfill_index / backfill_futures)"""
+    """LS 백필 프로세스 PID list. (backfill_30sec_bars / backfill_index / backfill_futures
+    / repair_intraday_truncation) — 새 LS 장기 스크립트를 추가하면 여기에도 넣어야
+    스케줄러 LS 잡과 충돌하지 않는다 (여기 빠지면 SIGSTOP 대상이 안 됨)."""
     import subprocess
     pids: list[int] = []
     for pat in ("backfill_30sec_bars.py", "backfill_index_minute_bars.py",
-                "backfill_futures_minute_bars.py"):
+                "backfill_futures_minute_bars.py", "repair_intraday_truncation.py"):
         try:
             r = subprocess.run(["pgrep", "-f", pat], capture_output=True, text=True, timeout=5)
             if r.returncode == 0:
@@ -2516,12 +2636,19 @@ def run_minute_bars_pipeline(target_date: date) -> dict:
         _ls_backfill_resume(paused_pids)
 
 
-def run_index_minute_bars_pipeline(target_date: date) -> dict:
+def run_index_minute_bars_pipeline(target_date: date,
+                                   only_days: list[date] = None) -> dict:
     """
     지수 30초봉 일배치 (LS t8418, /indtp/chart).
     갭 backfill: **종목별** max(time)+1 ~ target_date (옛 테이블 전체 max는 다른 contract에
     가려질 위험 — 5/16 지수선물 사례. _per_code_gap_simple 사용).
     스코프: KOSPI200(101) + KOSDAQ150(301) 만 (사용자 정책).
+
+    only_days: 갭 계산을 건너뛰고 이 날짜들만 수집 (2026-08-30 추가).
+      t8418은 **직전 1세션만** 제공한다(8/27·8/26 실측 0봉, nday/sdate 변형도 무효).
+      그래서 갭 누적 방식은 이미 지나간 날짜를 매일 헛되이 재요청하게 된다
+      (실측: empty가 2,4,6,8…로 증가). 당일 장 마감 직후 호출이 유일하게
+      데이터가 오는 타이밍이라, 그 경로에서는 오늘 하루만 딱 집는다.
     """
     from collectors.ls_api import LsApiClient, LsApiError
     from scripts.backfill_index_minute_bars import insert_bars
@@ -2531,7 +2658,11 @@ def run_index_minute_bars_pipeline(target_date: date) -> dict:
     print("=" * 70)
 
     codes = ["101", "301"]  # KOSPI200, KOSDAQ150
-    gaps, total_calls = _per_code_gap_simple("index_ohlcv_intraday", "index_code", codes, target_date)
+    if only_days is not None:
+        gaps = {c: list(only_days) for c in codes}
+        total_calls = len(codes) * len(only_days)
+    else:
+        gaps, total_calls = _per_code_gap_simple("index_ohlcv_intraday", "index_code", codes, target_date)
     if total_calls == 0:
         print(f"  [skip] 모든 지수 갭 0일 (target_date={target_date})")
         return {"calls": 0, "rows": 0}
