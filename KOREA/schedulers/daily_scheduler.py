@@ -533,6 +533,10 @@ def job_index_minute_bars_today():
         finally:
             c.close()
 
+    # 기대 코드 수는 파이프라인 스코프에서 가져온다 (하드코딩 2 → 405 추가 시 어긋남)
+    from scripts.daily_update import INDEX_INTRADAY_CODES
+    want_codes = set(INDEX_INTRADAY_CODES)
+
     attempts, result = 0, {}
     paused = _ls_backfill_pause()
     try:
@@ -548,23 +552,35 @@ def job_index_minute_bars_today():
                 result = {"error": str(e)}
             counts = _bars_today()
             logger.info(f"[스케줄러] 지수 30초봉 {attempts}회차: {result} / 봉수={counts}")
-            if counts and min(counts.values()) >= INDEX_BARS_MIN and len(counts) == 2:
+            if want_codes <= set(counts) and min(counts.values()) >= INDEX_BARS_MIN:
                 break
     finally:
         _ls_backfill_resume(paused)
 
     counts = _bars_today()
-    ok = bool(counts) and len(counts) == 2 and min(counts.values()) >= INDEX_BARS_MIN
-    detail = (f"target={today} / 시도 {attempts}회\n"
-              + "\n".join(f"• {c}: {n:,}봉 (기대 {INDEX_BARS_EXPECTED})"
-                          for c, n in sorted(counts.items()))
-              if counts else f"target={today} / 시도 {attempts}회\n• 적재 0")
-    if not ok:
+    ok = bool(counts) and want_codes <= set(counts) and min(counts.values()) >= INDEX_BARS_MIN
+    lines = [f"target={today} / 시도 {attempts}회"]
+    if counts:
+        lines += [f"• {c}: {n:,}봉 (기대 {INDEX_BARS_EXPECTED})" for c, n in sorted(counts.items())]
+    else:
+        lines.append("• 적재 0")
+    missing = sorted(want_codes - set(counts))
+    if missing:
+        lines.append(f"• 미적재 코드: {', '.join(missing)}")
+
+    # 성공도 반드시 기록한다 — 이 잡은 실패 시에만 notify_job 을 불러서
+    # 성공하면 job_events 에 아무 흔적이 없었고(2026-08-31 첫 실행), 일일 요약에도
+    # 안 떠서 "정상"인지 "잡이 아예 안 떴는지" 구분할 수 없었다.
+    # 지수는 t8418 특성상 그날 못 받으면 영구 손실이라 침묵이 두 뜻을 가지면 위험하다.
+    # notify_job 3단계 정책상 깨끗한 성공은 기록만 되고 전송은 안 된다.
+    detail = "\n".join(lines)
+    if ok:
+        notify_job("지수 30초봉", "ok", started, detail=detail)
+        logger.info(f"[스케줄러] 지수 30초봉 완료: {counts}")
+    else:
         notify_job("지수 30초봉", "fail", started,
                    detail=detail + "\n\n⚠️ 당일 확보 실패 — t8418은 과거를 주지 않아 "
                                    "이 날짜는 소급 불가")
-    else:
-        logger.info(f"[스케줄러] 지수 30초봉 완료: {counts}")
 
 
 def _purge_stockfut_day(day) -> int:

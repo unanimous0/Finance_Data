@@ -1882,6 +1882,18 @@ def check_etf_master_completeness(conn, target_date: date,
     return result
 
 
+# 지수 30초봉 스코프 — LS 업종코드 (t8424 마스터 기준).
+# 인포맥스 지수코드계(K2G01P 등)와 **다른 체계**라 자동 대조가 안 된다.
+#   101 = 코스피200    → 일별 K2G01P
+#   301 = 코스닥 종합  → 일별 QGG01P
+#   405 = KOSDAQ 150   → 일별 Q5G01P
+# 2026-09-01 수정: 301을 KOSDAQ150으로 **잘못 알고** 8개월간 코스닥 종합을 받았다.
+# 8/31 분봉 종가 834.29가 코스닥 종합(834.29)과 일치하고 코스닥150(1444.04)과
+# 어긋나 발각. t8424 업종 마스터에서 'KOSDAQ 150' = upcode 405 확인 후 실시간 대조 검증.
+# 301도 종합지수로는 유효하고 8개월 연속성이 있어 그대로 둔다(하루 2콜 추가).
+# 교훈: 코드계가 다르면 이름만 믿지 말고 **종가 일치**로 검산할 것.
+INDEX_INTRADAY_CODES = ("101", "301", "405")
+
 # 30초봉 하루 정상 봉수 (페이징 완주 실측, 2026-08-28 기준)
 #   종목/ETF  760~761봉  09:00:30~15:30
 #   지수      761봉      09:00:30~15:30   (종목과 같은 세션)
@@ -2657,7 +2669,7 @@ def run_index_minute_bars_pipeline(target_date: date,
     print("  ⏱️  지수 분봉 일배치 (LS t8418)")
     print("=" * 70)
 
-    codes = ["101", "301"]  # KOSPI200, KOSDAQ150
+    codes = list(INDEX_INTRADAY_CODES)
     if only_days is not None:
         gaps = {c: list(only_days) for c in codes}
         total_calls = len(codes) * len(only_days)
@@ -2667,7 +2679,7 @@ def run_index_minute_bars_pipeline(target_date: date,
         print(f"  [skip] 모든 지수 갭 0일 (target_date={target_date})")
         return {"calls": 0, "rows": 0}
 
-    print(f"  [스코프] {len(codes)} 지수 (KOSPI200, KOSDAQ150) / 호출 {total_calls}건")
+    print(f"  [스코프] {len(codes)} 지수 ({', '.join(codes)}) / 호출 {total_calls}건")
     for c in codes:
         days = gaps.get(c, [])
         if days: print(f"     {c}: {len(days)}일 → {days[0]} ~ {days[-1]}")
