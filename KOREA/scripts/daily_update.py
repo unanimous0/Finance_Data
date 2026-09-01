@@ -1893,6 +1893,11 @@ def check_etf_master_completeness(conn, target_date: date,
 # 교훈: 코드계가 다르면 이름만 믿지 말고 **종가 일치**로 검산할 것.
 INDEX_INTRADAY_CODES = ("101", "405")
 
+# 분봉(LS 업종코드) ↔ 일별(인포맥스 지수코드) 대조표.
+# 두 체계가 달라 자동 대조가 불가능했던 게 301 오배정을 8개월 못 잡은 원인이다.
+# 여기 매핑을 근거로 check_intraday_close_match() 가 매일 종가를 맞춰본다.
+INDEX_CODE_MAP = {"101": "K2G01P", "301": "QGG01P", "405": "Q5G01P"}
+
 # 30초봉 하루 정상 봉수 (페이징 완주 실측, 2026-08-28 기준)
 #   종목/ETF  760~761봉  09:00:30~15:30
 #   지수      761봉      09:00:30~15:30   (종목과 같은 세션)
@@ -2007,6 +2012,126 @@ def check_intraday_bar_counts(conn, target_date: date,
                 """, (target_date, issue_count, psycopg2.extras.Json(result)))
     except Exception as e:
         print(f"  ⚠️ [봉수 완결성] data_quality_checks 기록 실패: {e}")
+
+    return result
+
+
+# 종가 대조 허용오차 — "무엇이 왔나"를 보는 체크라 소수점 차이는 통과시킨다.
+#   지수  : 산출값이라 정확히 맞아야 함 (실측 101/301 완전 일치)
+#   종목·선물: 무거래/저유동 종목의 일별 종가는 기준가·정산가라 최종 호가와 다를 수 있다
+#            (실측 8/31: 채권ETF 0.005%, 지수선물 NEXT 0.11%, 주식선물 0.69%)
+# 잡으려는 사고(코드 오배정)는 40%+ 규모라 이 정도 허용해도 충분히 갈린다.
+CLOSE_MATCH_TOL = {"지수": 0.001, "종목/ETF": 0.02, "선물": 0.02}
+
+
+def check_intraday_close_match(conn, target_date: date) -> dict:
+    """30초봉 마지막 봉 종가 ↔ 일별 공식 종가 대조 (재발방지, 2026-09-02).
+
+    배경: check_intraday_bar_counts 는 "몇 개 왔나"만 본다. 2026-09-01에
+    발견된 301 오배정(코스닥 **종합**을 KOSDAQ150으로 알고 8개월 수집)은
+    봉수 761로 멀쩡했다 — 개수는 맞고 **내용이 다른** 사고라 개수 체크로는
+    원리적으로 안 잡힌다. 그래서 "무엇이 왔나"를 값으로 확인한다.
+
+    분봉과 일별은 소스·코드계가 서로 다르므로(지수: LS 업종코드 vs 인포맥스
+    지수코드 / 선물: LS 계약코드 vs 인포맥스 contract_code) 종가 일치가
+    사실상 유일한 교차검산 수단이다.
+
+    대상 3종:
+      지수      INDEX_CODE_MAP 으로 일별 index_ohlcv_daily 조인
+      종목/ETF  ohlcv_daily.close_price 조인
+      선물      futures_ohlcv_daily.contract_code 조인
+
+    반환: {sources: {name: {checked, matched, mismatched, worst:[...]}}, issue_count}
+    """
+    lo = datetime(target_date.year, target_date.month, target_date.day, tzinfo=KST)
+    hi = lo + timedelta(days=1)
+
+    QUERIES = {
+        "지수": ("""
+            WITH lb AS (
+              SELECT DISTINCT ON (index_code) index_code AS code, close
+              FROM index_ohlcv_intraday
+              WHERE time >= %(lo)s AND time < %(hi)s
+              ORDER BY index_code, time DESC)
+            SELECT lb.code, lb.close::numeric, d.close::numeric
+            FROM lb
+            JOIN (SELECT * FROM (VALUES """ +
+              ",".join(f"('{k}','{v}')" for k, v in INDEX_CODE_MAP.items()) +
+            """) t(ls, imx)) m ON m.ls = lb.code
+            JOIN index_ohlcv_daily d ON d.code = m.imx AND d.time = %(d)s
+        """),
+        "종목/ETF": ("""
+            WITH lb AS (
+              SELECT DISTINCT ON (stock_code) stock_code AS code, close
+              FROM ohlcv_intraday
+              WHERE interval_seconds = 30 AND time >= %(lo)s AND time < %(hi)s
+              ORDER BY stock_code, time DESC)
+            SELECT lb.code, lb.close::numeric, o.close_price::numeric
+            FROM lb JOIN ohlcv_daily o
+              ON o.stock_code = lb.code AND o.time = %(d)s
+        """),
+        "선물": ("""
+            WITH lb AS (
+              SELECT DISTINCT ON (futures_code) futures_code AS code, close
+              FROM futures_ohlcv_intraday
+              WHERE interval_seconds = 30 AND time >= %(lo)s AND time < %(hi)s
+              ORDER BY futures_code, time DESC)
+            SELECT lb.code, lb.close::numeric, d.close::numeric
+            FROM lb JOIN futures_ohlcv_daily d
+              ON d.contract_code = lb.code AND d.time = %(d)s
+        """),
+    }
+
+    sources: dict[str, dict] = {}
+    for name, sql in QUERIES.items():
+        with conn.cursor() as cur:
+            cur.execute(sql, {"lo": lo, "hi": hi, "d": target_date})
+            rows = cur.fetchall()
+        if not rows:
+            sources[name] = {"present": False}
+            continue
+        tol = CLOSE_MATCH_TOL[name]
+        diffs = []
+        for code, ic, dc in rows:
+            if dc is None or ic is None or dc == 0:
+                continue
+            r = abs(float(ic) - float(dc)) / abs(float(dc))
+            diffs.append((code, float(ic), float(dc), r))
+        bad = sorted([x for x in diffs if x[3] > tol], key=lambda x: -x[3])
+        sources[name] = {
+            "present": True, "checked": len(diffs),
+            "matched": len(diffs) - len(bad), "mismatched": len(bad),
+            "tol_pct": tol * 100,
+            "worst": [{"code": c, "intraday": i, "daily": d,
+                       "diff_pct": round(r * 100, 3)} for c, i, d, r in bad[:20]],
+        }
+
+    issue_count = sum(s.get("mismatched", 0) for s in sources.values())
+    result = {"target_date": str(target_date), "sources": sources,
+              "issue_count": issue_count}
+
+    print(f"\n  [종가 대조] {target_date}")
+    for name, s in sources.items():
+        if not s.get("present"):
+            print(f"    {name:<8} — 데이터 없음 (skip)")
+            continue
+        mark = "⚠️" if s["mismatched"] else "✅"
+        print(f"    {mark} {name:<8} {s['checked']:>5}건 대조 / 일치 {s['matched']:>5} "
+              f"/ 불일치 {s['mismatched']} (허용 {s['tol_pct']:.1f}%)")
+        for w in s["worst"][:10]:
+            print(f"       ⚠️ {w['code']} 분봉 {w['intraday']:,} vs 일별 {w['daily']:,} "
+                  f"({w['diff_pct']:+.2f}%)")
+
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO data_quality_checks
+                      (table_name, check_date, check_type, issue_count, details)
+                    VALUES ('ohlcv_intraday', %s, 'intraday_close_match', %s, %s)
+                """, (target_date, issue_count, psycopg2.extras.Json(result)))
+    except Exception as e:
+        print(f"  ⚠️ [종가 대조] data_quality_checks 기록 실패: {e}")
 
     return result
 

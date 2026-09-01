@@ -453,16 +453,22 @@ def job_minute_bars_daily():
     # "존재하지만 잘려 있음"은 기존 완결성 체크로 원리적으로 안 보여서
     # 지수/지수선물이 8개월간 무증상이었다 (tr_cont 페이징 사고, 2026-08-30).
     try:
-        from scripts.daily_update import check_intraday_bar_counts, get_conn
+        from scripts.daily_update import (check_intraday_bar_counts,
+                                          check_intraday_close_match, get_conn)
         conn = get_conn()
         try:
             bc = check_intraday_bar_counts(conn, target)
+            # 봉수 체크는 "몇 개 왔나"만 본다. 개수는 맞고 **내용이 다른** 사고
+            # (2026-09-01 301 오배정 — 761봉 정상인데 코스닥 종합이었음)는
+            # 종가 대조로만 잡힌다. 두 체크가 서로 다른 실패 모드를 담당한다.
+            cm = check_intraday_close_match(conn, target)
         finally:
             conn.close()
         logger.info(f"[스케줄러] 봉수 완결성: issue={bc['issue_count']} "
-                    f"genuine={bc['genuine_sources']} short_codes={bc['short_code_total']}")
-        if bc["issue_count"] > 0:
-            lines = [f"target={target}"]
+                    f"genuine={bc['genuine_sources']} short_codes={bc['short_code_total']} "
+                    f"/ 종가 대조: issue={cm['issue_count']}")
+        if bc["issue_count"] > 0 or cm["issue_count"] > 0:
+            lines = [f"target={target}", "[봉수]"]
             for name, s in bc["sources"].items():
                 if not s.get("present"):
                     lines.append(f"• {name}: 데이터 없음")
@@ -470,15 +476,27 @@ def job_minute_bars_daily():
                 lines.append(f"• {name}: {s['codes']}코드 / median {s['median']:.0f}봉 "
                              f"(기대 {s['expected']}, {s['ratio']*100:.0f}%)")
             if bc["genuine_sources"]:
-                lines.append(f"\n⚠️ 소스 통째 절단 의심: {', '.join(bc['genuine_sources'])}")
+                lines.append(f"⚠️ 소스 통째 절단 의심: {', '.join(bc['genuine_sources'])}")
             if bc["short_code_total"]:
                 sample = ", ".join(f"{c['code']}({c['bars']}봉)"
                                    for c in bc["short_codes"][:10])
-                lines.append(f"\n⚠️ 개별 코드 미달 {bc['short_code_total']}건: {sample}")
-            notify_job("30초봉 봉수 완결성", "ok", datetime.now(KST),
+                lines.append(f"⚠️ 개별 코드 미달 {bc['short_code_total']}건: {sample}")
+
+            lines.append("")
+            lines.append("[종가 대조]")
+            for name, s in cm["sources"].items():
+                if not s.get("present"):
+                    lines.append(f"• {name}: 데이터 없음")
+                    continue
+                lines.append(f"• {name}: {s['checked']}건 중 불일치 {s['mismatched']} "
+                             f"(허용 {s['tol_pct']:.1f}%)")
+                for w in s["worst"][:5]:
+                    lines.append(f"  ⚠️ {w['code']} 분봉 {w['intraday']:,} vs "
+                                 f"일별 {w['daily']:,} ({w['diff_pct']:+.2f}%)")
+            notify_job("30초봉 무결성", "ok", datetime.now(KST),
                        detail="\n".join(lines), warn=True)
     except Exception as e:
-        logger.error(f"[스케줄러] 봉수 완결성 체크 실패: {e}")
+        logger.error(f"[스케줄러] 30초봉 무결성 체크 실패: {e}")
 
 
 INDEX_BARS_EXPECTED = 761      # 09:00:30~15:30 30초봉 (페이징 완주 실측)
