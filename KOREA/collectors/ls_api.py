@@ -91,6 +91,42 @@ def hard_timeout(seconds: int):
         signal.signal(signal.SIGALRM, old)
 
 
+# 연속조회(2페이지 이후) 빈 응답 재시도 — 간헐 절단 대응 (2026-09-03)
+CONT_MAX_RETRY = 2
+CONT_RETRY_WAIT = 1.5
+
+
+def _cont_retry_or_stop(tr: str, code: str, ymd: str, tr_cont: str,
+                        got: int, attempt: int) -> bool:
+    """연속조회 중 빈 응답이 왔을 때 재시도할지 판단. True면 재시도.
+
+    배경 — 간헐 절단(2026-09-03 원인 규명):
+      30초봉이 드물게 **정확히 500봉(=qrycnt 1페이지)** 만 적재되는 일이 있었다.
+      2026-05~09 사이 46 code-day, 하루에 몰릴 땐 정렬상 인접한 코드 3~4개가
+      한꺼번에(예: 152500/152870/153130/155660) 걸렸다.
+      같은 (code, day)를 나중에 재요청하면 761봉이 정상 수신되므로 **일시적 실패**다.
+      그런데 배치 로그는 errors=0 이었다 — 예외가 안 났다는 뜻이다.
+
+      원인: 2페이지 요청이 빈 응답(_no_data 또는 빈 bars)으로 돌아오면 루프가
+      **그냥 break** 했다. _classify_error 는 rsp_msg 에 '없'이 들어가면 no_data 로
+      묶어 예외 대신 {_no_data:True} 를 반환하므로, 서버가 일시적으로 '자료 없음'을
+      돌려주면 조용히 1페이지만 남고 끝난다. 인접 코드가 함께 걸리는 것도
+      한 시점의 서버 상태가 연속된 작업 항목에 그대로 반영된 결과로 읽힌다.
+
+    대응: 연속조회(tr_cont='Y') 중 빈 응답은 바로 포기하지 말고 짧게 쉬었다 재시도.
+    그래도 비면 **로그를 남긴다** — 조용히 끊기는 게 이 사고의 본질이었다.
+    첫 페이지가 비는 것은 정상(그날 데이터 없음)이라 재시도 대상이 아니다.
+    """
+    if tr_cont != "Y":
+        return False
+    if attempt < CONT_MAX_RETRY:
+        time.sleep(CONT_RETRY_WAIT * (attempt + 1))
+        return True
+    print(f"    [{tr}] 연속조회 빈 응답 — {code} {ymd} {got}봉에서 중단 "
+          f"(재시도 {CONT_MAX_RETRY}회 실패) → 절단 가능성", flush=True)
+    return False
+
+
 def _classify_error(rsp_msg: str, status_code: int = 0) -> str:
     msg = (rsp_msg or "").lower()
     if status_code == 429 or "초과" in (rsp_msg or "") or "rate" in msg:
@@ -496,6 +532,7 @@ class LsApiClient:
         all_bars: list[dict] = []
         cts_date, cts_time = "", ""
         tr_cont, tr_cont_key = "N", ""
+        cont_attempt = 0
         seen_keys: set[tuple] = set()
 
         while True:
@@ -506,11 +543,14 @@ class LsApiClient:
             }
             data = self._post_generic("t8418", url, "t8418InBlock", in_block,
                                       tr_cont=tr_cont, tr_cont_key=tr_cont_key)
-            if data.get("_no_data"):
-                break
-            bars = data.get("t8418OutBlock1", []) or []
+            bars = [] if data.get("_no_data") else (data.get("t8418OutBlock1", []) or [])
             if not bars:
+                if _cont_retry_or_stop("t8418", shcode, ymd, tr_cont,
+                                       len(all_bars), cont_attempt):
+                    cont_attempt += 1
+                    continue
                 break
+            cont_attempt = 0
             all_bars.extend(bars)
             out = data.get("t8418OutBlock", {}) or {}
             nd = (out.get("cts_date", "") or "").strip()
@@ -541,6 +581,7 @@ class LsApiClient:
         all_bars: list[dict] = []
         cts_date, cts_time = "", ""
         tr_cont, tr_cont_key = "N", ""
+        cont_attempt = 0
         seen_keys: set[tuple] = set()
 
         while True:
@@ -551,11 +592,14 @@ class LsApiClient:
             }
             data = self._post_generic("t8465", url, "t8465InBlock", in_block,
                                       tr_cont=tr_cont, tr_cont_key=tr_cont_key)
-            if data.get("_no_data"):
-                break
-            bars = data.get("t8465OutBlock1", []) or []
+            bars = [] if data.get("_no_data") else (data.get("t8465OutBlock1", []) or [])
             if not bars:
+                if _cont_retry_or_stop("t8465", shcode, ymd, tr_cont,
+                                       len(all_bars), cont_attempt):
+                    cont_attempt += 1
+                    continue
                 break
+            cont_attempt = 0
             all_bars.extend(bars)
             out = data.get("t8465OutBlock", {}) or {}
             nd = (out.get("cts_date", "") or "").strip()
@@ -777,6 +821,7 @@ class LsApiClient:
         all_bars: list[dict] = []
         cts_date, cts_time = "", ""
         tr_cont, tr_cont_key = "N", ""
+        cont_attempt = 0
         seen_keys: set[tuple] = set()
 
         while True:
@@ -785,11 +830,14 @@ class LsApiClient:
                 cts_date=cts_date, cts_time=cts_time,
                 exchgubun="K", tr_cont=tr_cont, tr_cont_key=tr_cont_key,
             )
-            if data.get("_no_data"):
-                break
-            bars = data.get("t8452OutBlock1", []) or []
+            bars = [] if data.get("_no_data") else (data.get("t8452OutBlock1", []) or [])
             if not bars:
+                if _cont_retry_or_stop("t8452", code, ymd, tr_cont,
+                                       len(all_bars), cont_attempt):
+                    cont_attempt += 1
+                    continue
                 break
+            cont_attempt = 0
             all_bars.extend(bars)
             out = data.get("t8452OutBlock", {}) or {}
             nd = (out.get("cts_date", "") or "").strip()
